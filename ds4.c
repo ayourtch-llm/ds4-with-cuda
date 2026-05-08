@@ -2710,6 +2710,150 @@ void ds4_test_dense_iq2_xxs_pair_matvec(
     }
 }
 
+void ds4_test_router_select_raw(
+        int32_t       *selected,
+        float         *weights,
+        float         *probs,
+        const float   *logits,
+        const float   *bias,
+        const int32_t *hash,
+        const int32_t *tokens,
+        uint32_t       hash_rows,
+        uint32_t       token,
+        uint32_t       n_tokens,
+        bool           has_bias,
+        bool           hash_mode) {
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        float selection[DS4_N_EXPERT];
+        const float *row_logits = logits + (uint64_t)t * DS4_N_EXPERT;
+        float *row_probs = probs + (uint64_t)t * DS4_N_EXPERT;
+        int32_t *row_selected = selected + (uint64_t)t * DS4_N_EXPERT_USED;
+        float *row_weights = weights + (uint64_t)t * DS4_N_EXPERT_USED;
+
+        for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
+            row_probs[i] = sqrtf(softplus_stable(row_logits[i]));
+            selection[i] = row_probs[i] + (has_bias && !hash_mode ? bias[i] : 0.0f);
+        }
+
+        if (hash_mode) {
+            const uint32_t tok = tokens ? (uint32_t)tokens[t] : token;
+            if (!hash || hash_rows == 0 || tok >= hash_rows) ds4_die("router hash token outside test table");
+            const int32_t *src = hash + (uint64_t)tok * DS4_N_EXPERT_USED;
+            for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) row_selected[i] = src[i];
+        } else {
+            for (uint32_t k = 0; k < DS4_N_EXPERT_USED; k++) {
+                int32_t best = -1;
+                float best_v = -INFINITY;
+                for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
+                    if (best < 0 || selection[i] > best_v) {
+                        best = (int32_t)i;
+                        best_v = selection[i];
+                    }
+                }
+                row_selected[k] = best;
+                selection[(uint32_t)best] = -INFINITY;
+            }
+        }
+
+        float sum = 0.0f;
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            if (row_selected[i] < 0 || row_selected[i] >= DS4_N_EXPERT) ds4_die("selected expert is outside range");
+            row_weights[i] = row_probs[row_selected[i]];
+            sum += row_weights[i];
+        }
+        if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            row_weights[i] = row_weights[i] / sum * DS4_EXPERT_WEIGHT_SCALE;
+        }
+    }
+}
+
+void ds4_test_routed_moe_raw(
+        float         *out,
+        float         *gate,
+        float         *up,
+        float         *mid,
+        float         *experts,
+        const void    *gate_weights,
+        const void    *up_weights,
+        const void    *down_weights,
+        const int32_t *selected,
+        const float   *weights,
+        const float   *x,
+        uint32_t       n_tokens,
+        uint32_t       n_expert,
+        uint32_t       expert_in_dim,
+        uint32_t       expert_mid_dim,
+        uint32_t       out_dim,
+        uint64_t       gate_expert_bytes,
+        uint64_t       gate_row_bytes,
+        uint64_t       down_expert_bytes,
+        uint64_t       down_row_bytes,
+        float          clamp) {
+    pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
+    const uint32_t xq_blocks = expert_in_dim / QK_K;
+    const uint32_t midq_blocks = expert_mid_dim / QK_K;
+    block_q8_K *xq = xmalloc((size_t)n_tokens * xq_blocks * sizeof(xq[0]));
+    block_q8_K *midq = xmalloc((size_t)n_tokens * n_expert * midq_blocks * sizeof(midq[0]));
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        ds4_quantize_row_q8_K(x + (uint64_t)t * expert_in_dim,
+                              xq + (uint64_t)t * xq_blocks,
+                              (int64_t)expert_in_dim);
+    }
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t slot = 0; slot < n_expert; slot++) {
+            const uint64_t pair = (uint64_t)t * n_expert + slot;
+            const int32_t expert = selected[pair];
+            if (expert < 0 || expert >= DS4_N_EXPERT) ds4_die("selected expert is outside range");
+            const uint8_t *gate_base = (const uint8_t *)gate_weights + (uint64_t)(uint32_t)expert * gate_expert_bytes;
+            const uint8_t *up_base = (const uint8_t *)up_weights + (uint64_t)(uint32_t)expert * gate_expert_bytes;
+            const block_q8_K *token_xq = xq + (uint64_t)t * xq_blocks;
+
+            for (uint32_t row = 0; row < expert_mid_dim; row++) {
+                const block_iq2_xxs *gate_row = (const block_iq2_xxs *)(gate_base + (uint64_t)row * gate_row_bytes);
+                const block_iq2_xxs *up_row = (const block_iq2_xxs *)(up_base + (uint64_t)row * gate_row_bytes);
+                float g = 0.0f;
+                float u = 0.0f;
+                ds4_vec_dot_iq2_xxs_pair_q8_K((int)expert_in_dim, &g, &u, gate_row, up_row, token_xq);
+                if (clamp > 1.0e-6f) {
+                    if (g > clamp) g = clamp;
+                    if (u > clamp) u = clamp;
+                    if (u < -clamp) u = -clamp;
+                }
+                gate[pair * expert_mid_dim + row] = g;
+                up[pair * expert_mid_dim + row] = u;
+                mid[pair * expert_mid_dim + row] = silu(g) * u * weights[pair];
+            }
+
+            ds4_quantize_row_q8_K(mid + pair * expert_mid_dim,
+                                  midq + pair * midq_blocks,
+                                  (int64_t)expert_mid_dim);
+        }
+    }
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t row = 0; row < out_dim; row++) {
+            float sum = 0.0f;
+            for (uint32_t slot = 0; slot < n_expert; slot++) {
+                const uint64_t pair = (uint64_t)t * n_expert + slot;
+                const int32_t expert = selected[pair];
+                const uint8_t *down_base = (const uint8_t *)down_weights + (uint64_t)(uint32_t)expert * down_expert_bytes;
+                const block_q2_K *down_row = (const block_q2_K *)(down_base + (uint64_t)row * down_row_bytes);
+                float v = 0.0f;
+                ds4_vec_dot_q2_K_q8_K((int)expert_mid_dim, &v, down_row, midq + pair * midq_blocks);
+                if (experts) experts[pair * out_dim + row] = v;
+                sum += v;
+            }
+            out[(uint64_t)t * out_dim + row] = sum;
+        }
+    }
+
+    free(midq);
+    free(xq);
+}
+
 typedef struct {
     float *out;
     const uint8_t *data;
@@ -4607,7 +4751,7 @@ static void rope_yarn_corr_dims(int n_dims, uint64_t n_ctx_orig, float freq_base
 /* Apply DS4 RoPE only to the tail of each head.  Compressed layers use the
  * long-context frequency base and scale; inverse mode rotates attention output
  * back before the grouped output projection. */
-static void rope_tail_ext_inplace(
+void rope_tail_ext_inplace(
         float    * x,
         uint32_t   n_head,
         uint32_t   head_dim,

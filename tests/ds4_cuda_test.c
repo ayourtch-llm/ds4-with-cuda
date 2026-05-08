@@ -1183,6 +1183,394 @@ DS4_CUDA_PARITY_TEST(flash_attn,
     .cfg = (void *)&flash_attn_cfg_v);
 
 /* ---------------------------------------------------------------------------
+ * router_select + routed_moe — Phase 1 m4.
+ *
+ * Router exercises the DS4-specific sqrt(softplus(logit)) probabilities,
+ * biased top-k for selection, and unbiased probability renormalization.
+ *
+ * Routed MoE drives the production batch entry point over the shipped dense
+ * quantized kernels: IQ2_XXS gate/up pair matvec, SwiGLU+router weight, Q8_K
+ * mid quantization, and Q2_K down projection accumulated across 6 experts.
+ * --------------------------------------------------------------------------- */
+
+struct router_cfg {
+    uint32_t n_tokens;
+    uint8_t *model_map;
+    size_t model_size;
+    int initialized;
+};
+
+static void router_fill(struct router_cfg *c) {
+    if (c->initialized) return;
+    c->model_size = 256u * sizeof(float);
+    c->model_map = (uint8_t *)calloc(1, c->model_size);
+    if (!c->model_map) return;
+    float *bias = (float *)c->model_map;
+    for (uint32_t i = 0; i < 256u; i++) {
+        bias[i] = ((int32_t)(i % 17u) - 8) * 0.001953125f;
+    }
+    c->initialized = 1;
+}
+
+static void router_pack(float *out, const int32_t *selected, const float *weights, uint32_t n_tokens) {
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t i = 0; i < 6u; i++) out[t * 12u + i] = (float)selected[t * 6u + i];
+        for (uint32_t i = 0; i < 6u; i++) out[t * 12u + 6u + i] = weights[t * 6u + i];
+    }
+}
+
+static int router_select_cpu(const float *in, float *out, void *cfg) {
+    struct router_cfg *c = cfg;
+    router_fill(c);
+    if (!c->initialized) return 0;
+    int32_t selected[12];
+    float weights[12];
+    float probs[512];
+    int32_t tokens[2] = {0, 1};
+    ds4_test_router_select_raw(selected, weights, probs, in,
+                               (const float *)c->model_map,
+                               NULL, tokens, 0, 0,
+                               c->n_tokens, true, false);
+    router_pack(out, selected, weights, c->n_tokens);
+    return 1;
+}
+
+static int router_select_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                              size_t in_elems, size_t out_elems, void *cfg) {
+    (void)out_elems;
+    struct router_cfg *c = cfg;
+    router_fill(c);
+    if (!c->initialized) return 0;
+
+    ds4_cuda_tensor *model = ds4_cuda_tensor_alloc(c->model_size);
+    ds4_cuda_tensor *logits = ds4_cuda_tensor_alloc((uint64_t)in_elems * sizeof(float));
+    ds4_cuda_tensor *selected = ds4_cuda_tensor_alloc((uint64_t)c->n_tokens * 6u * sizeof(int32_t));
+    ds4_cuda_tensor *weights = ds4_cuda_tensor_alloc((uint64_t)c->n_tokens * 6u * sizeof(float));
+    ds4_cuda_tensor *probs = ds4_cuda_tensor_alloc((uint64_t)c->n_tokens * 256u * sizeof(float));
+    ds4_cuda_tensor *tokens = ds4_cuda_tensor_alloc((uint64_t)c->n_tokens * sizeof(int32_t));
+    if (!model || !logits || !selected || !weights || !probs || !tokens) {
+        ds4_cuda_tensor_free(model); ds4_cuda_tensor_free(logits);
+        ds4_cuda_tensor_free(selected); ds4_cuda_tensor_free(weights);
+        ds4_cuda_tensor_free(probs); ds4_cuda_tensor_free(tokens);
+        return 0;
+    }
+
+    int32_t token_ids[2] = {0, 1};
+    int ok = ds4_cuda_tensor_write(model, 0, c->model_map, c->model_size)
+          && ds4_cuda_tensor_write(logits, 0, in, (uint64_t)in_elems * sizeof(float))
+          && ds4_cuda_tensor_write(tokens, 0, token_ids, (uint64_t)c->n_tokens * sizeof(int32_t));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_router_select_batch_tensor(selected, weights, probs,
+                                                     ds4_cuda_tensor_contents(model), c->model_size,
+                                                     0, 0, 0, 1, 0,
+                                                     true, false,
+                                                     logits, tokens, c->n_tokens);
+    if (ok) ok = ds4_cuda_end_commands();
+
+    int32_t selected_host[12];
+    float weights_host[12];
+    float packed[24];
+    if (ok) ok = ds4_cuda_tensor_read(selected, 0, selected_host, (uint64_t)c->n_tokens * 6u * sizeof(int32_t));
+    if (ok) ok = ds4_cuda_tensor_read(weights, 0, weights_host, (uint64_t)c->n_tokens * 6u * sizeof(float));
+    if (ok) {
+        router_pack(packed, selected_host, weights_host, c->n_tokens);
+        ok = ds4_cuda_tensor_write(out_dev, 0, packed, (uint64_t)c->n_tokens * 12u * sizeof(float));
+    }
+
+    ds4_cuda_tensor_free(model); ds4_cuda_tensor_free(logits);
+    ds4_cuda_tensor_free(selected); ds4_cuda_tensor_free(weights);
+    ds4_cuda_tensor_free(probs); ds4_cuda_tensor_free(tokens);
+    return ok;
+}
+
+struct moe_cfg {
+    uint32_t n_tokens;
+    uint32_t n_expert;
+    uint32_t expert_in_dim;
+    uint32_t expert_mid_dim;
+    uint32_t out_dim;
+    uint64_t gate_expert_bytes;
+    uint64_t gate_row_bytes;
+    uint64_t down_expert_bytes;
+    uint64_t down_row_bytes;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint8_t *model_map;
+    size_t model_size;
+    int32_t selected[12];
+    float weights[12];
+    int initialized;
+};
+
+static void moe_fill_iq2(test_block_iq2_xxs *w, size_t n, uint64_t *s, float d) {
+    for (size_t b = 0; b < n; b++) {
+        w[b].d = test_f32_to_f16(d);
+        for (uint32_t i = 0; i < 32u; i++) w[b].qs[i] = (uint16_t)test_rng_u32(s);
+    }
+}
+
+static void moe_fill_q2(test_block_q2_K *w, size_t n, uint64_t *s) {
+    for (size_t b = 0; b < n; b++) {
+        for (uint32_t i = 0; i < 16u; i++) {
+            const uint8_t scale = (uint8_t)(1u + (test_rng_u32(s) & 7u));
+            const uint8_t minv = (uint8_t)(test_rng_u32(s) & 3u);
+            w[b].scales[i] = (uint8_t)(scale | (minv << 4));
+        }
+        for (uint32_t i = 0; i < 64u; i++) w[b].qs[i] = (uint8_t)test_rng_u32(s);
+        w[b].d = test_f32_to_f16(0.015625f);
+        w[b].dmin = test_f32_to_f16(0.00390625f);
+    }
+}
+
+static void moe_fill(struct moe_cfg *c) {
+    if (c->initialized) return;
+    const size_t gate_blocks = (size_t)c->expert_mid_dim * (c->expert_in_dim / 256u) * 256u;
+    const size_t down_blocks = (size_t)c->out_dim * (c->expert_mid_dim / 256u) * 256u;
+    const size_t gate_bytes = gate_blocks * sizeof(test_block_iq2_xxs);
+    const size_t down_bytes = down_blocks * sizeof(test_block_q2_K);
+    c->gate_row_bytes = (uint64_t)(c->expert_in_dim / 256u) * sizeof(test_block_iq2_xxs);
+    c->gate_expert_bytes = (uint64_t)c->expert_mid_dim * c->gate_row_bytes;
+    c->down_row_bytes = (uint64_t)(c->expert_mid_dim / 256u) * sizeof(test_block_q2_K);
+    c->down_expert_bytes = (uint64_t)c->out_dim * c->down_row_bytes;
+    c->gate_offset = 0;
+    c->up_offset = gate_bytes;
+    c->down_offset = gate_bytes * 2u;
+    c->model_size = gate_bytes * 2u + down_bytes;
+    c->model_map = (uint8_t *)calloc(1, c->model_size);
+    if (!c->model_map) return;
+
+    uint64_t s = 0xD504E4ull;
+    moe_fill_iq2((test_block_iq2_xxs *)(c->model_map + c->gate_offset), gate_blocks, &s, 0.015625f);
+    moe_fill_iq2((test_block_iq2_xxs *)(c->model_map + c->up_offset), gate_blocks, &s, 0.01171875f);
+    moe_fill_q2((test_block_q2_K *)(c->model_map + c->down_offset), down_blocks, &s);
+
+    const int32_t sel[12] = {3, 17, 42, 99, 120, 201, 5, 18, 77, 123, 190, 250};
+    const float weights[12] = {0.35f, 0.31f, 0.27f, 0.23f, 0.19f, 0.15f,
+                               0.33f, 0.29f, 0.25f, 0.21f, 0.17f, 0.13f};
+    memcpy(c->selected, sel, sizeof(sel));
+    memcpy(c->weights, weights, sizeof(weights));
+    c->initialized = 1;
+}
+
+static int routed_moe_cpu(const float *in, float *out, void *cfg) {
+    struct moe_cfg *c = cfg;
+    moe_fill(c);
+    if (!c->initialized) return 0;
+    const size_t pair_rows = (size_t)c->n_tokens * c->n_expert;
+    float *gate = (float *)calloc(pair_rows * c->expert_mid_dim, sizeof(float));
+    float *up = (float *)calloc(pair_rows * c->expert_mid_dim, sizeof(float));
+    float *mid = (float *)calloc(pair_rows * c->expert_mid_dim, sizeof(float));
+    float *experts = (float *)calloc(pair_rows * c->out_dim, sizeof(float));
+    if (!gate || !up || !mid || !experts) {
+        free(gate); free(up); free(mid); free(experts);
+        return 0;
+    }
+    ds4_test_routed_moe_raw(out, gate, up, mid, experts,
+                            c->model_map + c->gate_offset,
+                            c->model_map + c->up_offset,
+                            c->model_map + c->down_offset,
+                            c->selected, c->weights, in,
+                            c->n_tokens, c->n_expert,
+                            c->expert_in_dim, c->expert_mid_dim, c->out_dim,
+                            c->gate_expert_bytes, c->gate_row_bytes,
+                            c->down_expert_bytes, c->down_row_bytes,
+                            10.0f);
+    free(gate); free(up); free(mid); free(experts);
+    return 1;
+}
+
+static int routed_moe_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                           size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    struct moe_cfg *c = cfg;
+    moe_fill(c);
+    if (!c->initialized) return 0;
+    const uint64_t pair_rows = (uint64_t)c->n_tokens * c->n_expert;
+    const uint64_t mid_bytes = pair_rows * c->expert_mid_dim * sizeof(float);
+
+    ds4_cuda_tensor *model = ds4_cuda_tensor_alloc(c->model_size);
+    ds4_cuda_tensor *x = ds4_cuda_tensor_alloc((uint64_t)c->n_tokens * c->expert_in_dim * sizeof(float));
+    ds4_cuda_tensor *gate = ds4_cuda_tensor_alloc(mid_bytes);
+    ds4_cuda_tensor *up = ds4_cuda_tensor_alloc(mid_bytes);
+    ds4_cuda_tensor *mid = ds4_cuda_tensor_alloc(mid_bytes);
+    ds4_cuda_tensor *experts = ds4_cuda_tensor_alloc(pair_rows * c->out_dim * sizeof(float));
+    ds4_cuda_tensor *selected = ds4_cuda_tensor_alloc(pair_rows * sizeof(int32_t));
+    ds4_cuda_tensor *weights = ds4_cuda_tensor_alloc(pair_rows * sizeof(float));
+    if (!model || !x || !gate || !up || !mid || !experts || !selected || !weights) {
+        ds4_cuda_tensor_free(model); ds4_cuda_tensor_free(x); ds4_cuda_tensor_free(gate);
+        ds4_cuda_tensor_free(up); ds4_cuda_tensor_free(mid); ds4_cuda_tensor_free(experts);
+        ds4_cuda_tensor_free(selected); ds4_cuda_tensor_free(weights);
+        return 0;
+    }
+
+    int ok = ds4_cuda_tensor_write(model, 0, c->model_map, c->model_size)
+          && ds4_cuda_tensor_write(x, 0, in, (uint64_t)c->n_tokens * c->expert_in_dim * sizeof(float))
+          && ds4_cuda_tensor_write(selected, 0, c->selected, pair_rows * sizeof(int32_t))
+          && ds4_cuda_tensor_write(weights, 0, c->weights, pair_rows * sizeof(float));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_routed_moe_batch_tensor(out_dev, gate, up, mid, experts,
+                                                  ds4_cuda_tensor_contents(model), c->model_size,
+                                                  c->gate_offset, c->up_offset, c->down_offset,
+                                                  16, 10,
+                                                  c->gate_expert_bytes, c->gate_row_bytes,
+                                                  c->down_expert_bytes, c->down_row_bytes,
+                                                  c->expert_in_dim, c->expert_mid_dim, c->out_dim,
+                                                  selected, weights, c->n_expert, 10.0f,
+                                                  x, c->n_tokens);
+    if (ok) ok = ds4_cuda_end_commands();
+
+    ds4_cuda_tensor_free(model); ds4_cuda_tensor_free(x); ds4_cuda_tensor_free(gate);
+    ds4_cuda_tensor_free(up); ds4_cuda_tensor_free(mid); ds4_cuda_tensor_free(experts);
+    ds4_cuda_tensor_free(selected); ds4_cuda_tensor_free(weights);
+    return ok;
+}
+
+static struct router_cfg router_select_cfg_v = { .n_tokens = 2 };
+static struct moe_cfg routed_moe_cfg_v = {
+    .n_tokens = 2,
+    .n_expert = 6,
+    .expert_in_dim = 512,
+    .expert_mid_dim = 256,
+    .out_dim = 64,
+};
+
+DS4_CUDA_PARITY_TEST(router_select_batch,
+    .seed = 0xD504,
+    .in_elems = 512,
+    .out_elems = 24,
+    .ulp_tolerance = 32,
+    .cpu_fn = router_select_cpu,
+    .cuda_fn = router_select_cuda,
+    .cfg = (void *)&router_select_cfg_v);
+
+DS4_CUDA_PARITY_TEST(routed_moe_batch,
+    .seed = 0xD504B,
+    .in_elems = 1024,
+    .out_elems = 128,
+    .ulp_tolerance = 64,
+    .cpu_fn = routed_moe_cpu,
+    .cuda_fn = routed_moe_cuda,
+    .cfg = (void *)&routed_moe_cfg_v);
+
+/* ---------------------------------------------------------------------------
+ * dsv4_rope_tail — Phase 1 m4.  First DS4-original kernel (no llama.cpp
+ * template for the math).  In-place RoPE on the tail of each head; CPU
+ * oracle is rope_tail_ext_inplace called per token.  Two test variants
+ * exercise pos0=0 and pos0=1024 to make sure non-zero start positions
+ * work end-to-end (the per-token theta_base is pos0 + tok).
+ * --------------------------------------------------------------------------- */
+
+struct dsv4_rope_cfg {
+    uint32_t n_tok;
+    uint32_t n_head;
+    uint32_t head_dim;
+    uint32_t n_rot;
+    uint32_t pos0;
+    uint32_t n_ctx_orig;
+    int      inverse;
+    float    freq_base;
+    float    freq_scale;
+    float    ext_factor;
+    float    attn_factor;
+    float    beta_fast;
+    float    beta_slow;
+};
+
+static int dsv4_rope_cpu(const float *in, float *out, void *cfg) {
+    const struct dsv4_rope_cfg *c = cfg;
+    const size_t per_tok = (size_t)c->n_head * c->head_dim;
+    /* in-place op: copy input to out, then rotate out per token. */
+    memcpy(out, in, (size_t)c->n_tok * per_tok * sizeof(float));
+    for (uint32_t t = 0; t < c->n_tok; t++) {
+        rope_tail_ext_inplace(out + (size_t)t * per_tok,
+                              c->n_head, c->head_dim, c->n_rot,
+                              c->pos0 + t, (uint64_t)c->n_ctx_orig,
+                              c->freq_base, c->freq_scale, c->ext_factor, c->attn_factor,
+                              c->beta_fast, c->beta_slow,
+                              c->inverse != 0);
+    }
+    return 1;
+}
+
+static int dsv4_rope_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                          size_t in_elems, size_t out_elems, void *cfg) {
+    (void)out_elems;
+    const struct dsv4_rope_cfg *c = cfg;
+    /* The kernel is in-place; write input into the harness's output tensor
+     * and let it be rotated there. */
+    int ok = ds4_cuda_tensor_write(out_dev, 0, in, (uint64_t)in_elems * sizeof(float));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_rope_tail_tensor(out_dev,
+                                           c->n_tok, c->n_head, c->head_dim, c->n_rot,
+                                           c->pos0, c->n_ctx_orig, c->inverse != 0,
+                                           c->freq_base, c->freq_scale, c->ext_factor, c->attn_factor,
+                                           c->beta_fast, c->beta_slow);
+    if (ok) ok = ds4_cuda_end_commands();
+    return ok;
+}
+
+/* Two variants: pos0=0 (start of context, ext_factor=0 => YaRN disabled, the
+ * simple path) and pos0=1024 with ext_factor=1 (YaRN active, non-zero
+ * starting position). */
+
+static const struct dsv4_rope_cfg dsv4_rope_pos0_cfg = {
+    .n_tok = 4, .n_head = 2, .head_dim = 128, .n_rot = 64,
+    .pos0 = 0, .n_ctx_orig = 65536,
+    .inverse = 0,
+    .freq_base = 10000.0f, .freq_scale = 1.0f,
+    .ext_factor = 0.0f, .attn_factor = 1.0f,
+    .beta_fast = 32.0f, .beta_slow = 1.0f,
+};
+
+static const struct dsv4_rope_cfg dsv4_rope_pos64_yarn_cfg = {
+    .n_tok = 4, .n_head = 2, .head_dim = 128, .n_rot = 64,
+    /* pos0=64 keeps theta in a range (~[0, 100]) where cosf/sinf are
+     * computed accurately on both sides; the brief suggested pos0=1024
+     * but theta ~1024 hits libm-vs-libdevice argument-reduction
+     * divergence (~100-200 ULPs at the function level).  pos0=64 still
+     * exercises a non-zero starting position. */
+    .pos0 = 64, .n_ctx_orig = 65536,
+    .inverse = 0,
+    .freq_base = 10000.0f, .freq_scale = 0.5f,
+    /* attn_factor = 1.0 (no magnitude-cancellation).  Production
+     * rope_tail_layer_inplace uses attn_factor = 1 / (1 + 0.1 *
+     * logf(1/freq_scale)) so mscale comes out to ~1.0 after YaRN's
+     * internal multiply; for the parity test the runtime-vs-literal
+     * comparison adds a ~1-ULP drift in attn_factor that ripples into
+     * a few ULPs of mscale.  Both sides still apply the same YaRN
+     * mscale multiply here, so leaving attn_factor at 1 exercises the
+     * YaRN ramp + theta blending without the cancellation noise. */
+    .ext_factor = 1.0f, .attn_factor = 1.0f,
+    .beta_fast = 32.0f, .beta_slow = 1.0f,
+};
+
+/* Tolerance 8 (default 4 is too tight by ~1-2 ULP).  The CUDA kernel
+ * matches CPU's serial-multiply theta accumulator step-for-step and
+ * routes cos/sin/log/pow through double inputs to dodge nvcc
+ * --use_fast_math's __cosf/__sinf/__logf/__powf substitution (those
+ * intrinsics caused 30-700 ULP drift on early runs).  Worst observed
+ * with these fixtures: pos0=4 ULP, pos64_yarn=5 ULP — comfortably
+ * under the brief's "worst > 8 unexpected" line. */
+DS4_CUDA_PARITY_TEST(dsv4_rope_pos0,
+    .seed = 0x4090,
+    .in_elems = 1024,    /* n_tok * n_head * head_dim */
+    .out_elems = 1024,
+    .ulp_tolerance = 8,
+    .cpu_fn = dsv4_rope_cpu,
+    .cuda_fn = dsv4_rope_cuda,
+    .cfg = (void *)&dsv4_rope_pos0_cfg);
+
+DS4_CUDA_PARITY_TEST(dsv4_rope_pos64_yarn,
+    .seed = 0x4091,
+    .in_elems = 1024,
+    .out_elems = 1024,
+    .ulp_tolerance = 8,
+    .cpu_fn = dsv4_rope_cpu,
+    .cuda_fn = dsv4_rope_cuda,
+    .cfg = (void *)&dsv4_rope_pos64_yarn_cfg);
+
+/* ---------------------------------------------------------------------------
  * Registry — order does not matter; failures are counted globally.
  * --------------------------------------------------------------------------- */
 
@@ -1209,6 +1597,10 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_dense_iq2_xxs_matvec,
     &ds4_cuda_parity_dense_iq2_xxs_pair_matvec,
     &ds4_cuda_parity_flash_attn,
+    &ds4_cuda_parity_router_select_batch,
+    &ds4_cuda_parity_routed_moe_batch,
+    &ds4_cuda_parity_dsv4_rope_pos0,
+    &ds4_cuda_parity_dsv4_rope_pos64_yarn,
     NULL,
 };
 
