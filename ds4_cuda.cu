@@ -38,6 +38,10 @@ static int g_device = 0;
 static int g_initialized;
 static int g_batch_open;
 static int g_quality_mode;
+static int g_attr_host_register_supported;
+static int g_attr_host_register_read_only_supported;
+static int g_attr_pageable_memory_access;
+static int g_attr_pageable_memory_access_uses_host_page_tables;
 
 static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
@@ -57,6 +61,16 @@ static int ds4_cuda_check(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
     fprintf(stderr, "ds4: CUDA %s failed: %s\n", what, cudaGetErrorString(err));
     return 0;
+}
+
+static int ds4_cuda_get_device_attr(cudaDeviceAttr attr) {
+    int value = 0;
+    cudaError_t err = cudaDeviceGetAttribute(&value, attr, g_device);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return value;
 }
 
 static double ds4_cuda_mib(uint64_t bytes) {
@@ -143,6 +157,14 @@ int ds4_cuda_init(void) {
 
     cudaDeviceProp prop;
     if (!ds4_cuda_check(cudaGetDeviceProperties(&prop, g_device), "get device properties")) return 0;
+    g_attr_host_register_supported =
+        ds4_cuda_get_device_attr(cudaDevAttrHostRegisterSupported);
+    g_attr_host_register_read_only_supported =
+        ds4_cuda_get_device_attr(cudaDevAttrHostRegisterReadOnlySupported);
+    g_attr_pageable_memory_access =
+        ds4_cuda_get_device_attr(cudaDevAttrPageableMemoryAccess);
+    g_attr_pageable_memory_access_uses_host_page_tables =
+        ds4_cuda_get_device_attr(cudaDevAttrPageableMemoryAccessUsesHostPageTables);
     fprintf(stderr,
             "ds4: CUDA device %d: %s, compute capability %d.%d, unified addressing %s, managed memory %s\n",
             g_device,
@@ -151,6 +173,12 @@ int ds4_cuda_init(void) {
             prop.minor,
             prop.unifiedAddressing ? "yes" : "no",
             prop.managedMemory ? "yes" : "no");
+    fprintf(stderr,
+            "ds4: CUDA attrs hostRegister=%s hostRegisterReadOnly=%s pageableAccess=%s pageableUsesHostPT=%s\n",
+            g_attr_host_register_supported ? "yes" : "no",
+            g_attr_host_register_read_only_supported ? "yes" : "no",
+            g_attr_pageable_memory_access ? "yes" : "no",
+            g_attr_pageable_memory_access_uses_host_page_tables ? "yes" : "no");
     if (!prop.managedMemory) {
         fprintf(stderr, "ds4: CUDA managed memory is required for the Phase 0 DS4 CUDA backend\n");
         return 0;
@@ -375,7 +403,14 @@ int ds4_cuda_set_model_map_range(const void *model_map, uint64_t model_size, uin
      * keeps it accessible, so this rounding is safe.  Passing a non-mmap
      * pointer whose tail does not extend a full page would touch invalid
      * memory here. */
-    unsigned int flags = cudaHostRegisterMapped | cudaHostRegisterReadOnly;
+    if (!g_attr_host_register_supported) {
+        fprintf(stderr, "ds4: CUDA host memory registration is not supported by this device\n");
+        return 0;
+    }
+    unsigned int flags = cudaHostRegisterMapped;
+    if (g_attr_host_register_read_only_supported) {
+        flags |= cudaHostRegisterReadOnly;
+    }
     if (!ds4_cuda_check(cudaHostRegister(registered_base, registered_bytes, flags), "model mmap registration")) {
         return 0;
     }
