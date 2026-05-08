@@ -3653,7 +3653,7 @@ static void matvec_iq2_xxs_expert_pair_prequant(
     ds4_parallel_for(out_dim0, matvec_iq2_xxs_pair_worker, &ctx);
 }
 
-static float silu(float x);
+float silu(float x);
 
 typedef struct {
     float *mid;
@@ -4206,7 +4206,7 @@ static void layer_attn_pre_one(
 }
 
 /* The input embedding starts all HC streams with the same token vector. */
-static void hc_from_plain_embedding(float *out_hc, const float *x, uint32_t n_embd, uint32_t n_hc) {
+void hc_from_plain_embedding(float *out_hc, const float *x, uint32_t n_embd, uint32_t n_hc) {
     for (uint32_t h = 0; h < n_hc; h++) {
         memcpy(out_hc + (uint64_t)h * n_embd, x, (size_t)n_embd * sizeof(x[0]));
     }
@@ -4733,7 +4733,7 @@ static inline void scale_f32(float *x, float a, uint32_t n) {
 #endif
 }
 
-static float sigmoid_stable(float x) {
+float sigmoid_stable(float x) {
     if (x >= 0.0f) {
         const float e = expf(-x);
         return 1.0f / (1.0f + e);
@@ -4860,17 +4860,17 @@ static void layer_grouped_out_batch(
  * and the HC post step that returns the result to four-stream state.
  */
 
-static float silu(float x) {
+float silu(float x) {
     return x * sigmoid_stable(x);
 }
 
-static float softplus_stable(float x) {
+float softplus_stable(float x) {
     if (x > 20.0f) return x;
     if (x < -20.0f) return expf(x);
     return log1pf(expf(x));
 }
 
-static void swiglu(float *out, const float *gate, const float *up, uint64_t n) {
+void swiglu(float *out, const float *gate, const float *up, uint64_t n) {
     for (uint64_t i = 0; i < n; i++) {
         out[i] = silu(gate[i]) * up[i];
     }

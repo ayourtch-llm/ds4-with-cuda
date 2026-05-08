@@ -159,5 +159,10 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 
 /* CPU reference functions used by CUDA parity tests. */
 void rms_norm_no_weight(float *out, const float *x, uint64_t n, float eps);
+float silu(float x);
+float sigmoid_stable(float x);
+float softplus_stable(float x);
+void swiglu(float *out, const float *gate, const float *up, uint64_t n);
+void hc_from_plain_embedding(float *out_hc, const float *x, uint32_t n_embd, uint32_t n_hc);
 
 #endif

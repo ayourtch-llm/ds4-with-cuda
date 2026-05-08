@@ -11,8 +11,10 @@
 #include "ds4_cuda.h"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <inttypes.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -142,6 +144,128 @@ static int ds4_cuda_tensor_range(
     }
     *ptr = (uint8_t *)tensor->base + tensor->offset;
     return 1;
+}
+
+static __device__ __forceinline__ float ds4_cuda_silu_f32(float x) {
+    if (x >= 0.0f) {
+        const float e = expf(-x);
+        return x * (1.0f / (1.0f + e));
+    }
+    const float e = expf(x);
+    return x * (e / (1.0f + e));
+}
+
+/* Adapted from llama.cpp 29debb3a6a4c291d66aabbc46a0bb8c17a77e267
+ * ggml/src/ggml-cuda/softmax.cu.  This is the DS4 contiguous no-mask row
+ * shape used by the current parity harness and compressor helper path. */
+template <int block_size>
+static __global__ void ds4_cuda_softmax_f32_kernel(
+        const float *x,
+        float *out,
+        uint32_t width,
+        uint32_t rows) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+
+    const float *row_x = x + (uint64_t)row * width;
+    float *row_out = out + (uint64_t)row * width;
+    const uint32_t tid = threadIdx.x;
+
+    float max_val = -INFINITY;
+    for (uint32_t i = tid; i < width; i += block_size) {
+        max_val = fmaxf(max_val, row_x[i]);
+    }
+
+    __shared__ float shmem[block_size];
+    shmem[tid] = max_val;
+    __syncthreads();
+    for (uint32_t stride = block_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) shmem[tid] = fmaxf(shmem[tid], shmem[tid + stride]);
+        __syncthreads();
+    }
+    max_val = shmem[0];
+
+    float sum = 0.0f;
+    for (uint32_t i = tid; i < width; i += block_size) {
+        const float v = expf(row_x[i] - max_val);
+        row_out[i] = v;
+        sum += v;
+    }
+
+    shmem[tid] = sum;
+    __syncthreads();
+    for (uint32_t stride = block_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) shmem[tid] += shmem[tid + stride];
+        __syncthreads();
+    }
+    const float inv_sum = 1.0f / shmem[0];
+
+    for (uint32_t i = tid; i < width; i += block_size) {
+        row_out[i] *= inv_sum;
+    }
+}
+
+/* Adapted from llama.cpp 29debb3a6a4c291d66aabbc46a0bb8c17a77e267
+ * ggml/src/ggml-cuda/getrows.cu. */
+static __global__ void ds4_cuda_get_rows_f32_kernel(
+        const float *table,
+        const int32_t *ids,
+        float *out,
+        uint32_t row_width,
+        uint32_t n_ids) {
+    const uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t row = blockIdx.y;
+    if (col >= row_width || row >= n_ids) return;
+    const int32_t id = ids[row];
+    out[(uint64_t)row * row_width + col] = table[(uint64_t)id * row_width + col];
+}
+
+static __global__ void ds4_cuda_get_rows_f16_to_f32_kernel(
+        const uint16_t *table,
+        const int32_t *ids,
+        float *out,
+        uint32_t row_width,
+        uint32_t n_ids) {
+    const uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t row = blockIdx.y;
+    if (col >= row_width || row >= n_ids) return;
+    const int32_t id = ids[row];
+    const uint16_t hbits = table[(uint64_t)id * row_width + col];
+    out[(uint64_t)row * row_width + col] = __half2float(__ushort_as_half(hbits));
+}
+
+/* Adapted from llama.cpp 29debb3a6a4c291d66aabbc46a0bb8c17a77e267
+ * ggml/src/ggml-cuda/cpy.cu. */
+template <typename T>
+static __global__ void ds4_cuda_cpy_1d_kernel(
+        const T *src,
+        T *dst,
+        uint32_t n) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[i];
+}
+
+/* Adapted from llama.cpp 29debb3a6a4c291d66aabbc46a0bb8c17a77e267
+ * ggml/src/ggml-cuda/unary.cu. */
+static __global__ void ds4_cuda_swiglu_f32_kernel(
+        const float *gate,
+        const float *up,
+        float *out,
+        uint32_t n) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = ds4_cuda_silu_f32(gate[i]) * up[i];
+}
+
+/* Adapted from llama.cpp 29debb3a6a4c291d66aabbc46a0bb8c17a77e267
+ * ggml/src/ggml-cuda/binbcast.cu. */
+static __global__ void ds4_cuda_repeat_hc_f32_kernel(
+        const float *row,
+        float *out,
+        uint32_t n_embd,
+        uint32_t n_hc) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total = n_embd * n_hc;
+    if (i < total) out[i] = row[i % n_embd];
 }
 
 /* Adapted from llama.cpp 29debb3a6a4c291d66aabbc46a0bb8c17a77e267
@@ -514,6 +638,91 @@ void ds4_cuda_print_memory_report(const char *label) {
             g_kernel_stub_calls);
 }
 
+int ds4_cuda_test_softmax_f32_tensor(
+        ds4_cuda_tensor       *out,
+        const ds4_cuda_tensor *x,
+        uint32_t               width,
+        uint32_t               rows) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (width == 0 || rows == 0) return 0;
+
+    const uint64_t elems = (uint64_t)width * rows;
+    if (elems > UINT64_MAX / sizeof(float)) return 0;
+    const uint64_t bytes = elems * sizeof(float);
+
+    void *x_ptr = NULL;
+    void *out_ptr = NULL;
+    if (!ds4_cuda_tensor_range(x, bytes, "softmax input", &x_ptr) ||
+        !ds4_cuda_tensor_range(out, bytes, "softmax output", &out_ptr)) {
+        return 0;
+    }
+
+    constexpr int block_size = 256;
+    ds4_cuda_softmax_f32_kernel<block_size>
+        <<<dim3(rows, 1, 1), dim3(block_size, 1, 1), 0, g_stream>>>(
+            (const float *)x_ptr, (float *)out_ptr, width, rows);
+    return ds4_cuda_check(cudaGetLastError(), "launch softmax");
+}
+
+int ds4_cuda_test_get_rows_f32_tensor(
+        ds4_cuda_tensor       *out,
+        const ds4_cuda_tensor *table,
+        const ds4_cuda_tensor *ids,
+        uint32_t               row_width,
+        uint32_t               table_rows,
+        uint32_t               n_ids) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (row_width == 0 || table_rows == 0 || n_ids == 0) return 0;
+
+    const uint64_t table_elems = (uint64_t)row_width * table_rows;
+    const uint64_t out_elems = (uint64_t)row_width * n_ids;
+    if (table_elems > UINT64_MAX / sizeof(float) ||
+        out_elems > UINT64_MAX / sizeof(float) ||
+        n_ids > UINT64_MAX / sizeof(int32_t)) {
+        return 0;
+    }
+
+    void *table_ptr = NULL;
+    void *ids_ptr = NULL;
+    void *out_ptr = NULL;
+    if (!ds4_cuda_tensor_range(table, table_elems * sizeof(float), "get_rows table", &table_ptr) ||
+        !ds4_cuda_tensor_range(ids, (uint64_t)n_ids * sizeof(int32_t), "get_rows ids", &ids_ptr) ||
+        !ds4_cuda_tensor_range(out, out_elems * sizeof(float), "get_rows output", &out_ptr)) {
+        return 0;
+    }
+
+    const dim3 block(256, 1, 1);
+    const dim3 grid((row_width + block.x - 1u) / block.x, n_ids, 1);
+    ds4_cuda_get_rows_f32_kernel<<<grid, block, 0, g_stream>>>(
+        (const float *)table_ptr, (const int32_t *)ids_ptr, (float *)out_ptr, row_width, n_ids);
+    return ds4_cuda_check(cudaGetLastError(), "launch get_rows f32");
+}
+
+int ds4_cuda_test_cpy_f32_tensor(
+        ds4_cuda_tensor       *out,
+        const ds4_cuda_tensor *x,
+        uint32_t               n) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (n == 0) return 0;
+
+    const uint64_t bytes = (uint64_t)n * sizeof(float);
+    void *x_ptr = NULL;
+    void *out_ptr = NULL;
+    if (!ds4_cuda_tensor_range(x, bytes, "cpy input", &x_ptr) ||
+        !ds4_cuda_tensor_range(out, bytes, "cpy output", &out_ptr)) {
+        return 0;
+    }
+
+    const uint32_t block = 256;
+    const uint32_t grid = (n + block - 1u) / block;
+    ds4_cuda_cpy_1d_kernel<float><<<grid, block, 0, g_stream>>>(
+        (const float *)x_ptr, (float *)out_ptr, n);
+    return ds4_cuda_check(cudaGetLastError(), "launch cpy f32");
+}
+
 #define DS4_CUDA_STUB(fn, args) \
     int fn args { return ds4_cuda_kernel_stub(#fn); }
 
@@ -530,7 +739,31 @@ DS4_CUDA_STUB(ds4_cuda_shared_gate_up_swiglu_q8_0_tensor, (ds4_cuda_tensor *, ds
 DS4_CUDA_STUB(ds4_cuda_matmul_f16_tensor, (ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, const ds4_cuda_tensor *, uint64_t))
 DS4_CUDA_STUB(ds4_cuda_matmul_f16_pair_tensor, (ds4_cuda_tensor *, ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, const ds4_cuda_tensor *, uint64_t))
 DS4_CUDA_STUB(ds4_cuda_matmul_f32_tensor, (ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, const ds4_cuda_tensor *, uint64_t))
-DS4_CUDA_STUB(ds4_cuda_repeat_hc_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t))
+int ds4_cuda_repeat_hc_tensor(
+        ds4_cuda_tensor       *out,
+        const ds4_cuda_tensor *row,
+        uint32_t               n_embd,
+        uint32_t               n_hc) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (n_embd == 0 || n_hc == 0) return 0;
+
+    const uint64_t total = (uint64_t)n_embd * n_hc;
+    if (total > UINT32_MAX || total > UINT64_MAX / sizeof(float)) return 0;
+
+    void *row_ptr = NULL;
+    void *out_ptr = NULL;
+    if (!ds4_cuda_tensor_range(row, (uint64_t)n_embd * sizeof(float), "repeat_hc input", &row_ptr) ||
+        !ds4_cuda_tensor_range(out, total * sizeof(float), "repeat_hc output", &out_ptr)) {
+        return 0;
+    }
+
+    const uint32_t block = 256;
+    const uint32_t grid = ((uint32_t)total + block - 1u) / block;
+    ds4_cuda_repeat_hc_f32_kernel<<<grid, block, 0, g_stream>>>(
+        (const float *)row_ptr, (float *)out_ptr, n_embd, n_hc);
+    return ds4_cuda_check(cudaGetLastError(), "launch repeat_hc");
+}
 int ds4_cuda_rms_norm_plain_tensor(
         ds4_cuda_tensor       *out,
         const ds4_cuda_tensor *x,
@@ -657,7 +890,36 @@ DS4_CUDA_STUB(ds4_cuda_attention_prefill_masked_mixed_heads_tensor, (ds4_cuda_te
 DS4_CUDA_STUB(ds4_cuda_attention_output_q8_batch_tensor, (ds4_cuda_tensor *, ds4_cuda_tensor *, ds4_cuda_tensor *, ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint64_t, const ds4_cuda_tensor *, uint32_t))
 DS4_CUDA_STUB(ds4_cuda_attention_output_low_q8_tensor, (ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, const ds4_cuda_tensor *))
 
-DS4_CUDA_STUB(ds4_cuda_swiglu_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, float, float))
+int ds4_cuda_swiglu_tensor(
+        ds4_cuda_tensor       *out,
+        const ds4_cuda_tensor *gate,
+        const ds4_cuda_tensor *up,
+        uint32_t               n,
+        float                  clamp,
+        float                  weight) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (n == 0) return 0;
+    if (fabsf(clamp) > 1e-12f || fabsf(weight - 1.0f) > 1e-12f) {
+        return ds4_cuda_kernel_stub("ds4_cuda_swiglu_tensor non-default clamp/weight");
+    }
+
+    const uint64_t bytes = (uint64_t)n * sizeof(float);
+    void *gate_ptr = NULL;
+    void *up_ptr = NULL;
+    void *out_ptr = NULL;
+    if (!ds4_cuda_tensor_range(gate, bytes, "swiglu gate", &gate_ptr) ||
+        !ds4_cuda_tensor_range(up, bytes, "swiglu up", &up_ptr) ||
+        !ds4_cuda_tensor_range(out, bytes, "swiglu output", &out_ptr)) {
+        return 0;
+    }
+
+    const uint32_t block = 256;
+    const uint32_t grid = (n + block - 1u) / block;
+    ds4_cuda_swiglu_f32_kernel<<<grid, block, 0, g_stream>>>(
+        (const float *)gate_ptr, (const float *)up_ptr, (float *)out_ptr, n);
+    return ds4_cuda_check(cudaGetLastError(), "launch swiglu");
+}
 DS4_CUDA_STUB(ds4_cuda_add_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t))
 DS4_CUDA_STUB(ds4_cuda_router_select_tensor, (ds4_cuda_tensor *, ds4_cuda_tensor *, ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, bool, bool, const ds4_cuda_tensor *))
 DS4_CUDA_STUB(ds4_cuda_router_select_batch_tensor, (ds4_cuda_tensor *, ds4_cuda_tensor *, ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, bool, bool, const ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t))
@@ -677,5 +939,302 @@ DS4_CUDA_STUB(ds4_cuda_shared_down_hc_expand_q8_0_tensor, (ds4_cuda_tensor *, ds
 DS4_CUDA_STUB(ds4_cuda_matmul_q8_0_hc_expand_tensor, (ds4_cuda_tensor *, ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, const ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t))
 
 #undef DS4_CUDA_STUB
+
+} /* extern "C" */
+
+/* =========================================================================
+ * Phase 1 m2 — standard kernel ports.
+ * =========================================================================
+ *
+ * concat / sum_rows / argsort / unary (silu/sigmoid/softplus/scale) /
+ * set_rows.  These are not exposed in ds4_cuda.h yet — they are tested in
+ * isolation by tests/ds4_cuda_test.c (which forward-declares the entry
+ * points).  Higher-level wrappers in Phase 2+ will route through them.
+ *
+ * Attribution: kernels marked "Adapted from llama.cpp <SHA>" are derived
+ * from the GGML CUDA backend at SHA 29debb3a6a4c291d66aabbc46a0bb8c17a77e267
+ * (tmp/llama.cpp/ggml/src/ggml-cuda/<file>.cu).
+ * ========================================================================= */
+
+/* Adapted from llama.cpp 29debb3a6a4c291d66aabbc46a0bb8c17a77e267
+ * ggml/src/ggml-cuda/concat.cu — DS4 only needs 1-D concat (axis 0) for the
+ * Phase 1 parity surface; the full 4-D Metal shape will follow when a real
+ * caller appears. */
+static __global__ void ds4_cuda_concat_f32_1d_kernel(
+        const float *a,
+        uint32_t na,
+        const float *b,
+        uint32_t nb,
+        float *out) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t total = na + nb;
+    if (i >= total) return;
+    out[i] = (i < na) ? a[i] : b[i - na];
+}
+
+/* Adapted from llama.cpp 29debb3a6a4c291d66aabbc46a0bb8c17a77e267
+ * ggml/src/ggml-cuda/sumrows.cu.  One block per row, block-wide reduction. */
+template <int block_size>
+static __global__ void ds4_cuda_sum_rows_f32_kernel(
+        const float *x,
+        uint32_t cols,
+        uint32_t rows,
+        float *out) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const uint32_t tid = threadIdx.x;
+
+    const float *row_x = x + (uint64_t)row * cols;
+    float sum = 0.0f;
+    for (uint32_t i = tid; i < cols; i += block_size) {
+        sum += row_x[i];
+    }
+
+    __shared__ float shmem[block_size];
+    shmem[tid] = sum;
+    __syncthreads();
+    for (uint32_t s = block_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shmem[tid] += shmem[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) out[row] = shmem[0];
+}
+
+/* Adapted from llama.cpp 29debb3a6a4c291d66aabbc46a0bb8c17a77e267
+ * ggml/src/ggml-cuda/argsort.cu.  Single-block bitonic sort returning
+ * indices.  DS4 only emits descending (router/indexer top-k semantics).
+ * Caller must pass a power-of-two `n` <= 1024 (one block, one thread per
+ * element); the larger Metal multi-block variant lands when a caller needs
+ * it. */
+static __global__ void ds4_cuda_argsort_f32_i32_desc_kernel(
+        const float *x,
+        int32_t *out,
+        uint32_t n) {
+    extern __shared__ int32_t shmem_argsort[];
+    const uint32_t col = threadIdx.x;
+    if (col >= n) return;
+
+    shmem_argsort[col] = (int32_t)col;
+    __syncthreads();
+
+    for (uint32_t k = 2; k <= n; k *= 2) {
+        for (uint32_t j = k / 2; j > 0; j /= 2) {
+            const uint32_t ixj = col ^ j;
+            if (ixj > col) {
+                const bool descending = ((col & k) == 0);
+                const float a = x[shmem_argsort[col]];
+                const float b = x[shmem_argsort[ixj]];
+                const bool swap = descending ? (a < b) : (a > b);
+                if (swap) {
+                    int32_t tmp = shmem_argsort[col];
+                    shmem_argsort[col] = shmem_argsort[ixj];
+                    shmem_argsort[ixj] = tmp;
+                }
+            }
+            __syncthreads();
+        }
+    }
+    out[col] = shmem_argsort[col];
+}
+
+/* Adapted from llama.cpp 29debb3a6a4c291d66aabbc46a0bb8c17a77e267
+ * ggml/src/ggml-cuda/unary.cu.  Element-wise families; one templated
+ * kernel per op.  Op IDs are private to this TU (no public enum). */
+enum {
+    DS4_CUDA_UNARY_SILU      = 0,
+    DS4_CUDA_UNARY_SIGMOID   = 1,
+    DS4_CUDA_UNARY_SOFTPLUS  = 2,
+    DS4_CUDA_UNARY_SCALE     = 3,
+};
+
+template <int op>
+static __global__ void ds4_cuda_unary_kernel(
+        const float *x,
+        uint32_t n,
+        float a,
+        float b,
+        float *out) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = x[i];
+    float r;
+    if constexpr (op == DS4_CUDA_UNARY_SILU) {
+        /* sigmoid_stable(v) for matching ds4.c CPU reference: avoids overflow
+         * for v < 0 by computing e^v / (1+e^v) instead of 1/(1+e^-v). */
+        const float e = (v >= 0.0f) ? expf(-v) : expf(v);
+        const float s = (v >= 0.0f) ? (1.0f / (1.0f + e)) : (e / (1.0f + e));
+        r = v * s;
+    } else if constexpr (op == DS4_CUDA_UNARY_SIGMOID) {
+        const float e = (v >= 0.0f) ? expf(-v) : expf(v);
+        r = (v >= 0.0f) ? (1.0f / (1.0f + e)) : (e / (1.0f + e));
+    } else if constexpr (op == DS4_CUDA_UNARY_SOFTPLUS) {
+        r = (v > 20.0f) ? v : ((v < -20.0f) ? expf(v) : log1pf(expf(v)));
+    } else { /* DS4_CUDA_UNARY_SCALE */
+        r = v * a + b;
+    }
+    out[i] = r;
+}
+
+/* Adapted from llama.cpp 29debb3a6a4c291d66aabbc46a0bb8c17a77e267
+ * ggml/src/ggml-cuda (set_rows is structurally symmetric to getrows.cu):
+ * scatter `nrows` rows of `cols` floats into `dst` at the indices given by
+ * `idx`.  No bounds check beyond a non-negative-index guard; matches the
+ * Metal kernel's contract. */
+static __global__ void ds4_cuda_set_rows_f32_kernel(
+        float *dst,
+        uint32_t dst_rows,
+        const float *src,
+        const int32_t *idx,
+        uint32_t cols,
+        uint32_t nrows) {
+    const uint32_t row = blockIdx.x;
+    if (row >= nrows) return;
+    const int32_t target = idx[row];
+    if (target < 0 || (uint32_t)target >= dst_rows) return;
+    const float *src_row = src + (uint64_t)row * cols;
+    float       *dst_row = dst + (uint64_t)target * cols;
+    for (uint32_t c = threadIdx.x; c < cols; c += blockDim.x) {
+        dst_row[c] = src_row[c];
+    }
+}
+
+extern "C" {
+
+int ds4_cuda_test_concat_f32_1d_tensor(
+        ds4_cuda_tensor       *out,
+        const ds4_cuda_tensor *a,
+        uint32_t               na,
+        const ds4_cuda_tensor *b,
+        uint32_t               nb) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    const uint32_t total = na + nb;
+    if (total == 0) return 0;
+    void *a_ptr = NULL, *b_ptr = NULL, *out_ptr = NULL;
+    if (na && !ds4_cuda_tensor_range(a,  (uint64_t)na    * sizeof(float), "concat a",   &a_ptr))   return 0;
+    if (nb && !ds4_cuda_tensor_range(b,  (uint64_t)nb    * sizeof(float), "concat b",   &b_ptr))   return 0;
+    if (    !ds4_cuda_tensor_range(out, (uint64_t)total * sizeof(float), "concat out", &out_ptr)) return 0;
+
+    constexpr int block_size = 256;
+    const uint32_t blocks = (total + block_size - 1) / block_size;
+    ds4_cuda_concat_f32_1d_kernel<<<blocks, block_size, 0, g_stream>>>(
+        (const float *)a_ptr, na, (const float *)b_ptr, nb, (float *)out_ptr);
+    return ds4_cuda_check(cudaGetLastError(), "launch concat");
+}
+
+int ds4_cuda_test_sum_rows_f32_tensor(
+        ds4_cuda_tensor       *out,
+        const ds4_cuda_tensor *x,
+        uint32_t               cols,
+        uint32_t               rows) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (cols == 0 || rows == 0) return 0;
+    void *x_ptr = NULL, *out_ptr = NULL;
+    if (!ds4_cuda_tensor_range(x,   (uint64_t)cols * rows * sizeof(float), "sum_rows in",  &x_ptr))   return 0;
+    if (!ds4_cuda_tensor_range(out, (uint64_t)rows         * sizeof(float), "sum_rows out", &out_ptr)) return 0;
+
+    constexpr int block_size = 256;
+    ds4_cuda_sum_rows_f32_kernel<block_size><<<rows, block_size, 0, g_stream>>>(
+        (const float *)x_ptr, cols, rows, (float *)out_ptr);
+    return ds4_cuda_check(cudaGetLastError(), "launch sum_rows");
+}
+
+int ds4_cuda_test_argsort_f32_i32_desc_tensor(
+        ds4_cuda_tensor       *indices,
+        const ds4_cuda_tensor *x,
+        uint32_t               n) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    /* Single-block bitonic requires power-of-two n <= 1024. */
+    if (n == 0 || n > 1024 || (n & (n - 1)) != 0) return 0;
+    void *x_ptr = NULL, *out_ptr = NULL;
+    if (!ds4_cuda_tensor_range(x,       (uint64_t)n * sizeof(float),   "argsort in",  &x_ptr))   return 0;
+    if (!ds4_cuda_tensor_range(indices, (uint64_t)n * sizeof(int32_t), "argsort out", &out_ptr)) return 0;
+
+    const size_t shmem_bytes = (size_t)n * sizeof(int32_t);
+    ds4_cuda_argsort_f32_i32_desc_kernel<<<1, n, shmem_bytes, g_stream>>>(
+        (const float *)x_ptr, (int32_t *)out_ptr, n);
+    return ds4_cuda_check(cudaGetLastError(), "launch argsort");
+}
+
+static int ds4_cuda_unary_dispatch(
+        ds4_cuda_tensor       *out,
+        const ds4_cuda_tensor *x,
+        uint32_t               n,
+        int                    op,
+        float                  a,
+        float                  b,
+        const char            *label) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (n == 0) return 0;
+    void *x_ptr = NULL, *out_ptr = NULL;
+    if (!ds4_cuda_tensor_range(x,   (uint64_t)n * sizeof(float), "unary in",  &x_ptr))   return 0;
+    if (!ds4_cuda_tensor_range(out, (uint64_t)n * sizeof(float), "unary out", &out_ptr)) return 0;
+
+    constexpr int block_size = 256;
+    const uint32_t blocks = (n + block_size - 1) / block_size;
+    switch (op) {
+        case DS4_CUDA_UNARY_SILU:
+            ds4_cuda_unary_kernel<DS4_CUDA_UNARY_SILU><<<blocks, block_size, 0, g_stream>>>(
+                (const float *)x_ptr, n, a, b, (float *)out_ptr);
+            break;
+        case DS4_CUDA_UNARY_SIGMOID:
+            ds4_cuda_unary_kernel<DS4_CUDA_UNARY_SIGMOID><<<blocks, block_size, 0, g_stream>>>(
+                (const float *)x_ptr, n, a, b, (float *)out_ptr);
+            break;
+        case DS4_CUDA_UNARY_SOFTPLUS:
+            ds4_cuda_unary_kernel<DS4_CUDA_UNARY_SOFTPLUS><<<blocks, block_size, 0, g_stream>>>(
+                (const float *)x_ptr, n, a, b, (float *)out_ptr);
+            break;
+        case DS4_CUDA_UNARY_SCALE:
+            ds4_cuda_unary_kernel<DS4_CUDA_UNARY_SCALE><<<blocks, block_size, 0, g_stream>>>(
+                (const float *)x_ptr, n, a, b, (float *)out_ptr);
+            break;
+        default:
+            return 0;
+    }
+    return ds4_cuda_check(cudaGetLastError(), label);
+}
+
+int ds4_cuda_test_unary_silu_tensor(ds4_cuda_tensor *out, const ds4_cuda_tensor *x, uint32_t n) {
+    return ds4_cuda_unary_dispatch(out, x, n, DS4_CUDA_UNARY_SILU, 0.0f, 0.0f, "launch unary silu");
+}
+
+int ds4_cuda_test_unary_sigmoid_tensor(ds4_cuda_tensor *out, const ds4_cuda_tensor *x, uint32_t n) {
+    return ds4_cuda_unary_dispatch(out, x, n, DS4_CUDA_UNARY_SIGMOID, 0.0f, 0.0f, "launch unary sigmoid");
+}
+
+int ds4_cuda_test_unary_softplus_tensor(ds4_cuda_tensor *out, const ds4_cuda_tensor *x, uint32_t n) {
+    return ds4_cuda_unary_dispatch(out, x, n, DS4_CUDA_UNARY_SOFTPLUS, 0.0f, 0.0f, "launch unary softplus");
+}
+
+int ds4_cuda_test_unary_scale_tensor(ds4_cuda_tensor *out, const ds4_cuda_tensor *x, uint32_t n,
+                                     float scale, float bias) {
+    return ds4_cuda_unary_dispatch(out, x, n, DS4_CUDA_UNARY_SCALE, scale, bias, "launch unary scale");
+}
+
+int ds4_cuda_test_set_rows_f32_tensor(
+        ds4_cuda_tensor       *dst,
+        uint32_t               dst_rows,
+        const ds4_cuda_tensor *src,
+        const ds4_cuda_tensor *idx,
+        uint32_t               cols,
+        uint32_t               nrows) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (cols == 0 || nrows == 0 || dst_rows == 0) return 0;
+    void *dst_ptr = NULL, *src_ptr = NULL, *idx_ptr = NULL;
+    if (!ds4_cuda_tensor_range(dst, (uint64_t)dst_rows * cols * sizeof(float), "set_rows dst", &dst_ptr)) return 0;
+    if (!ds4_cuda_tensor_range(src, (uint64_t)nrows    * cols * sizeof(float), "set_rows src", &src_ptr)) return 0;
+    if (!ds4_cuda_tensor_range(idx, (uint64_t)nrows           * sizeof(int32_t), "set_rows idx", &idx_ptr)) return 0;
+
+    /* One block per source row; block_size threads cooperate along cols. */
+    const int block_size = (cols < 256u) ? (int)cols : 256;
+    ds4_cuda_set_rows_f32_kernel<<<nrows, block_size, 0, g_stream>>>(
+        (float *)dst_ptr, dst_rows, (const float *)src_ptr, (const int32_t *)idx_ptr, cols, nrows);
+    return ds4_cuda_check(cudaGetLastError(), "launch set_rows");
+}
 
 } /* extern "C" */
