@@ -4386,7 +4386,7 @@ static DS4_MAYBE_UNUSED void sum_down_pairs_worker(void *vctx, uint64_t row0, ui
 
 /* Decode the HC control projection.  The output contains pre weights, post
  * gates, and a small doubly-normalized combine matrix. */
-static void hc_split_sinkhorn_one(
+void hc_split_sinkhorn_one(
         float       * out,
         const float * mix,
         const float * scale,

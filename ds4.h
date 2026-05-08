@@ -271,5 +271,7 @@ void hc_weighted_sum_one(float *out, const float *x, const float *weights, uint3
 void hc_post_one(float *out_hc, const float *block_out, const float *residual_hc,
                  const float *post, const float *comb,
                  uint32_t n_embd, uint32_t n_hc);
+void hc_split_sinkhorn_one(float *out, const float *mix, const float *scale, const float *base,
+                           int n_hc, int iters, float eps);
 
 #endif
