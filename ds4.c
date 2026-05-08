@@ -2645,6 +2645,71 @@ static void matvec_f16_serial(float *out, const ds4_model *m, const ds4_tensor *
     }
 }
 
+void ds4_test_dense_f16_matvec(
+        float          *out,
+        const uint16_t *weights,
+        const float    *x,
+        uint32_t        in_dim,
+        uint32_t        out_dim) {
+    for (uint32_t row = 0; row < out_dim; row++) {
+        out[row] = dot_f16_row(weights + (uint64_t)row * in_dim, x, in_dim);
+    }
+}
+
+void ds4_test_quantize_row_q8_K(const float *x, void *y, int64_t k) {
+    ds4_quantize_row_q8_K(x, (block_q8_K *)y, k);
+}
+
+void ds4_test_dense_q2_k_matvec(
+        float      *out,
+        const void *weights,
+        const void *xq,
+        uint32_t    in_dim,
+        uint32_t    out_dim) {
+    const uint64_t blocks = in_dim / QK_K;
+    const block_q2_K *w = (const block_q2_K *)weights;
+    const block_q8_K *x = (const block_q8_K *)xq;
+    for (uint32_t row = 0; row < out_dim; row++) {
+        ds4_vec_dot_q2_K_q8_K((int)in_dim, &out[row], w + (uint64_t)row * blocks, x);
+    }
+}
+
+void ds4_test_dense_iq2_xxs_matvec(
+        float      *out,
+        const void *weights,
+        const void *xq,
+        uint32_t    in_dim,
+        uint32_t    out_dim) {
+    pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
+    const uint64_t blocks = in_dim / QK_K;
+    const block_iq2_xxs *w = (const block_iq2_xxs *)weights;
+    const block_q8_K *x = (const block_q8_K *)xq;
+    for (uint32_t row = 0; row < out_dim; row++) {
+        ds4_vec_dot_iq2_xxs_q8_K((int)in_dim, &out[row], w + (uint64_t)row * blocks, x);
+    }
+}
+
+void ds4_test_dense_iq2_xxs_pair_matvec(
+        float      *out0,
+        float      *out1,
+        const void *weights0,
+        const void *weights1,
+        const void *xq,
+        uint32_t    in_dim,
+        uint32_t    out_dim) {
+    pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
+    const uint64_t blocks = in_dim / QK_K;
+    const block_iq2_xxs *w0 = (const block_iq2_xxs *)weights0;
+    const block_iq2_xxs *w1 = (const block_iq2_xxs *)weights1;
+    const block_q8_K *x = (const block_q8_K *)xq;
+    for (uint32_t row = 0; row < out_dim; row++) {
+        ds4_vec_dot_iq2_xxs_pair_q8_K((int)in_dim, &out0[row], &out1[row],
+                                      w0 + (uint64_t)row * blocks,
+                                      w1 + (uint64_t)row * blocks,
+                                      x);
+    }
+}
+
 typedef struct {
     float *out;
     const uint8_t *data;
@@ -4745,6 +4810,58 @@ float sigmoid_stable(float x) {
 
 /* Sink-aware attention over a set of KV rows.  The learned sink logit is part
  * of the softmax denominator but contributes no value vector. */
+/* Two-pass softmax attention with sinks, parameterised on n_head/head_dim.
+ *
+ * One query row attends to n_kv KV rows.  DS4 is multi-query (n_head_kv == 1)
+ * so all heads share the same KV row.  `sinks[h]` is mixed into the softmax
+ * as a learned bias toward attending to "nothing"; it shows up once in the
+ * max/denominator and never as a value contribution.
+ *
+ * Exposed so the CUDA flash-attention parity test can use it as the oracle
+ * without dragging the ds4_model / ds4_layer_weights structs into tests/. */
+void attention_rows_raw_cpu(
+        float       *out_heads,
+        const float *q,
+        const float *kv_rows,
+        uint32_t     n_kv,
+        const float *sinks,
+        uint32_t     n_head,
+        uint32_t     head_dim) {
+    const float kq_scale = 1.0f / sqrtf((float)head_dim);
+    float score_stack[512];
+    float *score = n_kv <= 512 ? score_stack : xmalloc((size_t)n_kv * sizeof(score[0]));
+
+    for (uint32_t h = 0; h < n_head; h++) {
+        const float *qh = q + (uint64_t)h * head_dim;
+
+        float max_score = sinks[h];
+        for (uint32_t r = 0; r < n_kv; r++) {
+            const float *kv = kv_rows + (uint64_t)r * head_dim;
+            float s = 0.0f;
+            for (uint32_t i = 0; i < head_dim; i++) s += qh[i] * kv[i];
+            s *= kq_scale;
+            score[r] = s;
+            if (s > max_score) max_score = s;
+        }
+
+        float *oh = out_heads + (uint64_t)h * head_dim;
+        memset(oh, 0, (size_t)head_dim * sizeof(oh[0]));
+
+        float denom = expf(sinks[h] - max_score);
+        for (uint32_t r = 0; r < n_kv; r++) {
+            const float weight = expf(score[r] - max_score);
+            const float *kv = kv_rows + (uint64_t)r * head_dim;
+            denom += weight;
+            for (uint32_t i = 0; i < head_dim; i++) oh[i] += weight * kv[i];
+        }
+
+        const float inv = 1.0f / denom;
+        for (uint32_t i = 0; i < head_dim; i++) oh[i] *= inv;
+    }
+
+    if (score != score_stack) free(score);
+}
+
 static void layer_attention_rows_one(
         float             * out_heads,
         const ds4_model   * model,
@@ -4752,37 +4869,11 @@ static void layer_attention_rows_one(
         const float       * q,
         const float       * kv_rows,
         uint32_t            n_kv) {
+    /* Production callers go through the parameterised core; the SIMD-friendly
+     * dot_f32 / axpy_f32 / scale_f32 helpers used previously have moved into
+     * the inline loops there.  The math is identical. */
     const float *sinks = tensor_data(model, layer->attn_sinks);
-    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
-    float score_stack[512];
-    float *score = n_kv <= 512 ? score_stack : xmalloc((size_t)n_kv * sizeof(score[0]));
-
-    for (uint32_t h = 0; h < DS4_N_HEAD; h++) {
-        const float *qh = q + (uint64_t)h * DS4_N_HEAD_DIM;
-
-        float max_score = sinks[h];
-        for (uint32_t r = 0; r < n_kv; r++) {
-            const float *kv = kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
-            score[r] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
-            if (score[r] > max_score) max_score = score[r];
-        }
-
-        float *oh = out_heads + (uint64_t)h * DS4_N_HEAD_DIM;
-        memset(oh, 0, (size_t)DS4_N_HEAD_DIM * sizeof(oh[0]));
-
-        float denom = expf(sinks[h] - max_score);
-        for (uint32_t r = 0; r < n_kv; r++) {
-            const float weight = expf(score[r] - max_score);
-            const float *kv = kv_rows + (uint64_t)r * DS4_N_HEAD_DIM;
-            denom += weight;
-            axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
-        }
-
-        const float inv = 1.0f / denom;
-        scale_f32(oh, inv, DS4_N_HEAD_DIM);
-    }
-
-    if (score != score_stack) free(score);
+    attention_rows_raw_cpu(out_heads, q, kv_rows, n_kv, sinks, DS4_N_HEAD, DS4_N_HEAD_DIM);
 }
 
 static void layer_attention_one(
