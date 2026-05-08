@@ -1813,6 +1813,386 @@ DS4_CUDA_PARITY_TEST(indexer_score_one,
     .cfg = (void *)&indexer_score_one_cfg_v);
 
 /* ---------------------------------------------------------------------------
+ * Phase 1 m5 — dsv4_kv: four DS4-original kernels from metal/dsv4_kv.metal.
+ * Two are public APIs (fp8_kv_quantize, kv_fp8_store_raw); the remaining
+ * two (ratio4_shift, compressor_store_one) are internal Metal helpers
+ * dispatched inside compressor_update on Metal — exposed here via
+ * ds4_cuda_test_* thunks for parity-testing the kernel math directly.
+ * --------------------------------------------------------------------------- */
+
+extern int ds4_cuda_test_dsv4_ratio4_shift_tensor(
+        ds4_cuda_tensor *state_kv,
+        ds4_cuda_tensor *state_score,
+        uint32_t         width);
+
+extern int ds4_cuda_test_dsv4_compressor_store_one_tensor(
+        const ds4_cuda_tensor *kv,
+        const ds4_cuda_tensor *score,
+        const ds4_cuda_tensor *ape,
+        ds4_cuda_tensor       *state_kv,
+        ds4_cuda_tensor       *state_score,
+        uint32_t               width,
+        uint32_t               ratio,
+        uint32_t               pos,
+        uint32_t               ape_type);
+
+/* ---- dsv4_fp8_kv_quantize: in-place E4M3FN round trip on the non-RoPE
+ *      prefix of every row.  Production shape: head_dim=128, n_rot=64,
+ *      so n_nope=64 (one block per row).  Test multi-row to exercise the
+ *      grid loop. */
+
+struct dsv4_fp8_kv_quantize_cfg {
+    uint32_t n_rows;
+    uint32_t head_dim;
+    uint32_t n_rot;
+};
+
+static int dsv4_fp8_kv_quantize_cpu(const float *in, float *out, void *cfg) {
+    const struct dsv4_fp8_kv_quantize_cfg *c = cfg;
+    const size_t per_row = (size_t)c->head_dim;
+    memcpy(out, in, (size_t)c->n_rows * per_row * sizeof(float));
+    for (uint32_t r = 0; r < c->n_rows; r++) {
+        dsv4_fp8_kv_quantize_row_inplace_cpu(out + r * per_row, c->head_dim, c->n_rot);
+    }
+    return 1;
+}
+
+static int dsv4_fp8_kv_quantize_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                     size_t in_elems, size_t out_elems, void *cfg) {
+    (void)out_elems;
+    const struct dsv4_fp8_kv_quantize_cfg *c = cfg;
+    int ok = ds4_cuda_tensor_write(out_dev, 0, in, (uint64_t)in_elems * sizeof(float));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_dsv4_fp8_kv_quantize_tensor(out_dev, c->n_rows, c->head_dim, c->n_rot);
+    if (ok) ok = ds4_cuda_end_commands();
+    return ok;
+}
+
+static const struct dsv4_fp8_kv_quantize_cfg dsv4_fp8_kv_quantize_cfg_v = {
+    .n_rows = 4, .head_dim = 128, .n_rot = 64,
+};
+
+/* Tolerance 0: the E4M3FN round-trip selects from a fixed 128-entry table
+ * with deterministic tie-break, the per-64 amax is order-independent for
+ * max-reduction, and log2/exp2 are routed through doubles to dodge the
+ * --use_fast_math intrinsics (Trap #1).  Expected bit-exact with CPU
+ * oracle. */
+DS4_CUDA_PARITY_TEST(dsv4_fp8_kv_quantize,
+    .seed = 0xFB80,
+    .in_elems = 4 * 128,
+    .out_elems = 4 * 128,
+    .ulp_tolerance = 0,
+    .cpu_fn = dsv4_fp8_kv_quantize_cpu,
+    .cuda_fn = dsv4_fp8_kv_quantize_cuda,
+    .cfg = (void *)&dsv4_fp8_kv_quantize_cfg_v);
+
+/* ---- dsv4_kv_fp8_store_raw: single-row finalizer.  In-place FP8 round
+ *      trip on kv's non-RoPE prefix + F16-rounded write of the full row
+ *      into raw_cache[row].  Output layout: [kv (head_dim) | raw_row
+ *      (head_dim)].  CPU oracle uses ds4_test_dsv4_kv_fp8_store_raw,
+ *      which uses the same FP8 helper. */
+
+struct dsv4_kv_fp8_store_cfg {
+    uint32_t head_dim;
+    uint32_t n_rot;
+    uint32_t raw_cap;
+    uint32_t raw_row;
+};
+
+static int dsv4_kv_fp8_store_cpu(const float *in, float *out, void *cfg) {
+    const struct dsv4_kv_fp8_store_cfg *c = cfg;
+    /* Layout: out[0..head_dim) = kv (in-place rounded);
+     *         out[head_dim..2*head_dim) = the raw_row written. */
+    float *kv  = out;
+    float *raw = out + c->head_dim;
+    memcpy(kv, in, (size_t)c->head_dim * sizeof(float));
+    /* Allocate a raw_cache of raw_cap rows so the helper writes at the
+     * configured offset; we then memcpy the live row into the trailing
+     * half of the harness output. */
+    float *raw_cache = (float *)calloc((size_t)c->raw_cap * c->head_dim, sizeof(float));
+    if (!raw_cache) return 0;
+    ds4_test_dsv4_kv_fp8_store_raw(kv, raw_cache, c->raw_cap, c->raw_row, c->head_dim, c->n_rot);
+    memcpy(raw, raw_cache + (size_t)c->raw_row * c->head_dim, (size_t)c->head_dim * sizeof(float));
+    free(raw_cache);
+    return 1;
+}
+
+static int dsv4_kv_fp8_store_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                  size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct dsv4_kv_fp8_store_cfg *c = cfg;
+    /* kv is the harness output's first head_dim floats; raw_cache is a
+     * separate device tensor (raw_cap rows) that we materialize and then
+     * read row 'raw_row' back from into out_dev's trailing half. */
+    ds4_cuda_tensor *raw_cache = ds4_cuda_tensor_alloc(
+            (uint64_t)c->raw_cap * c->head_dim * sizeof(float));
+    if (!raw_cache) return 0;
+
+    int ok = ds4_cuda_tensor_write(out_dev, 0, in, (uint64_t)c->head_dim * sizeof(float));
+    if (ok) {
+        /* Zero the raw cache so unrelated rows are deterministic. */
+        float *zero = (float *)calloc((size_t)c->raw_cap * c->head_dim, sizeof(float));
+        if (!zero) { ok = 0; }
+        else {
+            ok = ds4_cuda_tensor_write(raw_cache, 0, zero,
+                                       (uint64_t)c->raw_cap * c->head_dim * sizeof(float));
+            free(zero);
+        }
+    }
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_kv_fp8_store_raw_tensor(out_dev, raw_cache,
+                                                  c->raw_cap, c->raw_row,
+                                                  c->head_dim, c->n_rot);
+    if (ok) ok = ds4_cuda_end_commands();
+    if (ok) {
+        /* Copy raw_cache[raw_row] into the trailing half of out_dev so the
+         * harness compares both kv (rounded) and raw (f16-rounded). */
+        ds4_cuda_tensor *raw_view = ds4_cuda_tensor_view(raw_cache,
+                (uint64_t)c->raw_row * c->head_dim * sizeof(float),
+                (uint64_t)c->head_dim * sizeof(float));
+        if (!raw_view) ok = 0;
+        else {
+            if (ok) ok = ds4_cuda_begin_commands();
+            if (ok) ok = ds4_cuda_tensor_copy(out_dev, (uint64_t)c->head_dim * sizeof(float),
+                                              raw_view, 0,
+                                              (uint64_t)c->head_dim * sizeof(float));
+            if (ok) ok = ds4_cuda_end_commands();
+            ds4_cuda_tensor_free(raw_view);
+        }
+    }
+    ds4_cuda_tensor_free(raw_cache);
+    return ok;
+}
+
+static const struct dsv4_kv_fp8_store_cfg dsv4_kv_fp8_store_cfg_v = {
+    .head_dim = 128, .n_rot = 64, .raw_cap = 8, .raw_row = 3,
+};
+
+/* Tolerance 0: same reasoning as dsv4_fp8_kv_quantize (deterministic
+ * table-based round trip).  The F16-round step is also bit-exact: CPU
+ * uses libm-via-ARM-NEON `vcvt_f16_f32`, CUDA uses
+ * `__float2half_rn` — both are round-to-nearest-even and produce
+ * identical bits for finite normals.  No transcendentals on the F16 leg. */
+DS4_CUDA_PARITY_TEST(dsv4_kv_fp8_store_raw,
+    .seed = 0xFB81,
+    .in_elems = 128,                    /* one head's KV */
+    .out_elems = 256,                   /* kv (128) | raw_row (128) */
+    .ulp_tolerance = 0,
+    .cpu_fn = dsv4_kv_fp8_store_cpu,
+    .cuda_fn = dsv4_kv_fp8_store_cuda,
+    .cfg = (void *)&dsv4_kv_fp8_store_cfg_v);
+
+/* ---- dsv4_ratio4_shift: state_kv[0..n) := state_kv[n..2n);
+ *      state_score[0..n) := state_score[n..2n).  n=4*width.  Pure index
+ *      copy, bit-exact match expected. */
+
+struct dsv4_ratio4_shift_cfg {
+    uint32_t width;
+};
+
+static int dsv4_ratio4_shift_cpu(const float *in, float *out, void *cfg) {
+    const struct dsv4_ratio4_shift_cfg *c = cfg;
+    const size_t n = (size_t)4u * c->width;
+    /* Layout in `in` and `out`:
+     *   [state_kv (2n) | state_score (2n)]
+     * The shift operates in-place on each half independently. */
+    memcpy(out, in, (size_t)4u * n * sizeof(float));
+    ds4_test_dsv4_ratio4_shift(out, out + 2u * n, c->width);
+    return 1;
+}
+
+static int dsv4_ratio4_shift_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                  size_t in_elems, size_t out_elems, void *cfg) {
+    (void)out_elems;
+    const struct dsv4_ratio4_shift_cfg *c = cfg;
+    const size_t n = (size_t)4u * c->width;
+    /* Allocate two separate state tensors; write the input halves; run; copy
+     * each tensor back into the harness output buffer. */
+    ds4_cuda_tensor *st_kv = ds4_cuda_tensor_alloc((uint64_t)2u * n * sizeof(float));
+    ds4_cuda_tensor *st_sc = ds4_cuda_tensor_alloc((uint64_t)2u * n * sizeof(float));
+    if (!st_kv || !st_sc) {
+        ds4_cuda_tensor_free(st_kv); ds4_cuda_tensor_free(st_sc);
+        return 0;
+    }
+    int ok = ds4_cuda_tensor_write(st_kv, 0, in,            (uint64_t)2u * n * sizeof(float))
+          && ds4_cuda_tensor_write(st_sc, 0, in + 2u * n,   (uint64_t)2u * n * sizeof(float));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_test_dsv4_ratio4_shift_tensor(st_kv, st_sc, c->width);
+    if (ok) {
+        /* Copy both back into out_dev: [state_kv (2n) | state_score (2n)]. */
+        ok = ds4_cuda_tensor_copy(out_dev, 0,                              st_kv, 0, (uint64_t)2u * n * sizeof(float))
+          && ds4_cuda_tensor_copy(out_dev, (uint64_t)2u * n * sizeof(float), st_sc, 0, (uint64_t)2u * n * sizeof(float));
+    }
+    if (ok) ok = ds4_cuda_end_commands();
+    (void)in_elems;
+    ds4_cuda_tensor_free(st_kv);
+    ds4_cuda_tensor_free(st_sc);
+    return ok;
+}
+
+static const struct dsv4_ratio4_shift_cfg dsv4_ratio4_shift_cfg_v = {
+    .width = 32,
+};
+
+DS4_CUDA_PARITY_TEST(dsv4_ratio4_shift,
+    .seed = 0xFB82,
+    .in_elems  = 4u * 32u * 4u,    /* 2 * (2n) = 4n where n = 4*width */
+    .out_elems = 4u * 32u * 4u,
+    .ulp_tolerance = 0,
+    .cpu_fn = dsv4_ratio4_shift_cpu,
+    .cuda_fn = dsv4_ratio4_shift_cuda,
+    .cfg = (void *)&dsv4_ratio4_shift_cfg_v);
+
+/* ---- dsv4_compressor_store_one: one-token compressor frontier update.
+ *      Single FMA per gid (state_score = score + ape).  Output is the
+ *      updated state arrays.  Two test variants exercise the ape_type
+ *      half/float discriminator. */
+
+struct dsv4_store_one_cfg {
+    uint32_t width;
+    uint32_t ratio;
+    uint32_t pos;
+    uint32_t ape_type;
+    uint32_t state_rows;   /* derived: ratio==4 ? 2*ratio : ratio */
+};
+
+/* Layout in `in` (parameterised by cfg):
+ *   kv          : width
+ *   score       : width
+ *   ape_payload : width * ratio   (f32 if ape_type==0; f16 packed in same
+ *                                  number of f32 elems for ape_type==1
+ *                                  — see thunk for the encoding).
+ *   state_kv0   : state_rows * width
+ *   state_score0: state_rows * width
+ * The CPU thunk converts the f16 ape segment from its f32-encoded source
+ * before calling the oracle so both sides see identical f16 bit patterns. */
+
+/* Note: ape footprint in float-units depends on ape_type:
+ *   ape_type==0: width * ratio f32s
+ *   ape_type==1: width * ratio / 2 f32s (each f32 holds two f16s; the
+ *                CUDA thunk reinterprets the bytes as f16, and the CPU
+ *                oracle does the same).  The hardcoded in_elems on each
+ *                test below carries that derivation in its comment. */
+
+static int dsv4_store_one_cpu(const float *in, float *out, void *cfg) {
+    const struct dsv4_store_one_cfg *c = cfg;
+    const size_t row_n   = c->width;
+    const size_t state_n = (size_t)c->state_rows * c->width;
+    const size_t ape_floats = (c->ape_type == 1u)
+        ? ((size_t)c->width * c->ratio / 2u)
+        : ((size_t)c->width * c->ratio);
+
+    const float *kv          = in;
+    const float *score       = in + row_n;
+    const void  *ape_bytes   = in + 2u * row_n;
+    const float *state_kv0   = in + 2u * row_n + ape_floats;
+    const float *state_score0 = state_kv0 + state_n;
+
+    float *state_kv    = out;
+    float *state_score = out + state_n;
+    memcpy(state_kv,    state_kv0,    state_n * sizeof(float));
+    memcpy(state_score, state_score0, state_n * sizeof(float));
+    ds4_test_dsv4_compressor_store_one(kv, score, ape_bytes,
+                                       state_kv, state_score,
+                                       c->width, c->ratio, c->pos, c->ape_type);
+    return 1;
+}
+
+static int dsv4_store_one_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                               size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct dsv4_store_one_cfg *c = cfg;
+    const size_t row_n   = c->width;
+    const size_t state_n = (size_t)c->state_rows * c->width;
+    const size_t ape_floats = (c->ape_type == 1u)
+        ? ((size_t)c->width * c->ratio / 2u)
+        : ((size_t)c->width * c->ratio);
+    const size_t ape_bytes = (c->ape_type == 1u)
+        ? ((size_t)c->width * c->ratio * sizeof(uint16_t))
+        : ((size_t)c->width * c->ratio * sizeof(float));
+
+    const float *kv_src          = in;
+    const float *score_src       = in + row_n;
+    const void  *ape_src         = in + 2u * row_n;
+    const float *state_kv0_src   = in + 2u * row_n + ape_floats;
+    const float *state_score0_src = state_kv0_src + state_n;
+
+    ds4_cuda_tensor *kv_dev    = ds4_cuda_tensor_alloc((uint64_t)row_n   * sizeof(float));
+    ds4_cuda_tensor *score_dev = ds4_cuda_tensor_alloc((uint64_t)row_n   * sizeof(float));
+    ds4_cuda_tensor *ape_dev   = ds4_cuda_tensor_alloc((uint64_t)ape_bytes);
+    ds4_cuda_tensor *st_kv_dev = ds4_cuda_tensor_alloc((uint64_t)state_n * sizeof(float));
+    ds4_cuda_tensor *st_sc_dev = ds4_cuda_tensor_alloc((uint64_t)state_n * sizeof(float));
+    if (!kv_dev || !score_dev || !ape_dev || !st_kv_dev || !st_sc_dev) {
+        ds4_cuda_tensor_free(kv_dev);    ds4_cuda_tensor_free(score_dev);
+        ds4_cuda_tensor_free(ape_dev);   ds4_cuda_tensor_free(st_kv_dev);
+        ds4_cuda_tensor_free(st_sc_dev);
+        return 0;
+    }
+    int ok = ds4_cuda_tensor_write(kv_dev,    0, kv_src,           (uint64_t)row_n   * sizeof(float))
+          && ds4_cuda_tensor_write(score_dev, 0, score_src,        (uint64_t)row_n   * sizeof(float))
+          && ds4_cuda_tensor_write(ape_dev,   0, ape_src,          (uint64_t)ape_bytes)
+          && ds4_cuda_tensor_write(st_kv_dev, 0, state_kv0_src,    (uint64_t)state_n * sizeof(float))
+          && ds4_cuda_tensor_write(st_sc_dev, 0, state_score0_src, (uint64_t)state_n * sizeof(float));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_test_dsv4_compressor_store_one_tensor(
+                    kv_dev, score_dev, ape_dev, st_kv_dev, st_sc_dev,
+                    c->width, c->ratio, c->pos, c->ape_type);
+    if (ok) {
+        ok = ds4_cuda_tensor_copy(out_dev, 0,
+                                  st_kv_dev, 0, (uint64_t)state_n * sizeof(float))
+          && ds4_cuda_tensor_copy(out_dev, (uint64_t)state_n * sizeof(float),
+                                  st_sc_dev, 0, (uint64_t)state_n * sizeof(float));
+    }
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(kv_dev);
+    ds4_cuda_tensor_free(score_dev);
+    ds4_cuda_tensor_free(ape_dev);
+    ds4_cuda_tensor_free(st_kv_dev);
+    ds4_cuda_tensor_free(st_sc_dev);
+    return ok;
+}
+
+/* Ratio 4 + ape_type 0 (float APE): exercises the dst_row = ratio + pos_mod
+ * branch with f32 APE.  pos=5 → pos_mod=1 → dst_row=5. */
+static const struct dsv4_store_one_cfg dsv4_store_one_r4_f32_cfg = {
+    .width = 64, .ratio = 4, .pos = 5, .ape_type = 0,
+    .state_rows = 8,
+};
+
+/* Ratio 1 + ape_type 1 (half APE): exercises the else branch (dst_row =
+ * pos_mod) with f16 APE.  ratio=1 → pos_mod=0 → dst_row=0. */
+static const struct dsv4_store_one_cfg dsv4_store_one_r1_f16_cfg = {
+    .width = 64, .ratio = 1, .pos = 0, .ape_type = 1,
+    .state_rows = 1,
+};
+
+/* DS4_CUDA_PARITY_TEST initialisers can't call helpers, so the in_elems /
+ * out_elems below are hand-derived from store_one_in_elems /
+ * store_one_out_elems for each cfg.  Numbers are double-checked in the
+ * comment alongside each test. */
+DS4_CUDA_PARITY_TEST(dsv4_compressor_store_one_r4_f32,
+    .seed = 0xFB83,
+    /* kv(64) + score(64) + ape(64*4 f32 = 256) + state(2*8*64 = 1024) = 1408 */
+    .in_elems  = 1408,
+    /* state_kv(8*64) + state_score(8*64) = 1024 */
+    .out_elems = 1024,
+    .ulp_tolerance = 0,
+    .cpu_fn = dsv4_store_one_cpu,
+    .cuda_fn = dsv4_store_one_cuda,
+    .cfg = (void *)&dsv4_store_one_r4_f32_cfg);
+
+DS4_CUDA_PARITY_TEST(dsv4_compressor_store_one_r1_f16,
+    .seed = 0xFB84,
+    /* kv(64) + score(64) + ape(64*1/2 f32-packed-f16 = 32) + state(2*1*64 = 128) = 288 */
+    .in_elems  = 288,
+    /* state_kv(64) + state_score(64) = 128 */
+    .out_elems = 128,
+    .ulp_tolerance = 0,
+    .cpu_fn = dsv4_store_one_cpu,
+    .cuda_fn = dsv4_store_one_cuda,
+    .cfg = (void *)&dsv4_store_one_r1_f16_cfg);
+
+/* ---------------------------------------------------------------------------
  * Registry — order does not matter; failures are counted globally.
  * --------------------------------------------------------------------------- */
 
@@ -1846,6 +2226,11 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_dsv4_topk_mask,
     &ds4_cuda_parity_indexer_topk,
     &ds4_cuda_parity_indexer_score_one,
+    &ds4_cuda_parity_dsv4_fp8_kv_quantize,
+    &ds4_cuda_parity_dsv4_kv_fp8_store_raw,
+    &ds4_cuda_parity_dsv4_ratio4_shift,
+    &ds4_cuda_parity_dsv4_compressor_store_one_r4_f32,
+    &ds4_cuda_parity_dsv4_compressor_store_one_r1_f16,
     NULL,
 };
 

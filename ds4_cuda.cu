@@ -1367,10 +1367,9 @@ DS4_CUDA_STUB(ds4_cuda_rms_norm_weight_tensor, (ds4_cuda_tensor *, const ds4_cud
 DS4_CUDA_STUB(ds4_cuda_rms_norm_weight_rows_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint32_t, uint32_t, float))
 DS4_CUDA_STUB(ds4_cuda_dsv4_qkv_rms_norm_rows_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint32_t, ds4_cuda_tensor *, const ds4_cuda_tensor *, uint64_t, uint32_t, uint32_t, float))
 DS4_CUDA_STUB(ds4_cuda_head_rms_norm_tensor, (ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t, float))
-DS4_CUDA_STUB(ds4_cuda_dsv4_fp8_kv_quantize_tensor, (ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t))
-/* ds4_cuda_rope_tail_tensor is implemented in the m4 section at the bottom
- * of this file. */
-DS4_CUDA_STUB(ds4_cuda_kv_fp8_store_raw_tensor, (ds4_cuda_tensor *, ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t, uint32_t))
+/* ds4_cuda_dsv4_fp8_kv_quantize_tensor and ds4_cuda_kv_fp8_store_raw_tensor
+ * are implemented in the m5 dsv4_kv section at the bottom of this file.
+ * ds4_cuda_rope_tail_tensor is implemented in the m4 section. */
 DS4_CUDA_STUB(ds4_cuda_store_raw_kv_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t))
 DS4_CUDA_STUB(ds4_cuda_store_raw_kv_batch_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t, uint32_t))
 
@@ -2703,6 +2702,422 @@ int ds4_cuda_indexer_score_one_tensor(
         (float *)scores_ptr, (const float *)q_ptr, (const float *)weights_ptr,
         (const float *)kv_ptr, n_comp, n_head, head_dim, scale);
     return ds4_cuda_check(cudaGetLastError(), "launch indexer_score_one");
+}
+
+} /* extern "C" */
+
+/* =========================================================================
+ * Phase 1 m5 — dsv4_kv (DS4-original compressed-KV path).
+ * =========================================================================
+ *
+ * Spec: metal/dsv4_kv.metal.  Four kernels, all DS4-original (no llama.cpp
+ * template):
+ *   1. kernel_dsv4_fp8_kv_quantize_f32     (public: dsv4_fp8_kv_quantize)
+ *   2. kernel_dsv4_kv_fp8_store_f32        (public: kv_fp8_store_raw)
+ *   3. kernel_dsv4_ratio4_shift_f32        (internal helper)
+ *   4. kernel_dsv4_compressor_store_one    (internal helper)
+ *
+ * Kernels 3 and 4 are dispatched on Metal as part of the compressor_update
+ * wrapper; they have no public ds4_metal/ds4_cuda API.  We expose them
+ * via test-only thunks (ds4_cuda_test_dsv4_*) so they can be parity-tested
+ * before the wrapping compressor_update tensor API is implemented.
+ *
+ * --- DS4 E4M3FN round trip ---------------------------------------------------
+ *
+ * The non-RoPE prefix of each KV row is round-tripped through DS4's E4M3-
+ * style FP8 encoding.  The encoding is a 7-bit magnitude (4-bit biased
+ * exponent + 3-bit mantissa) plus sign, with a per-64-element `scale =
+ * 2^ceil(log2(amax/448))` so the largest value lands near the max
+ * representable code (448).  The Metal kernel ties the per-block reduction
+ * to a 64-thread threadgroup; we do the same here (64 threads, one warp +
+ * tail) so the amax tree-reduction order is identical.
+ *
+ * The round-trip dequant (`dsv4_e4m3fn_dequant`) uses an iterative binary
+ * search over 127 representable codes followed by a tie-break.  Because the
+ * codes are a constant table, we materialise it in __constant__ memory and
+ * do exactly the same binary search the CPU oracle does — bit-exact match
+ * expected on every value.
+ *
+ * Trap-list audit:
+ *   - Trap #1 (--use_fast_math intrinsics): no transcendentals here except
+ *     log2 / ceil / exp2 in the per-block scale.  We route them through
+ *     double-input forms (log2/exp2 → libdevice double) to dodge __log2f /
+ *     __exp2f substitution.  ceil is integer-stable.
+ *   - Trap #2 (single-call powf vs serial multiply): N/A.
+ *   - Trap #3 (libm-vs-libdevice argument-reduction): N/A — log2/exp2 of
+ *     positive small ratios stay well inside the safe range.
+ *   - Trap #4 (CPU oracle precision): the CPU oracle here does its own
+ *     per-64-element amax in float (no double accumulator), so both sides
+ *     accumulate the same rounding.  amax is a max-reduction so order
+ *     doesn't matter for the value (max of floats is associative; the
+ *     intermediate ULP of the comparison-based reduce is not).
+ * ========================================================================= */
+
+/* DS4 E4M3FN value table (codes 0..127): code i decodes to
+ * exp == 0  ?  mant * 2^-9
+ *          : (1 + mant * 2^-3) * 2^(exp - 7)
+ * with bit-fields exp = (i >> 3) & 0xf, mant = i & 0x7.  Identical numbers
+ * on both sides; we precompute the table once at init via a small kernel
+ * write rather than a host->device copy so the values come from float
+ * constant folding on-device (mirrors Metal's `constant float dsv4_...`). */
+__device__ __constant__ float ds4_cuda_dsv4_e4m3fn_table[128];
+static int g_dsv4_e4m3fn_table_initialized = 0;
+
+static __host__ float ds4_cuda_dsv4_e4m3fn_value_host(int i) {
+    static const float exp_scale[16] = {
+        0.0f,         0.015625f,    0.03125f,     0.0625f,
+        0.125f,       0.25f,        0.5f,         1.0f,
+        2.0f,         4.0f,         8.0f,         16.0f,
+        32.0f,        64.0f,        128.0f,       256.0f,
+    };
+    const int exp  = (i >> 3) & 0x0f;
+    const int mant = i & 0x07;
+    return (exp == 0)
+        ? (float)mant * 0.001953125f
+        : (1.0f + (float)mant * 0.125f) * exp_scale[exp];
+}
+
+static int ds4_cuda_dsv4_init_e4m3fn_table(void) {
+    if (g_dsv4_e4m3fn_table_initialized) return 1;
+    float host_table[128];
+    for (int i = 0; i < 128; i++) host_table[i] = ds4_cuda_dsv4_e4m3fn_value_host(i);
+    if (!ds4_cuda_check(cudaMemcpyToSymbolAsync(
+            ds4_cuda_dsv4_e4m3fn_table, host_table, sizeof(host_table),
+            0, cudaMemcpyHostToDevice, g_stream),
+            "dsv4 e4m3fn table upload")) return 0;
+    if (!ds4_cuda_check(cudaStreamSynchronize(g_stream),
+            "dsv4 e4m3fn table sync")) return 0;
+    g_dsv4_e4m3fn_table_initialized = 1;
+    return 1;
+}
+
+/* Mirrors dsv4_e4m3fn_dequant in metal/dsv4_kv.metal.  Round-trips x to
+ * its nearest E4M3FN code value (signed magnitude, clamped to 448).
+ * Tie-break selects the even-mantissa code, matching the CPU oracle. */
+static __device__ __forceinline__ float ds4_cuda_dsv4_e4m3fn_dequant(float x) {
+    const float sign = (x < 0.0f) ? -1.0f : 1.0f;
+    float ax = fabsf(x);
+    if (ax > 448.0f) ax = 448.0f;
+
+    int lo = 0;
+    int hi = 126;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (ds4_cuda_dsv4_e4m3fn_table[mid] <= ax) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    int best = lo;
+    if (best < 126) {
+        const float best_diff = fabsf(ax - ds4_cuda_dsv4_e4m3fn_table[best]);
+        const float next_diff = fabsf(ax - ds4_cuda_dsv4_e4m3fn_table[best + 1]);
+        if (next_diff < best_diff ||
+            (next_diff == best_diff && ((best + 1) & 1) == 0 && (best & 1) != 0)) {
+            best = best + 1;
+        }
+    }
+
+    return sign * ds4_cuda_dsv4_e4m3fn_table[best];
+}
+
+/* Per-block scale: ldexpf(1, ceil(log2(amax/448))).  CPU oracle uses
+ * libm's ceilf+log2f+ldexpf; we route log2 through double inputs to dodge
+ * --use_fast_math's __log2f intrinsic substitution (Trap #1).  exp2 of an
+ * integer is exact in f32, so ldexpf is implementable as exp2(integer). */
+static __device__ __forceinline__ float ds4_cuda_dsv4_fp8_scale(float amax) {
+    const float clamped = fmaxf(amax, 1.0e-4f);
+    const double l2 = log2((double)clamped / 448.0);
+    const float exp_int = ceilf((float)l2);
+    return exp2f(exp_int);
+}
+
+/* Per-row 64-block FP8 round trip used by both fp8_kv_quantize and
+ * kv_fp8_store_raw.  Threadgroup-shared `amax_shmem` is provided by the
+ * caller (one float[64]).  Caller is responsible for syncing on entry. */
+static __device__ __forceinline__ void ds4_cuda_dsv4_fp8_quantize_row(
+        float          *kv,
+        uint32_t        n_nope,
+        float          *amax_shmem) {
+    const uint32_t tid = threadIdx.x;
+    for (uint32_t off = 0; off < n_nope; off += 64u) {
+        float v = 0.0f;
+        if (tid < 64u && off + tid < n_nope) {
+            v = kv[off + tid];
+            amax_shmem[tid] = fabsf(v);
+        } else if (tid < 64u) {
+            amax_shmem[tid] = 0.0f;
+        }
+        __syncthreads();
+
+        /* Tree-reduce 64 → 32 → 16 → 8 → 4 → 2 → 1 with max.  Mirrors the
+         * Metal kernel's reduction shape exactly (max is associative on
+         * floats up to NaN handling, which we don't hit on quantization
+         * inputs). */
+        for (uint32_t stride = 32u; stride > 0u; stride >>= 1) {
+            if (tid < stride) {
+                amax_shmem[tid] = fmaxf(amax_shmem[tid], amax_shmem[tid + stride]);
+            }
+            __syncthreads();
+        }
+
+        const float scale = ds4_cuda_dsv4_fp8_scale(amax_shmem[0]);
+        if (tid < 64u && off + tid < n_nope) {
+            float scaled = v / scale;
+            if (scaled >  448.0f) scaled =  448.0f;
+            if (scaled < -448.0f) scaled = -448.0f;
+            kv[off + tid] = ds4_cuda_dsv4_e4m3fn_dequant(scaled) * scale;
+        }
+        __syncthreads();
+    }
+}
+
+/* ----- Kernel 1: dsv4_fp8_kv_quantize -------------------------------------
+ *
+ * In-place FP8 round-trip on the non-RoPE prefix [0, head_dim - n_rot) of
+ * each row.  The RoPE tail [head_dim - n_rot, head_dim) is left as-is.
+ * One block per row, blockDim.x = 64 (matches Metal's 64-thread group;
+ * the per-64-element scale step demands 64 threads). */
+static __global__ void ds4_cuda_dsv4_fp8_kv_quantize_kernel(
+        float       *x,
+        uint32_t     n_rows,
+        uint32_t     head_dim,
+        uint32_t     n_rot) {
+    const uint32_t row = blockIdx.x;
+    if (row >= n_rows) return;
+
+    __shared__ float amax_shmem[64];
+    float *row_x = x + (uint64_t)row * head_dim;
+    const uint32_t n_nope = head_dim - n_rot;
+    ds4_cuda_dsv4_fp8_quantize_row(row_x, n_nope, amax_shmem);
+}
+
+/* ----- Kernel 2: dsv4_kv_fp8_store_raw ------------------------------------
+ *
+ * Single-row decode finalizer.  In-place FP8 round-trip on the non-RoPE
+ * prefix, plus an F16-rounded write of the entire row into raw_cache at
+ * `raw_row`.  The Metal kernel uses one threadgroup per call (single row
+ * shape); we do the same — one block, 64 threads.  The non-prefix portion
+ * (RoPE tail) is f16-rounded but otherwise unchanged. */
+static __global__ void ds4_cuda_dsv4_kv_fp8_store_raw_kernel(
+        float       *kv,
+        float       *raw_cache,
+        uint32_t     raw_row,
+        uint32_t     head_dim,
+        uint32_t     n_rot) {
+    __shared__ float amax_shmem[64];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t n_nope = head_dim - n_rot;
+    float *raw = raw_cache + (uint64_t)raw_row * head_dim;
+
+    /* Stage 1: FP8 round-trip on the non-RoPE prefix (in-place on kv).
+     * Then write the rounded values to raw via f16-round. */
+    for (uint32_t off = 0; off < n_nope; off += 64u) {
+        float v = 0.0f;
+        if (tid < 64u && off + tid < n_nope) {
+            v = kv[off + tid];
+            amax_shmem[tid] = fabsf(v);
+        } else if (tid < 64u) {
+            amax_shmem[tid] = 0.0f;
+        }
+        __syncthreads();
+        for (uint32_t stride = 32u; stride > 0u; stride >>= 1) {
+            if (tid < stride) {
+                amax_shmem[tid] = fmaxf(amax_shmem[tid], amax_shmem[tid + stride]);
+            }
+            __syncthreads();
+        }
+        const float scale = ds4_cuda_dsv4_fp8_scale(amax_shmem[0]);
+        if (tid < 64u && off + tid < n_nope) {
+            float scaled = v / scale;
+            if (scaled >  448.0f) scaled =  448.0f;
+            if (scaled < -448.0f) scaled = -448.0f;
+            const float q = ds4_cuda_dsv4_e4m3fn_dequant(scaled) * scale;
+            kv [off + tid] = q;
+            raw[off + tid] = __half2float(__float2half_rn(q));
+        }
+        __syncthreads();
+    }
+
+    /* Stage 2: f16-round the RoPE tail directly from kv into raw. */
+    for (uint32_t i = n_nope + tid; i < head_dim; i += 64u) {
+        raw[i] = __half2float(__float2half_rn(kv[i]));
+    }
+}
+
+/* ----- Kernel 3: dsv4_ratio4_shift ----------------------------------------
+ *
+ * state[0..n) := state[n..2n) where n = 4*width.  Pure index copy on two
+ * arrays (state_kv, state_score).  Bit-exact between any two implementations
+ * since it's just float load/store.  Source and destination ranges are
+ * disjoint (src starts at index n, dst ends at index n) so a forward
+ * per-thread copy is safe. */
+static __global__ void ds4_cuda_dsv4_ratio4_shift_kernel(
+        float       *state_kv,
+        float       *state_score,
+        uint32_t     width) {
+    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t n = 4u * width;
+    if (gid >= n) return;
+    state_kv   [gid] = state_kv   [n + gid];
+    state_score[gid] = state_score[n + gid];
+}
+
+/* ----- Kernel 4: dsv4_compressor_store_one --------------------------------
+ *
+ * One-token compressor frontier update.  For each gid in [0, width):
+ *   state_kv   [dst_row * width + gid] = kv[gid]
+ *   state_score[dst_row * width + gid] = score[gid] + ape[pos_mod * width + gid]
+ *   dst_row = (ratio == 4) ? (4 + pos_mod) : pos_mod
+ *
+ * APE values come from the model map as either f16 (ape_type==1) or
+ * f32 (ape_type==0); the kernel takes a `void *ape` plus the discriminator.
+ * Single FMA per gid, no reduction, no transcendentals — bit-exact match
+ * with CPU expected. */
+static __global__ void ds4_cuda_dsv4_compressor_store_one_kernel(
+        const float *kv,
+        const float *score,
+        const void  *ape,
+        float       *state_kv,
+        float       *state_score,
+        uint32_t     width,
+        uint32_t     ratio,
+        uint32_t     pos,
+        uint32_t     ape_type) {
+    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= width) return;
+
+    const uint32_t pos_mod = pos % ratio;
+    const uint32_t dst_row = (ratio == 4u) ? (ratio + pos_mod) : pos_mod;
+    const uint64_t dst     = (uint64_t)dst_row * width + gid;
+    const uint64_t ape_i   = (uint64_t)pos_mod * width + gid;
+
+    float ape_v;
+    if (ape_type == 1u) {
+        ape_v = __half2float(((const __half *)ape)[ape_i]);
+    } else {
+        ape_v = ((const float *)ape)[ape_i];
+    }
+
+    state_kv   [dst] = kv   [gid];
+    state_score[dst] = score[gid] + ape_v;
+}
+
+extern "C" {
+
+int ds4_cuda_dsv4_fp8_kv_quantize_tensor(
+        ds4_cuda_tensor *x,
+        uint32_t         n_tok,
+        uint32_t         head_dim,
+        uint32_t         n_rot) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (n_tok == 0u || head_dim == 0u) return 0;
+    if (n_rot > head_dim) return 0;
+    if ((head_dim - n_rot) % 64u != 0u) {
+        fprintf(stderr, "ds4: CUDA dsv4_fp8_kv_quantize requires (head_dim - n_rot) %% 64 == 0\n");
+        return 0;
+    }
+    if (!ds4_cuda_dsv4_init_e4m3fn_table()) return 0;
+
+    const uint64_t total_bytes = (uint64_t)n_tok * head_dim * sizeof(float);
+    void *x_ptr = NULL;
+    if (!ds4_cuda_tensor_range(x, total_bytes, "dsv4_fp8_kv_quantize x", &x_ptr)) return 0;
+
+    ds4_cuda_dsv4_fp8_kv_quantize_kernel<<<n_tok, 64u, 0, g_stream>>>(
+        (float *)x_ptr, n_tok, head_dim, n_rot);
+    return ds4_cuda_check(cudaGetLastError(), "launch dsv4_fp8_kv_quantize");
+}
+
+int ds4_cuda_kv_fp8_store_raw_tensor(
+        ds4_cuda_tensor *kv,
+        ds4_cuda_tensor *raw_cache,
+        uint32_t         raw_cap,
+        uint32_t         row,
+        uint32_t         head_dim,
+        uint32_t         n_rot) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (head_dim == 0u || raw_cap == 0u || row >= raw_cap) return 0;
+    if (n_rot > head_dim) return 0;
+    if ((head_dim - n_rot) % 64u != 0u) {
+        fprintf(stderr, "ds4: CUDA kv_fp8_store_raw requires (head_dim - n_rot) %% 64 == 0\n");
+        return 0;
+    }
+    if (!ds4_cuda_dsv4_init_e4m3fn_table()) return 0;
+
+    const uint64_t kv_bytes  = (uint64_t)head_dim * sizeof(float);
+    const uint64_t raw_bytes = (uint64_t)raw_cap * head_dim * sizeof(float);
+    void *kv_ptr = NULL, *raw_ptr = NULL;
+    if (!ds4_cuda_tensor_range(kv,        kv_bytes,  "kv_fp8_store_raw kv",    &kv_ptr))  return 0;
+    if (!ds4_cuda_tensor_range(raw_cache, raw_bytes, "kv_fp8_store_raw raw",   &raw_ptr)) return 0;
+
+    ds4_cuda_dsv4_kv_fp8_store_raw_kernel<<<1u, 64u, 0, g_stream>>>(
+        (float *)kv_ptr, (float *)raw_ptr, row, head_dim, n_rot);
+    return ds4_cuda_check(cudaGetLastError(), "launch kv_fp8_store_raw");
+}
+
+/* Test-only thunks for the two internal helper kernels.  These have no
+ * production public API on either Metal or CUDA — Metal dispatches them
+ * inside ds4_metal_compressor_update_tensor.  Exposing them here lets the
+ * parity harness verify the kernel math before the wrapping API lands. */
+int ds4_cuda_test_dsv4_ratio4_shift_tensor(
+        ds4_cuda_tensor *state_kv,
+        ds4_cuda_tensor *state_score,
+        uint32_t         width) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (width == 0u) return 0;
+
+    const uint64_t state_bytes = (uint64_t)8u * width * sizeof(float);
+    void *kv_ptr = NULL, *sc_ptr = NULL;
+    if (!ds4_cuda_tensor_range(state_kv,    state_bytes, "ratio4_shift state_kv",    &kv_ptr)) return 0;
+    if (!ds4_cuda_tensor_range(state_score, state_bytes, "ratio4_shift state_score", &sc_ptr)) return 0;
+
+    constexpr uint32_t block_size = 256u;
+    const uint32_t n = 4u * width;
+    const uint32_t grid = (n + block_size - 1u) / block_size;
+    ds4_cuda_dsv4_ratio4_shift_kernel<<<grid, block_size, 0, g_stream>>>(
+        (float *)kv_ptr, (float *)sc_ptr, width);
+    return ds4_cuda_check(cudaGetLastError(), "launch dsv4_ratio4_shift");
+}
+
+int ds4_cuda_test_dsv4_compressor_store_one_tensor(
+        const ds4_cuda_tensor *kv,
+        const ds4_cuda_tensor *score,
+        const ds4_cuda_tensor *ape,
+        ds4_cuda_tensor       *state_kv,
+        ds4_cuda_tensor       *state_score,
+        uint32_t               width,
+        uint32_t               ratio,
+        uint32_t               pos,
+        uint32_t               ape_type) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (width == 0u || ratio == 0u || (ape_type != 0u && ape_type != 1u)) return 0;
+
+    const uint64_t row_bytes   = (uint64_t)width * sizeof(float);
+    const uint32_t state_rows  = (ratio == 4u) ? (2u * ratio) : ratio;
+    const uint64_t state_bytes = (uint64_t)state_rows * row_bytes;
+    const uint64_t ape_elem    = (ape_type == 1u) ? 2u : 4u;
+    const uint64_t ape_bytes   = (uint64_t)width * ratio * ape_elem;
+
+    void *kv_ptr = NULL, *sc_ptr = NULL, *ape_ptr = NULL, *st_kv_ptr = NULL, *st_sc_ptr = NULL;
+    if (!ds4_cuda_tensor_range(kv,          row_bytes,   "store_one kv",          &kv_ptr))    return 0;
+    if (!ds4_cuda_tensor_range(score,       row_bytes,   "store_one score",       &sc_ptr))    return 0;
+    if (!ds4_cuda_tensor_range(ape,         ape_bytes,   "store_one ape",         &ape_ptr))   return 0;
+    if (!ds4_cuda_tensor_range(state_kv,    state_bytes, "store_one state_kv",    &st_kv_ptr)) return 0;
+    if (!ds4_cuda_tensor_range(state_score, state_bytes, "store_one state_score", &st_sc_ptr)) return 0;
+
+    constexpr uint32_t block_size = 256u;
+    const uint32_t grid = (width + block_size - 1u) / block_size;
+    ds4_cuda_dsv4_compressor_store_one_kernel<<<grid, block_size, 0, g_stream>>>(
+        (const float *)kv_ptr, (const float *)sc_ptr, (const void *)ape_ptr,
+        (float *)st_kv_ptr, (float *)st_sc_ptr,
+        width, ratio, pos, ape_type);
+    return ds4_cuda_check(cudaGetLastError(), "launch dsv4_compressor_store_one");
 }
 
 } /* extern "C" */

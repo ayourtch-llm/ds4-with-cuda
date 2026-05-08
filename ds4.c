@@ -1483,7 +1483,7 @@ static float dsv4_e4m3fn_dequant_cpu(float x) {
 /* DeepSeek V4 stores the non-RoPE part of compressed KV through an E4M3-style
  * round trip.  Keeping this in the CPU reference makes cache values comparable
  * to the Metal graph's compressed-cache behavior. */
-static void dsv4_fp8_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, uint32_t n_rot) {
+void dsv4_fp8_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, uint32_t n_rot) {
     const uint32_t n_nope = head_dim - n_rot;
     for (uint32_t off = 0; off < n_nope; off += 64) {
         float amax = 0.0f;
@@ -1500,6 +1500,79 @@ static void dsv4_fp8_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, ui
             if (v < -448.0f) v = -448.0f;
             x[off + i] = dsv4_e4m3fn_dequant_cpu(v) * scale;
         }
+    }
+}
+
+/* CPU oracle for the decode-side fused KV finalizer (metal/dsv4_kv.metal,
+ * kernel_dsv4_kv_fp8_store_f32).  Mirrors the kernel's two-stage write:
+ *   1. FP8 round trip on the non-RoPE prefix [0, head_dim - n_rot).
+ *   2. F16-round each element of the full row into raw_cache[raw_row].
+ * Production path emits this fused finalizer for decode; prefill uses the
+ * standalone fp8_kv_quantize + a separate raw-cache store. */
+void ds4_test_dsv4_kv_fp8_store_raw(float    *kv,
+                                    float    *raw_cache,
+                                    uint32_t  raw_cap,
+                                    uint32_t  raw_row,
+                                    uint32_t  head_dim,
+                                    uint32_t  n_rot) {
+    if (head_dim == 0u || raw_cap == 0u || raw_row >= raw_cap) return;
+    if (n_rot > head_dim) return;
+    dsv4_fp8_kv_quantize_row_inplace_cpu(kv, head_dim, n_rot);
+    float *raw = raw_cache + (size_t)raw_row * head_dim;
+    for (uint32_t i = 0; i < head_dim; i++) {
+        raw[i] = f16_to_f32(f32_to_f16(kv[i]));
+    }
+}
+
+/* CPU oracle for the ratio-4 compressor state shift
+ * (metal/dsv4_kv.metal, kernel_dsv4_ratio4_shift_f32).  After an emitted
+ * compressed row the second 4-row half of the recurrent state becomes the
+ * next window's previous half: state[0..n) := state[n..2n) where n=4*width.
+ * Pure index copy — no float arithmetic, bit-exact match expected. */
+void ds4_test_dsv4_ratio4_shift(float    *state_kv,
+                                float    *state_score,
+                                uint32_t  width) {
+    if (width == 0u) return;
+    const uint32_t n = 4u * width;
+    /* memmove-style: source rows are well past dst rows, so a forward
+     * memcpy is safe; mirror the per-thread index assignment for clarity. */
+    for (uint32_t gid = 0; gid < n; gid++) {
+        state_kv[gid]    = state_kv[n + gid];
+        state_score[gid] = state_score[n + gid];
+    }
+}
+
+/* CPU oracle for the one-token compressor frontier update
+ * (metal/dsv4_kv.metal, kernel_dsv4_compressor_store_one).  Writes a single
+ * (kv, score+ape) row into recurrent state at row dst_row, where dst_row is
+ *   ratio==4: 4 + (pos % 4)         (the second 4-row half)
+ *   else   : pos % ratio
+ * APE is read from `ape` as half (ape_type==1) or float (ape_type==0),
+ * indexed by `pos_mod * width + gid`.  Production caller always passes a
+ * model-mapped APE pointer; the test oracle uses a host buffer. */
+void ds4_test_dsv4_compressor_store_one(const float *kv,
+                                        const float *score,
+                                        const void  *ape,
+                                        float       *state_kv,
+                                        float       *state_score,
+                                        uint32_t     width,
+                                        uint32_t     ratio,
+                                        uint32_t     pos,
+                                        uint32_t     ape_type) {
+    if (width == 0u || ratio == 0u || (ape_type != 0u && ape_type != 1u)) return;
+    const uint32_t pos_mod = pos % ratio;
+    const uint32_t dst_row = (ratio == 4u) ? (ratio + pos_mod) : pos_mod;
+    const size_t   dst_base = (size_t)dst_row * width;
+    const size_t   ape_base = (size_t)pos_mod * width;
+    for (uint32_t gid = 0; gid < width; gid++) {
+        float ape_v;
+        if (ape_type == 1u) {
+            ape_v = f16_to_f32(((const uint16_t *)ape)[ape_base + gid]);
+        } else {
+            ape_v = ((const float *)ape)[ape_base + gid];
+        }
+        state_kv   [dst_base + gid] = kv   [gid];
+        state_score[dst_base + gid] = score[gid] + ape_v;
     }
 }
 

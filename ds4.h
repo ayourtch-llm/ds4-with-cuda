@@ -231,5 +231,24 @@ void indexer_score_one_cpu(float *scores,
                            uint32_t n_head,
                            uint32_t head_dim,
                            float scale);
+void dsv4_fp8_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, uint32_t n_rot);
+void ds4_test_dsv4_kv_fp8_store_raw(float    *kv,
+                                    float    *raw_cache,
+                                    uint32_t  raw_cap,
+                                    uint32_t  raw_row,
+                                    uint32_t  head_dim,
+                                    uint32_t  n_rot);
+void ds4_test_dsv4_ratio4_shift(float    *state_kv,
+                                float    *state_score,
+                                uint32_t  width);
+void ds4_test_dsv4_compressor_store_one(const float *kv,
+                                        const float *score,
+                                        const void  *ape,
+                                        float       *state_kv,
+                                        float       *state_score,
+                                        uint32_t     width,
+                                        uint32_t     ratio,
+                                        uint32_t     pos,
+                                        uint32_t     ape_type);
 
 #endif
