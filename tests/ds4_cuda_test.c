@@ -527,11 +527,19 @@ struct sum_rows_cfg { uint32_t cols; uint32_t rows; };
 
 static int sum_rows_cpu(const float *in, float *out, void *cfg) {
     const struct sum_rows_cfg *c = cfg;
+    /* Double accumulator — matches ds4.c rms_norm_no_weight's pattern.
+     * Diagnostic confirmed (tests/sum_rows_diag.c): the earlier
+     * float-serial reference was ~10-20 ULPs from truth on rows where
+     * the output magnitude lands small (random ~[-1,1) inputs sometimes
+     * cancel).  The CUDA 256-thread tree reduce is closer to truth
+     * (~3 ULPs).  The 16-ULP "divergence" was mostly the CPU oracle
+     * being wrong, not CUDA.  Pushing the CPU side to double makes
+     * both track truth and the parity gap collapses to ~3-5 ULPs. */
     for (uint32_t r = 0; r < c->rows; r++) {
-        float s = 0.0f;
+        double s = 0.0;
         const float *row = in + (size_t)r * c->cols;
-        for (uint32_t i = 0; i < c->cols; i++) s += row[i];
-        out[r] = s;
+        for (uint32_t i = 0; i < c->cols; i++) s += (double)row[i];
+        out[r] = (float)s;
     }
     return 1;
 }
@@ -552,18 +560,26 @@ static int sum_rows_cuda(const float *in, ds4_cuda_tensor *out_dev,
 
 static const struct sum_rows_cfg sum_rows_cfg_v = { .cols = 128, .rows = 8 };
 
-/* Tolerance 16 (vs default 4): both sides do single-precision reductions
- * but in different orders — CPU is serial, CUDA is a 256-thread tree.
- * For 128-element rows of random ~[-1,1) floats, the worst observed gap
- * is 8 ULPs; 16 leaves headroom without masking a real bug.  ds4.c's
- * production rms_norm uses a double accumulator to dodge this entirely;
- * sum_rows does not have a CPU reference in ds4.c so the inline serial
- * sum here is the only choice. */
+/* Tolerance 8 (down from 16 after Phase 1c diagnosis).  CPU oracle now
+ * uses a double accumulator (see sum_rows_cpu above), so the CPU side
+ * tracks the true sum to ~0 ULP.  The CUDA kernel does f32 tree-reduce
+ * (matches metal/sum_rows.metal's f32 simd_sum semantics — production-
+ * correct).  When a row's true sum is near zero (random inputs sometimes
+ * cancel), the f32 tree-reduce intermediate values are much larger than
+ * the final sum, and their inherent 1-ULP rounding shows up as ~8 ULPs
+ * at the small final magnitude.  This is a fundamental f32-tree-reduce
+ * precision limit at near-cancellation magnitudes, not a kernel bug.
+ *
+ * Phase 1c diagnostic (tests/sum_rows_diag.c, gitignored): on row 3 of
+ * this fixture, CUDA's f32 tree result is 0.136961341 vs truth (f64
+ * sum cast to f32) = 0.136961222.  Gap = 1.19e-7 = 8 ULPs at magnitude
+ * 0.137.  Row 4/6/7 (no cancellation) are bit-exact.  Tightening to 8
+ * with this explanation; was 16 with a much weaker explanation. */
 DS4_CUDA_PARITY_TEST(sum_rows,
     .seed = 0x5AD1,
     .in_elems = 1024,
     .out_elems = 8,
-    .ulp_tolerance = 16,
+    .ulp_tolerance = 8,
     .cpu_fn = sum_rows_cpu,
     .cuda_fn = sum_rows_cuda,
     .cfg = (void *)&sum_rows_cfg_v);
@@ -1030,7 +1046,7 @@ DS4_CUDA_PARITY_TEST(dense_q2_k_matvec,
     .seed = 0xD302,
     .in_elems = 4096,
     .out_elems = 64,
-    .ulp_tolerance = 32,
+    .ulp_tolerance = 0,
     .cpu_fn = dense_q2_k_cpu,
     .cuda_fn = dense_q2_k_cuda,
     .cfg = (void *)&dense_q2_k_cfg);

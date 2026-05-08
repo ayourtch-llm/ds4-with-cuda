@@ -327,8 +327,13 @@ static __device__ float ds4_cuda_vec_dot_q2_K_q8_K(
             summs += (int)y[i].bsums[j] * (int)(sc[j] >> 4);
         }
 
-        const float dall = y[i].d * ds4_cuda_f16_to_f32(x[i].d);
-        const float dmin = y[i].d * ds4_cuda_f16_to_f32(x[i].dmin);
+        /* Match ds4.c's ARM NEON path exactly: the min-offset contribution is
+         * accumulated before the scaled q2 dot, each as its own FMA.  Grouping
+         * them as `d*isum - dmin*summs` is mathematically equivalent but moved
+         * dense_q2_k from bit-exact to ~23 ULP on GB10. */
+        const float d = y[i].d * ds4_cuda_f16_to_f32(x[i].d);
+        const float dmin = -y[i].d * ds4_cuda_f16_to_f32(x[i].dmin);
+        sumf = fmaf(dmin, (float)summs, sumf);
 
         int isum = 0;
         int is = 0;
@@ -346,7 +351,7 @@ static __device__ float ds4_cuda_vec_dot_q2_K_q8_K(
             }
             q2 += 32;
         }
-        sumf += dall * (float)isum - dmin * (float)summs;
+        sumf = fmaf(d, (float)isum, sumf);
     }
     return sumf;
 }
