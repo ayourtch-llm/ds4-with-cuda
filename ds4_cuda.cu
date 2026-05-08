@@ -1252,11 +1252,10 @@ int ds4_cuda_test_dense_iq2_xxs_pair_matvec_tensor(
 
 DS4_CUDA_STUB(ds4_cuda_embed_token_hc_tensor, (ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t))
 DS4_CUDA_STUB(ds4_cuda_embed_tokens_hc_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t))
-DS4_CUDA_STUB(ds4_cuda_indexer_score_one_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t, float))
+/* ds4_cuda_indexer_score_one_tensor / _topk_tensor / dsv4_topk_mask_tensor
+ * are implemented in the m5 dsv4_misc section at the bottom of this file. */
 DS4_CUDA_STUB(ds4_cuda_indexer_scores_prefill_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float))
 DS4_CUDA_STUB(ds4_cuda_indexer_scores_decode_batch_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float))
-DS4_CUDA_STUB(ds4_cuda_indexer_topk_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t))
-DS4_CUDA_STUB(ds4_cuda_dsv4_topk_mask_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t))
 
 DS4_CUDA_STUB(ds4_cuda_matmul_q8_0_tensor, (ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, const ds4_cuda_tensor *, uint64_t))
 DS4_CUDA_STUB(ds4_cuda_shared_gate_up_swiglu_q8_0_tensor, (ds4_cuda_tensor *, ds4_cuda_tensor *, ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, const ds4_cuda_tensor *))
@@ -2454,6 +2453,256 @@ int ds4_cuda_rope_tail_tensor(
         pos0, n_ctx_orig, inverse ? 1 : 0,
         freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
     return ds4_cuda_check(cudaGetLastError(), "launch dsv4_rope_tail");
+}
+
+} /* extern "C" */
+
+/* =========================================================================
+ * Phase 1 m5 — dsv4_misc subset (3 of 6 public APIs).
+ * =========================================================================
+ *
+ * Spec: metal/dsv4_misc.metal.  All DS4-original — no llama.cpp template.
+ *
+ * Three public APIs covered in this commit:
+ *   - ds4_cuda_dsv4_topk_mask_tensor       (kernel_dsv4_topk_mask + scatter)
+ *   - ds4_cuda_indexer_topk_tensor         (descending top-k + ascending sort)
+ *   - ds4_cuda_indexer_score_one_tensor    (kernel_dsv4_indexer_score_one_direct)
+ *
+ * Deferred to m5b (intentionally surfaced):
+ *   - ds4_cuda_indexer_scores_prefill_tensor      (tiled simdgroup-MMA prefill)
+ *   - ds4_cuda_indexer_scores_decode_batch_tensor (tiled decode batch)
+ *   - ds4_cuda_attention_indexed_mixed_batch_heads_tensor (large attention)
+ *
+ * --- DS4-original notes ---------------------------------------------------
+ *
+ * dsv4_topk_mask materialises a dense [-inf | 0] mask consumed by the
+ * indexed mixed attention.  Two-step launch: (1) fill every cell with
+ * -INFINITY, (2) scatter top_k 0.0 cells per token.  Could be one launch,
+ * but the Metal implementation does it in two so dependent bookkeeping
+ * matches; we mirror that.
+ *
+ * indexer_topk is the DS4-specific "select top_k highest scores per token,
+ * then sort the selected indices ascending by row id".  The ascending sort
+ * is the DS4-original twist — vanilla top-k leaves results in score order,
+ * but DS4 indexed attention scans compressed K/V rows in cache order, so
+ * indices must be re-sorted by row id ascending.
+ *
+ * indexer_score_one computes per-compressed-row scores as a sum over heads
+ * of `max(dot(q[h], kv[c]), 0) * weights[h] * scale`.  The ReLU on each
+ * head dot is the DS4-original bit; vanilla cross-attention does not zero
+ * negative dots.  Production hardcodes n_head=64, head_dim=128 — kernel
+ * accepts general dims for portability but is tuned for those values.
+ * ========================================================================= */
+
+/* dsv4_topk_mask: fill mask[t, c] with -INFINITY for every c, then scatter
+ * 0.0 at mask[t, topk[t, k]] for k in [0, top_k).  Parallel over (t, c). */
+static __global__ void ds4_cuda_dsv4_topk_mask_fill_kernel(
+        float    *mask,
+        uint32_t  n_comp,
+        uint32_t  n_tokens) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total = (uint64_t)n_comp * n_tokens;
+    if (i >= total) return;
+    mask[i] = -INFINITY;
+}
+
+static __global__ void ds4_cuda_dsv4_topk_mask_scatter_kernel(
+        float          *mask,
+        const int32_t  *topk,
+        uint32_t        n_comp,
+        uint32_t        n_tokens,
+        uint32_t        top_k) {
+    const uint32_t k = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (k >= top_k || t >= n_tokens) return;
+    const int32_t idx = topk[(uint64_t)t * top_k + k];
+    if (idx < 0 || (uint32_t)idx >= n_comp) return;
+    mask[(uint64_t)t * n_comp + (uint32_t)idx] = 0.0f;
+}
+
+/* indexer_topk: per-token, find top_k highest scores then sort the selected
+ * indices ascending by row id.  One block per token; uses a small n_comp-
+ * sized arena in shared memory for partial top-k tracking and final sort.
+ * For Phase 1 m5 we restrict n_comp <= 1024 (single-block work) — the
+ * production indexer caps at DS4_N_INDEXER_TOP_K=512, so n_comp slightly
+ * larger than that is realistic. */
+static __global__ void ds4_cuda_indexer_topk_kernel(
+        int32_t        *selected,
+        const float    *scores,
+        uint32_t        n_comp,
+        uint32_t        top_k) {
+    const uint32_t t = blockIdx.x;
+    /* Single thread per token block keeps the math identical to topk_desc:
+     * insertion-sort style top-k descending, then ascending sort by index.
+     * O(n_comp * top_k) per token; for top_k=512 and n_comp=1024 that is
+     * ~512K ops per token — fine for parity-test scale.  When this lands
+     * in production traffic, swap for a parallel selection. */
+    if (threadIdx.x != 0) return;
+
+    const float *row = scores + (uint64_t)t * n_comp;
+    int32_t     *sel = selected + (uint64_t)t * top_k;
+
+    /* Phase A: insertion-sort top-k descending — mirrors topk_desc in ds4.c. */
+    for (uint32_t i = 0; i < top_k; i++) sel[i] = -1;
+    for (uint32_t i = 0; i < n_comp; i++) {
+        const float si = row[i];
+        for (uint32_t j = 0; j < top_k; j++) {
+            const int32_t cur = sel[j];
+            if (cur < 0 || si > row[cur]) {
+                for (uint32_t m = top_k - 1u; m > j; m--) sel[m] = sel[m - 1u];
+                sel[j] = (int32_t)i;
+                break;
+            }
+        }
+    }
+
+    /* Phase B: sort the selected indices ascending (insertion sort). */
+    for (uint32_t i = 1; i < top_k; i++) {
+        const int32_t v = sel[i];
+        if (v < 0) continue;
+        uint32_t j = i;
+        while (j > 0 && (sel[j - 1u] < 0 || sel[j - 1u] > v)) {
+            sel[j] = sel[j - 1u];
+            j--;
+        }
+        sel[j] = v;
+    }
+}
+
+/* indexer_score_one: per compressed row c, score = sum_h max(dot(q[h],
+ * kv[c]), 0) * weights[h] * scale.  One block per compressed row; threads
+ * cooperate over (head, head_dim) work.  Uses head_dim threads; each does
+ * one dim of the dot, simdgroup-reduces to score per head, ReLU, multiply
+ * by weight and scale, sum across heads via shmem. */
+template <int block_size>
+static __global__ void ds4_cuda_indexer_score_one_kernel(
+        float        *scores,
+        const float  *q,
+        const float  *weights,
+        const float  *index_comp,
+        uint32_t      n_comp,
+        uint32_t      n_head,
+        uint32_t      head_dim,
+        float         scale) {
+    const uint32_t c = blockIdx.x;
+    if (c >= n_comp) return;
+
+    const float *kv = index_comp + (uint64_t)c * head_dim;
+
+    extern __shared__ float shmem[];
+    float *reduce = shmem;  /* block_size floats for tree-reduce scratch */
+
+    float head_acc = 0.0f;
+    for (uint32_t h = 0; h < n_head; h++) {
+        const float *qh = q + (uint64_t)h * head_dim;
+        float partial = 0.0f;
+        for (uint32_t i = threadIdx.x; i < head_dim; i += block_size) {
+            partial += qh[i] * kv[i];
+        }
+        reduce[threadIdx.x] = partial;
+        __syncthreads();
+        for (uint32_t s = block_size / 2u; s > 0u; s >>= 1) {
+            if (threadIdx.x < s) reduce[threadIdx.x] += reduce[threadIdx.x + s];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const float dot = reduce[0];
+            const float r = (dot < 0.0f) ? 0.0f : dot;
+            head_acc += r * weights[h] * scale;
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) scores[c] = head_acc;
+}
+
+extern "C" {
+
+int ds4_cuda_dsv4_topk_mask_tensor(
+        ds4_cuda_tensor       *mask,
+        const ds4_cuda_tensor *topk,
+        uint32_t               n_comp,
+        uint32_t               n_tokens,
+        uint32_t               top_k) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (n_comp == 0u || n_tokens == 0u || top_k == 0u) return 0;
+
+    const uint64_t mask_bytes = (uint64_t)n_comp * n_tokens * sizeof(float);
+    const uint64_t topk_bytes = (uint64_t)top_k * n_tokens * sizeof(int32_t);
+
+    void *mask_ptr = NULL, *topk_ptr = NULL;
+    if (!ds4_cuda_tensor_range(mask, mask_bytes, "topk_mask mask",  &mask_ptr)) return 0;
+    if (!ds4_cuda_tensor_range(topk, topk_bytes, "topk_mask topk",  &topk_ptr)) return 0;
+
+    constexpr int block_size = 256;
+    const uint64_t total = (uint64_t)n_comp * n_tokens;
+    const uint32_t fill_blocks = (uint32_t)((total + block_size - 1u) / block_size);
+    ds4_cuda_dsv4_topk_mask_fill_kernel<<<fill_blocks, block_size, 0, g_stream>>>(
+        (float *)mask_ptr, n_comp, n_tokens);
+    if (!ds4_cuda_check(cudaGetLastError(), "launch topk_mask fill")) return 0;
+
+    const uint32_t scatter_x = (top_k + (uint32_t)block_size - 1u) / (uint32_t)block_size;
+    dim3 scatter_grid(scatter_x, n_tokens, 1u);
+    ds4_cuda_dsv4_topk_mask_scatter_kernel<<<scatter_grid, block_size, 0, g_stream>>>(
+        (float *)mask_ptr, (const int32_t *)topk_ptr, n_comp, n_tokens, top_k);
+    return ds4_cuda_check(cudaGetLastError(), "launch topk_mask scatter");
+}
+
+int ds4_cuda_indexer_topk_tensor(
+        ds4_cuda_tensor       *selected,
+        const ds4_cuda_tensor *scores,
+        uint32_t               n_comp,
+        uint32_t               n_tokens,
+        uint32_t               top_k) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (n_comp == 0u || n_tokens == 0u || top_k == 0u || top_k > n_comp) return 0;
+
+    const uint64_t scores_bytes   = (uint64_t)n_comp * n_tokens * sizeof(float);
+    const uint64_t selected_bytes = (uint64_t)top_k * n_tokens * sizeof(int32_t);
+
+    void *scores_ptr = NULL, *selected_ptr = NULL;
+    if (!ds4_cuda_tensor_range(scores,   scores_bytes,   "indexer_topk scores",   &scores_ptr))   return 0;
+    if (!ds4_cuda_tensor_range(selected, selected_bytes, "indexer_topk selected", &selected_ptr)) return 0;
+
+    /* Single-thread-per-token block; see kernel comment for the trade-off.
+     * Phase 2 perf will replace this with a parallel selection. */
+    ds4_cuda_indexer_topk_kernel<<<n_tokens, 32u, 0, g_stream>>>(
+        (int32_t *)selected_ptr, (const float *)scores_ptr, n_comp, top_k);
+    return ds4_cuda_check(cudaGetLastError(), "launch indexer_topk");
+}
+
+int ds4_cuda_indexer_score_one_tensor(
+        ds4_cuda_tensor       *scores,
+        const ds4_cuda_tensor *q,
+        const ds4_cuda_tensor *weights,
+        const ds4_cuda_tensor *index_comp,
+        uint32_t               n_comp,
+        uint32_t               n_head,
+        uint32_t               head_dim,
+        float                  scale) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (n_comp == 0u || n_head == 0u || head_dim == 0u) return 0;
+
+    const uint64_t scores_bytes  = (uint64_t)n_comp * sizeof(float);
+    const uint64_t q_bytes       = (uint64_t)n_head * head_dim * sizeof(float);
+    const uint64_t weights_bytes = (uint64_t)n_head * sizeof(float);
+    const uint64_t kv_bytes      = (uint64_t)n_comp * head_dim * sizeof(float);
+
+    void *scores_ptr = NULL, *q_ptr = NULL, *weights_ptr = NULL, *kv_ptr = NULL;
+    if (!ds4_cuda_tensor_range(scores,     scores_bytes,  "indexer_score_one scores",   &scores_ptr))  return 0;
+    if (!ds4_cuda_tensor_range(q,          q_bytes,       "indexer_score_one q",        &q_ptr))       return 0;
+    if (!ds4_cuda_tensor_range(weights,    weights_bytes, "indexer_score_one weights",  &weights_ptr)) return 0;
+    if (!ds4_cuda_tensor_range(index_comp, kv_bytes,      "indexer_score_one kv",       &kv_ptr))      return 0;
+
+    constexpr int block_size = 128;
+    const size_t shmem_bytes = (size_t)block_size * sizeof(float);
+    ds4_cuda_indexer_score_one_kernel<block_size><<<n_comp, block_size, shmem_bytes, g_stream>>>(
+        (float *)scores_ptr, (const float *)q_ptr, (const float *)weights_ptr,
+        (const float *)kv_ptr, n_comp, n_head, head_dim, scale);
+    return ds4_cuda_check(cudaGetLastError(), "launch indexer_score_one");
 }
 
 } /* extern "C" */

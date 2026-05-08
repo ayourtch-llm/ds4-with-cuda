@@ -222,5 +222,14 @@ void rope_tail_ext_inplace(float *x,
                            float beta_fast,
                            float beta_slow,
                            bool inverse);
+void topk_desc(const float *score, int n, int k, int *idx);
+void indexer_score_one_cpu(float *scores,
+                           const float *q,
+                           const float *weights,
+                           const float *index_comp,
+                           uint32_t n_comp,
+                           uint32_t n_head,
+                           uint32_t head_dim,
+                           float scale);
 
 #endif

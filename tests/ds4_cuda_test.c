@@ -1587,6 +1587,232 @@ DS4_CUDA_PARITY_TEST(dsv4_rope_pos64_yarn,
     .cfg = (void *)&dsv4_rope_pos64_yarn_cfg);
 
 /* ---------------------------------------------------------------------------
+ * Phase 1 m5 — dsv4_misc subset: dsv4_topk_mask, indexer_topk,
+ * indexer_score_one.  Three of six public APIs in metal/dsv4_misc.metal;
+ * the remaining three (indexer_scores_prefill / decode_batch / indexed
+ * mixed attention) are deferred to m5b.
+ * --------------------------------------------------------------------------- */
+
+extern int ds4_cuda_dsv4_topk_mask_tensor(ds4_cuda_tensor *mask,
+                                          const ds4_cuda_tensor *topk,
+                                          uint32_t n_comp, uint32_t n_tokens, uint32_t top_k);
+extern int ds4_cuda_indexer_topk_tensor(ds4_cuda_tensor *selected,
+                                        const ds4_cuda_tensor *scores,
+                                        uint32_t n_comp, uint32_t n_tokens, uint32_t top_k);
+extern int ds4_cuda_indexer_score_one_tensor(ds4_cuda_tensor *scores,
+                                             const ds4_cuda_tensor *q,
+                                             const ds4_cuda_tensor *weights,
+                                             const ds4_cuda_tensor *index_comp,
+                                             uint32_t n_comp, uint32_t n_head,
+                                             uint32_t head_dim, float scale);
+
+/* ---- dsv4_topk_mask: fill (n_tokens × n_comp) mask with -inf, then 0.0
+ *      at the top_k indices per row.  Output bit-cast through f32 buffer
+ *      since mask values are -inf or 0 (both representable). */
+
+struct topk_mask_cfg {
+    uint32_t n_comp;
+    uint32_t n_tokens;
+    uint32_t top_k;
+    const int32_t *topk;
+};
+
+/* Synthesise a fixed top-k pattern that exercises bounds + duplicate-skip. */
+static const int32_t topk_mask_indices[3 * 4] = {
+    0, 4, 7, 0, 1, 6,        /* token 0: rows {0, 4, 7, 1, 6} (one dup at 0) */
+    2, 5, 7, 8, 9, 9,        /* token 1: rows {2, 5, 7, 8, 9}     (one dup at 9) */
+    /* tokens 2 unused — n_tokens=2 in the cfg */
+};
+
+static int topk_mask_cpu(const float *in, float *out, void *cfg) {
+    (void)in;
+    const struct topk_mask_cfg *c = cfg;
+    /* Harness calloc'd `out` — start fresh with -inf. */
+    for (uint64_t i = 0; i < (uint64_t)c->n_tokens * c->n_comp; i++) out[i] = -INFINITY;
+    for (uint32_t t = 0; t < c->n_tokens; t++) {
+        for (uint32_t k = 0; k < c->top_k; k++) {
+            const int32_t idx = c->topk[(size_t)t * c->top_k + k];
+            if (idx < 0 || (uint32_t)idx >= c->n_comp) continue;
+            out[(size_t)t * c->n_comp + (uint32_t)idx] = 0.0f;
+        }
+    }
+    return 1;
+}
+
+static int topk_mask_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                          size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in; (void)in_elems; (void)out_elems;
+    const struct topk_mask_cfg *c = cfg;
+    ds4_cuda_tensor *topk_dev = ds4_cuda_tensor_alloc((uint64_t)c->top_k * c->n_tokens * sizeof(int32_t));
+    if (!topk_dev) return 0;
+    int ok = ds4_cuda_tensor_write(topk_dev, 0, c->topk,
+                                   (uint64_t)c->top_k * c->n_tokens * sizeof(int32_t));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_dsv4_topk_mask_tensor(out_dev, topk_dev, c->n_comp, c->n_tokens, c->top_k);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(topk_dev);
+    return ok;
+}
+
+static const struct topk_mask_cfg topk_mask_cfg_v = {
+    .n_comp = 16, .n_tokens = 2, .top_k = 6, .topk = topk_mask_indices,
+};
+
+DS4_CUDA_PARITY_TEST(dsv4_topk_mask,
+    .seed = 0x70901,
+    .in_elems = 1,
+    .out_elems = 32,    /* n_tokens * n_comp */
+    .ulp_tolerance = 0,
+    .cpu_fn = topk_mask_cpu,
+    .cuda_fn = topk_mask_cuda,
+    .cfg = (void *)&topk_mask_cfg_v);
+
+/* ---- indexer_topk: per-token, top_k highest scores → indices, sorted
+ *      ascending by row id.  Output is int32 indices, bit-cast through
+ *      f32 buffer.  ULP=0 = bit-exact match. */
+
+struct indexer_topk_cfg {
+    uint32_t n_comp;
+    uint32_t n_tokens;
+    uint32_t top_k;
+};
+
+static int indexer_topk_cpu(const float *in, float *out, void *cfg) {
+    const struct indexer_topk_cfg *c = cfg;
+    int *idx_buf = (int *)malloc((size_t)c->top_k * sizeof(int));
+    if (!idx_buf) return 0;
+    int32_t *out_i32 = (int32_t *)out;
+    for (uint32_t t = 0; t < c->n_tokens; t++) {
+        topk_desc(in + (size_t)t * c->n_comp, (int)c->n_comp, (int)c->top_k, idx_buf);
+        /* Sort ascending by row id (mirror DS4 indexer top-k order). */
+        for (uint32_t i = 1; i < c->top_k; i++) {
+            const int v = idx_buf[i];
+            if (v < 0) continue;
+            uint32_t j = i;
+            while (j > 0 && (idx_buf[j - 1u] < 0 || idx_buf[j - 1u] > v)) {
+                idx_buf[j] = idx_buf[j - 1u];
+                j--;
+            }
+            idx_buf[j] = v;
+        }
+        int32_t *out_row = out_i32 + (size_t)t * c->top_k;
+        for (uint32_t k = 0; k < c->top_k; k++) out_row[k] = (int32_t)idx_buf[k];
+    }
+    free(idx_buf);
+    return 1;
+}
+
+static int indexer_topk_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                             size_t in_elems, size_t out_elems, void *cfg) {
+    (void)out_elems;
+    const struct indexer_topk_cfg *c = cfg;
+    ds4_cuda_tensor *scores_dev = ds4_cuda_tensor_alloc((uint64_t)in_elems * sizeof(float));
+    if (!scores_dev) return 0;
+    int ok = ds4_cuda_tensor_write(scores_dev, 0, in, (uint64_t)in_elems * sizeof(float));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_indexer_topk_tensor(out_dev, scores_dev, c->n_comp, c->n_tokens, c->top_k);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(scores_dev);
+    return ok;
+}
+
+static const struct indexer_topk_cfg indexer_topk_cfg_v = {
+    .n_comp = 64, .n_tokens = 4, .top_k = 8,
+};
+
+DS4_CUDA_PARITY_TEST(indexer_topk,
+    .seed = 0x10D7,
+    .in_elems = 256,    /* n_comp * n_tokens */
+    .out_elems = 32,    /* top_k * n_tokens */
+    .ulp_tolerance = 0,
+    .cpu_fn = indexer_topk_cpu,
+    .cuda_fn = indexer_topk_cuda,
+    .cfg = (void *)&indexer_topk_cfg_v);
+
+/* ---- indexer_score_one: per compressed row, sum over heads of
+ *      max(dot(q[h], kv[c]), 0) * weights[h] * scale.  CPU oracle is
+ *      indexer_score_one_cpu (extracted from indexer_allowed_decode_one in
+ *      ds4.c).  Production hardcodes n_head=64, head_dim=128; we test at
+ *      n_head=8, head_dim=32 to keep test compute tight while exercising
+ *      the same math (kernel is parameterized). */
+
+struct indexer_score_one_cfg {
+    uint32_t n_comp;
+    uint32_t n_head;
+    uint32_t head_dim;
+    float    scale;
+};
+
+/* Layout in `in`:
+ *   q       : n_head * head_dim
+ *   weights : n_head
+ *   kv      : n_comp * head_dim
+ */
+static int indexer_score_one_cpu_thunk(const float *in, float *out, void *cfg) {
+    const struct indexer_score_one_cfg *c = cfg;
+    const size_t q_n = (size_t)c->n_head * c->head_dim;
+    const size_t w_n = (size_t)c->n_head;
+    const float *q       = in;
+    const float *weights = in + q_n;
+    const float *kv      = in + q_n + w_n;
+    indexer_score_one_cpu(out, q, weights, kv, c->n_comp, c->n_head, c->head_dim, c->scale);
+    return 1;
+}
+
+static int indexer_score_one_cuda_thunk(const float *in, ds4_cuda_tensor *out_dev,
+                                        size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct indexer_score_one_cfg *c = cfg;
+    const size_t q_n  = (size_t)c->n_head * c->head_dim;
+    const size_t w_n  = (size_t)c->n_head;
+    const size_t kv_n = (size_t)c->n_comp * c->head_dim;
+
+    ds4_cuda_tensor *q_dev  = ds4_cuda_tensor_alloc((uint64_t)q_n  * sizeof(float));
+    ds4_cuda_tensor *w_dev  = ds4_cuda_tensor_alloc((uint64_t)w_n  * sizeof(float));
+    ds4_cuda_tensor *kv_dev = ds4_cuda_tensor_alloc((uint64_t)kv_n * sizeof(float));
+    if (!q_dev || !w_dev || !kv_dev) {
+        ds4_cuda_tensor_free(q_dev); ds4_cuda_tensor_free(w_dev); ds4_cuda_tensor_free(kv_dev);
+        return 0;
+    }
+    int ok = ds4_cuda_tensor_write(q_dev,  0, in,             (uint64_t)q_n  * sizeof(float))
+          && ds4_cuda_tensor_write(w_dev,  0, in + q_n,       (uint64_t)w_n  * sizeof(float))
+          && ds4_cuda_tensor_write(kv_dev, 0, in + q_n + w_n, (uint64_t)kv_n * sizeof(float));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_indexer_score_one_tensor(out_dev, q_dev, w_dev, kv_dev,
+                                                   c->n_comp, c->n_head, c->head_dim, c->scale);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(q_dev);
+    ds4_cuda_tensor_free(w_dev);
+    ds4_cuda_tensor_free(kv_dev);
+    return ok;
+}
+
+/* n_comp=32, n_head=8, head_dim=32: small enough for fast tests, large
+ * enough to exercise the per-head reduce + per-comp accumulator paths.
+ * scale matches DS4 production formula 1/sqrt(head_dim * n_head). */
+static const struct indexer_score_one_cfg indexer_score_one_cfg_v = {
+    .n_comp = 32, .n_head = 8, .head_dim = 32,
+    .scale = 1.0f / 16.0f,   /* sqrt(32 * 8) = 16 */
+};
+
+/* Tolerance 16: the kernel chains a tree-reduced dot per head + ReLU +
+ * weight-scale + serial across-head accumulation in f32.  CPU oracle
+ * (indexer_score_one_cpu in ds4.c) was promoted to double accumulators
+ * per Trap #4, so CPU now tracks truth.  Remaining divergence is the
+ * CUDA f32 cross-head accumulator at near-cancellation rows (random
+ * inputs sometimes cancel through the ReLU + weight mix).  Same
+ * pattern as sum_rows (Phase 1c): f32 reduce vs f64 truth at small
+ * magnitudes, ~8-10 ULPs at output magnitude 1e-2.  Worst observed: 9. */
+DS4_CUDA_PARITY_TEST(indexer_score_one,
+    .seed = 0x15C0,
+    .in_elems = 8 * 32 + 8 + 32 * 32,   /* q + weights + kv = 1320 */
+    .out_elems = 32,                     /* n_comp scores */
+    .ulp_tolerance = 16,
+    .cpu_fn = indexer_score_one_cpu_thunk,
+    .cuda_fn = indexer_score_one_cuda_thunk,
+    .cfg = (void *)&indexer_score_one_cfg_v);
+
+/* ---------------------------------------------------------------------------
  * Registry — order does not matter; failures are counted globally.
  * --------------------------------------------------------------------------- */
 
@@ -1617,6 +1843,9 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_routed_moe_batch,
     &ds4_cuda_parity_dsv4_rope_pos0,
     &ds4_cuda_parity_dsv4_rope_pos64_yarn,
+    &ds4_cuda_parity_dsv4_topk_mask,
+    &ds4_cuda_parity_indexer_topk,
+    &ds4_cuda_parity_indexer_score_one,
     NULL,
 };
 

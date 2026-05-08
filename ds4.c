@@ -5294,7 +5294,10 @@ static void layer_hash_router_weights_one(
     layer_hash_router_weights_from_probs(weights_out, probs, selected);
 }
 
-static void topk_desc(const float *score, int n, int k, int *idx) {
+/* Top-k descending selection: walk the input once, keep a sorted-descending
+ * `idx` of the k best.  Insertion-sort style.  Used both by router top-k and
+ * (post-Phase-1c) the CUDA indexer-topk parity test. */
+void topk_desc(const float *score, int n, int k, int *idx) {
     for (int i = 0; i < k; i++) idx[i] = -1;
 
     for (int i = 0; i < n; i++) {
@@ -5305,6 +5308,46 @@ static void topk_desc(const float *score, int n, int k, int *idx) {
                 break;
             }
         }
+    }
+}
+
+/* DS4 indexer scoring for one token across n_comp compressed rows.
+ *
+ * Extracted from indexer_allowed_decode_one (kept as a helper there too) so
+ * the CUDA parity test can reach this exact math without dragging the model
+ * struct into tests/.  Math: per compressed row, sum over heads of
+ *
+ *     max(dot(q[h], kv[c]), 0) * weights[h] * scale
+ *
+ * where the ReLU is the DS4-original detail — vanilla cross-attention would
+ * not zero negative dot products.  `scale` is typically 1/sqrt(head_dim *
+ * n_head) and is applied per-multiply (matching the Metal kernel's runtime
+ * scale, not the CPU's pre-scaled-weights variant in the original loop). */
+void indexer_score_one_cpu(float       *scores,
+                           const float *q,
+                           const float *weights,
+                           const float *index_comp,
+                           uint32_t     n_comp,
+                           uint32_t     n_head,
+                           uint32_t     head_dim,
+                           float        scale) {
+    /* Double accumulators inside the dot and across heads (Trap #4 from
+     * the m5 brief: when the harness reports "CUDA off by N ULPs", check
+     * whether the CPU oracle is itself off by ~N ULPs from f64 truth).
+     * Production uses float here, but for the parity-test reference we
+     * want the CPU side to track truth so we can attribute remaining
+     * divergence to the CUDA kernel. */
+    for (uint32_t c = 0; c < n_comp; c++) {
+        const float *kv = index_comp + (uint64_t)c * head_dim;
+        double s = 0.0;
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *qh = q + (uint64_t)h * head_dim;
+            double d = 0.0;
+            for (uint32_t i = 0; i < head_dim; i++) d += (double)qh[i] * (double)kv[i];
+            if (d < 0.0) d = 0.0;
+            s += d * (double)weights[h] * (double)scale;
+        }
+        scores[c] = (float)s;
     }
 }
 
