@@ -2548,7 +2548,7 @@ static void embed_token_f16(const ds4_model *m, const ds4_weights *w, int token,
 }
 
 /* RMSNorm without a learned scale, used by hyper-connection control vectors. */
-static void rms_norm_no_weight(float *out, const float *x, uint64_t n, float eps) {
+void rms_norm_no_weight(float *out, const float *x, uint64_t n, float eps) {
     double ss = 0.0;
     for (uint64_t i = 0; i < n; i++) ss += (double)x[i] * x[i];
 

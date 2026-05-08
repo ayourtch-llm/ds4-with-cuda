@@ -7,6 +7,7 @@
  * tests below by flipping their `#if 0` guards. */
 
 #include "ds4_cuda_parity.h"
+#include "../ds4.h"
 
 #include <math.h>
 #include <stddef.h>
@@ -60,14 +61,11 @@ DS4_CUDA_PARITY_TEST(trivial_copy,
  * to `all_tests[]` below.
  * --------------------------------------------------------------------------- */
 
-#if 0
+#if 1
 struct rms_norm_cfg {
     size_t n;
     float  eps;
 };
-
-/* Provided by ds4.c (currently static; expose in Phase 1.2). */
-extern void rms_norm_no_weight(float *out, const float *x, uint64_t n, float eps);
 
 static int rms_norm_cpu(const float *in, float *out, void *cfg) {
     const struct rms_norm_cfg *c = cfg;
@@ -110,7 +108,7 @@ DS4_CUDA_PARITY_TEST(rms_norm,
 
 static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_trivial_copy,
-#if 0
+#if 1
     &ds4_cuda_parity_rms_norm,
 #endif
     NULL,

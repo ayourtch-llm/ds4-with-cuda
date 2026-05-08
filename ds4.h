@@ -157,4 +157,7 @@ uint64_t ds4_session_payload_bytes(ds4_session *s);
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
 
+/* CPU reference functions used by CUDA parity tests. */
+void rms_norm_no_weight(float *out, const float *x, uint64_t n, float eps);
+
 #endif

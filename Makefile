@@ -69,8 +69,8 @@ ds4-server-cuda: ds4_server_cuda.o $(CUDA_CORE_OBJS)
 ds4_cuda_load_sanity: ds4_cuda_load_sanity.o ds4_cuda.o
 	$(NVCC) $(CUDAFLAGS) -o $@ ds4_cuda_load_sanity.o ds4_cuda.o $(CUDA_LDLIBS)
 
-ds4_cuda_test: ds4_cuda_test.o ds4_cuda_parity.o ds4_cuda.o
-	$(NVCC) $(CUDAFLAGS) -o $@ ds4_cuda_test.o ds4_cuda_parity.o ds4_cuda.o $(CUDA_LDLIBS)
+ds4_cuda_test: ds4_cuda_test.o ds4_cuda_parity.o ds4_cuda.o ds4_native.o
+	$(NVCC) $(CUDAFLAGS) -o $@ ds4_cuda_test.o ds4_cuda_parity.o ds4_cuda.o ds4_native.o $(CUDA_LDLIBS)
 else
 ds4-cuda:
 	@echo "ds4-cuda requires CUDA nvcc; set NVCC=/path/to/nvcc or install CUDA." >&2

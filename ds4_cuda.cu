@@ -129,6 +129,61 @@ static int ds4_cuda_kernel_stub(const char *name) {
     return 0;
 }
 
+static int ds4_cuda_tensor_range(
+        const ds4_cuda_tensor *tensor,
+        uint64_t bytes,
+        const char *label,
+        void **ptr) {
+    if (!tensor || !tensor->base || !ptr) return 0;
+    if (bytes > tensor->bytes) {
+        fprintf(stderr, "ds4: CUDA %s received undersized tensor (%" PRIu64 " < %" PRIu64 " bytes)\n",
+                label, tensor->bytes, bytes);
+        return 0;
+    }
+    *ptr = (uint8_t *)tensor->base + tensor->offset;
+    return 1;
+}
+
+/* Adapted from llama.cpp 29debb3a6a4c291d66aabbc46a0bb8c17a77e267
+ * ggml/src/ggml-cuda/norm.cu.  DS4's Phase 1 wrapper keeps the simpler Metal
+ * shape: one contiguous f32 row per block, plain RMSNorm with no weight. */
+template <int block_size>
+static __global__ void ds4_cuda_rms_norm_plain_f32_kernel(
+        const float *x,
+        float *out,
+        uint32_t n,
+        uint32_t rows,
+        float eps) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+
+    const float *row_x = x + (uint64_t)row * n;
+    float *row_out = out + (uint64_t)row * n;
+    const uint32_t tid = threadIdx.x;
+
+    float sum = 0.0f;
+    for (uint32_t i = tid; i < n; i += block_size) {
+        const float v = row_x[i];
+        sum += v * v;
+    }
+
+    __shared__ float shmem[block_size];
+    shmem[tid] = sum;
+    __syncthreads();
+
+    for (uint32_t stride = block_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shmem[tid] += shmem[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    const float scale = rsqrtf(shmem[0] / (float)n + eps);
+    for (uint32_t i = tid; i < n; i += block_size) {
+        row_out[i] = row_x[i] * scale;
+    }
+}
+
 extern "C" {
 
 int ds4_cuda_init(void) {
@@ -476,8 +531,41 @@ DS4_CUDA_STUB(ds4_cuda_matmul_f16_tensor, (ds4_cuda_tensor *, const void *, uint
 DS4_CUDA_STUB(ds4_cuda_matmul_f16_pair_tensor, (ds4_cuda_tensor *, ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, const ds4_cuda_tensor *, uint64_t))
 DS4_CUDA_STUB(ds4_cuda_matmul_f32_tensor, (ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, const ds4_cuda_tensor *, uint64_t))
 DS4_CUDA_STUB(ds4_cuda_repeat_hc_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t))
-DS4_CUDA_STUB(ds4_cuda_rms_norm_plain_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, float))
-DS4_CUDA_STUB(ds4_cuda_rms_norm_plain_rows_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, float))
+int ds4_cuda_rms_norm_plain_tensor(
+        ds4_cuda_tensor       *out,
+        const ds4_cuda_tensor *x,
+        uint32_t               n,
+        float                  eps) {
+    return ds4_cuda_rms_norm_plain_rows_tensor(out, x, n, 1, eps);
+}
+
+int ds4_cuda_rms_norm_plain_rows_tensor(
+        ds4_cuda_tensor       *out,
+        const ds4_cuda_tensor *x,
+        uint32_t               n,
+        uint32_t               rows,
+        float                  eps) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (n == 0 || rows == 0) return 0;
+
+    const uint64_t elems = (uint64_t)n * rows;
+    if (elems > UINT64_MAX / sizeof(float)) return 0;
+    const uint64_t bytes = elems * sizeof(float);
+
+    void *x_ptr = NULL;
+    void *out_ptr = NULL;
+    if (!ds4_cuda_tensor_range(x, bytes, "plain RMS norm input", &x_ptr) ||
+        !ds4_cuda_tensor_range(out, bytes, "plain RMS norm output", &out_ptr)) {
+        return 0;
+    }
+
+    constexpr int block_size = 256;
+    ds4_cuda_rms_norm_plain_f32_kernel<block_size>
+        <<<dim3(rows, 1, 1), dim3(block_size, 1, 1), 0, g_stream>>>(
+            (const float *)x_ptr, (float *)out_ptr, n, rows, eps);
+    return ds4_cuda_check(cudaGetLastError(), "launch plain RMS norm");
+}
 DS4_CUDA_STUB(ds4_cuda_rms_norm_weight_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint32_t, float))
 DS4_CUDA_STUB(ds4_cuda_rms_norm_weight_rows_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint32_t, uint32_t, float))
 DS4_CUDA_STUB(ds4_cuda_dsv4_qkv_rms_norm_rows_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint32_t, ds4_cuda_tensor *, const ds4_cuda_tensor *, uint64_t, uint32_t, uint32_t, float))
