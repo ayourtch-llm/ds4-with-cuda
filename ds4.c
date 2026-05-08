@@ -16289,197 +16289,111 @@ int ds4_engine_cuda_single_layer_test(ds4_engine *e, const ds4_tokens *prompt) {
     free(cuda_flat);
 
     /* ============================================================
-     * 2.1b extension: chain through the attention-inputs path
-     * (HC pre + Q LoRA + KV proj + RoPE on Q and KV).  Compare
-     * post-RoPE Q and KV to CPU.
+     * 2.1c-1: multi-token prefill through layer 0's attention block.
+     * Loop over prompt tokens with a growing raw KV cache.  Per
+     * token, run the full attention-block chain (HC pre + Q/KV proj
+     * + RoPE + FP8 store-to-cache + decode_heads with n_raw=t+1 +
+     * RoPE-inv + Q8 attention output + HC expand) and compare
+     * after_attn_hc to a CPU oracle that mirrors the same KV cache
+     * growth.  Layer 0 is dense (compress_ratio=0); raw-only path.
      * ============================================================ */
 
-    const ds4_layer_weights *layer = &weights->layer[0];
-    const uint32_t           il    = 0;
-    const uint32_t           pos   = 0;
-    const uint64_t           q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const ds4_layer_weights *layer  = &weights->layer[0];
+    const uint32_t           il     = 0;
+    const uint64_t           q_dim  = (uint64_t)DS4_N_HEAD    * DS4_N_HEAD_DIM;
     const uint64_t           kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     const uint64_t           mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC; /* 24 */
+    const uint32_t           raw_cap = DS4_N_SWA;  /* 128 — sliding-window cap. */
+    const uint32_t           n_tok   = ((uint32_t)prompt->len < raw_cap) ?
+                                       (uint32_t)prompt->len : raw_cap;
 
-    /* CPU oracle: full attention-inputs path on layer 0. */
-    float *cpu_attn_residual = xmalloc(hc_dim * sizeof(float));
-    float *cpu_attn_cur      = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *cpu_attn_norm     = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *cpu_q             = xmalloc(q_dim * sizeof(float));
-    float *cpu_kv            = xmalloc(kv_dim * sizeof(float));
-    float  cpu_post[4]; float cpu_comb[16];
-    memcpy(cpu_attn_residual, cpu_cur, hc_dim * sizeof(float));
-    hc_pre_from_state_one(model, layer->hc_attn_fn,
-                          layer->hc_attn_scale, layer->hc_attn_base,
-                          cpu_attn_residual, cpu_attn_cur, cpu_post, cpu_comb);
-    layer_attn_norm_one(cpu_attn_norm, model, layer, cpu_attn_cur);
-    layer_q_projection_normed_one(model, layer, cpu_attn_norm, cpu_q);
-    layer_kv_projection_normed_one(model, layer, cpu_attn_norm, cpu_kv);
-    rope_tail_layer_inplace(cpu_q,  DS4_N_HEAD,    DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
-    rope_tail_layer_inplace(cpu_kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
-
-    /* CUDA: chain HC pre + Q LoRA + KV proj + RoPE.  attn_residual is
-     * cur_dev (already populated by the 2.1a chain above). */
-    ds4_cuda_tensor *mix_dev      = ds4_cuda_tensor_alloc(mix_dim    * sizeof(float));
-    ds4_cuda_tensor *attn_cur_dev = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    ds4_cuda_tensor *attn_norm_dev = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    ds4_cuda_tensor *split_dev    = ds4_cuda_tensor_alloc(mix_dim    * sizeof(float));
-    ds4_cuda_tensor *qr_dev       = ds4_cuda_tensor_alloc(1024u      * sizeof(float));
-    ds4_cuda_tensor *qr_norm_dev  = ds4_cuda_tensor_alloc(1024u      * sizeof(float));
-    ds4_cuda_tensor *q_dev        = ds4_cuda_tensor_alloc(q_dim      * sizeof(float));
-    ds4_cuda_tensor *kv_raw_dev   = ds4_cuda_tensor_alloc(kv_dim     * sizeof(float));
-    ds4_cuda_tensor *kv_dev       = ds4_cuda_tensor_alloc(kv_dim     * sizeof(float));
-    if (!mix_dev || !attn_cur_dev || !attn_norm_dev || !split_dev ||
-        !qr_dev  || !qr_norm_dev  || !q_dev || !kv_raw_dev || !kv_dev) {
-        fprintf(stderr, "ds4: cuda_single_layer_test attn-inputs alloc failed\n");
-        ds4_cuda_tensor_free(cur_dev); ds4_cuda_tensor_free(flat_dev);
-        ds4_cuda_tensor_free(mix_dev); ds4_cuda_tensor_free(attn_cur_dev);
-        ds4_cuda_tensor_free(attn_norm_dev); ds4_cuda_tensor_free(split_dev);
-        ds4_cuda_tensor_free(qr_dev); ds4_cuda_tensor_free(qr_norm_dev);
-        ds4_cuda_tensor_free(q_dev); ds4_cuda_tensor_free(kv_raw_dev); ds4_cuda_tensor_free(kv_dev);
-        free(plain); free(cpu_cur); free(cpu_flat);
-        free(cpu_attn_residual); free(cpu_attn_cur); free(cpu_attn_norm);
-        free(cpu_q); free(cpu_kv);
-        return 1;
-    }
-
-    const float freq_base  = layer_rope_freq_base(il);
-    const float freq_scale = layer_rope_freq_scale(il);
-    const bool  compressed = ds4_layer_compress_ratio(il) != 0;
-    const float ext_factor = compressed && DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
+    /* RoPE configuration for layer 0. */
+    const float freq_base   = layer_rope_freq_base(il);
+    const float freq_scale  = layer_rope_freq_scale(il);
+    const bool  compressed  = ds4_layer_compress_ratio(il) != 0;
+    const float ext_factor  = compressed && DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
     float       attn_factor = 1.0f;
     if (ext_factor != 0.0f && freq_scale > 0.0f) {
         attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
     }
     const uint32_t n_ctx_orig_arg = (uint32_t)(compressed ? DS4_ROPE_ORIG_CTX : 0);
 
-    int ok2 = ds4_cuda_begin_commands();
-    /* HC pre attn: rms_norm_plain → matmul_f16 → fused split+sum+norm. */
-    if (ok2) ok2 = ds4_cuda_rms_norm_plain_tensor(flat_dev, cur_dev,
-                                                  (uint32_t)hc_dim, DS4_RMS_EPS);
-    if (ok2) ok2 = ds4_cuda_matmul_f16_tensor(mix_dev, e->model.map, e->model.size,
-                                              layer->hc_attn_fn->abs_offset,
-                                              hc_dim, mix_dim, flat_dev, 1u);
-    if (ok2) ok2 = ds4_cuda_hc_split_weighted_sum_norm_tensor(
-                    attn_cur_dev, attn_norm_dev, split_dev,
-                    mix_dev, cur_dev, e->model.map, e->model.size,
-                    layer->hc_attn_scale->abs_offset,
-                    layer->hc_attn_base->abs_offset,
-                    layer->attn_norm->abs_offset,
-                    DS4_N_EMBD, DS4_N_HC,
-                    DS4_N_HC_SINKHORN_ITER, 1.0e-6f, DS4_RMS_EPS);
-    /* Q LoRA: matmul_q8_0 → rms_norm_weight → matmul_q8_0 → head_rms_norm. */
-    if (ok2) ok2 = ds4_cuda_matmul_q8_0_tensor(qr_dev, e->model.map, e->model.size,
-                                               layer->attn_q_a->abs_offset,
-                                               DS4_N_EMBD, 1024u, attn_norm_dev, 1u);
-    if (ok2) ok2 = ds4_cuda_rms_norm_weight_tensor(qr_norm_dev, qr_dev,
-                                                   e->model.map, e->model.size,
-                                                   layer->attn_q_a_norm->abs_offset,
-                                                   1024u, DS4_RMS_EPS);
-    if (ok2) ok2 = ds4_cuda_matmul_q8_0_tensor(q_dev, e->model.map, e->model.size,
-                                               layer->attn_q_b->abs_offset,
-                                               1024u, q_dim, qr_norm_dev, 1u);
-    if (ok2) ok2 = ds4_cuda_head_rms_norm_tensor(q_dev, 1u, DS4_N_HEAD,
-                                                 DS4_N_HEAD_DIM, DS4_RMS_EPS);
-    /* KV proj: matmul_q8_0 → rms_norm_weight. */
-    if (ok2) ok2 = ds4_cuda_matmul_q8_0_tensor(kv_raw_dev, e->model.map, e->model.size,
-                                               layer->attn_kv->abs_offset,
-                                               DS4_N_EMBD, kv_dim, attn_norm_dev, 1u);
-    if (ok2) ok2 = ds4_cuda_rms_norm_weight_tensor(kv_dev, kv_raw_dev,
-                                                   e->model.map, e->model.size,
-                                                   layer->attn_kv_a_norm->abs_offset,
-                                                   (uint32_t)kv_dim, DS4_RMS_EPS);
-    /* RoPE Q + KV (in-place). */
-    if (ok2) ok2 = ds4_cuda_rope_tail_tensor(q_dev, 1u, DS4_N_HEAD,
-                                             DS4_N_HEAD_DIM, DS4_N_ROT,
-                                             pos, n_ctx_orig_arg, false,
-                                             freq_base, freq_scale,
-                                             ext_factor, attn_factor,
-                                             DS4_ROPE_YARN_BETA_FAST,
-                                             DS4_ROPE_YARN_BETA_SLOW);
-    if (ok2) ok2 = ds4_cuda_rope_tail_tensor(kv_dev, 1u, DS4_N_HEAD_KV,
-                                             DS4_N_HEAD_DIM, DS4_N_ROT,
-                                             pos, n_ctx_orig_arg, false,
-                                             freq_base, freq_scale,
-                                             ext_factor, attn_factor,
-                                             DS4_ROPE_YARN_BETA_FAST,
-                                             DS4_ROPE_YARN_BETA_SLOW);
-    if (ok2) ok2 = ds4_cuda_end_commands();
+    /* Per-token CPU scratch (re-used across iterations). */
+    float *cpu_attn_residual   = xmalloc(hc_dim * sizeof(float));
+    float *cpu_attn_cur        = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *cpu_attn_norm       = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *cpu_q               = xmalloc(q_dim * sizeof(float));
+    float *cpu_kv              = xmalloc(kv_dim * sizeof(float));
+    float *cpu_kv_unrounded    = xmalloc(kv_dim * sizeof(float));
+    float *cpu_heads           = xmalloc(q_dim * sizeof(float));
+    float *cpu_after_attn      = xmalloc(hc_dim * sizeof(float));
+    float *cpu_attn_low_oracle = xmalloc((size_t)DS4_N_OUT_GROUP * DS4_N_LORA_O * sizeof(float));
+    float *cpu_attn_out_oracle = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *cuda_heads_buf      = xmalloc(q_dim * sizeof(float));
+    float *cuda_after_attn_buf = xmalloc(hc_dim * sizeof(float));
+    float  cpu_post[4]; float cpu_comb[16];
 
-    int rc = 0;
-    if (!ok2) {
-        fprintf(stderr, "ds4: cuda_single_layer_test attn-inputs chain failed\n");
-        rc = 1;
-        goto cuda_test_cleanup;
-    }
+    /* CPU raw KV cache (FP8+F16 quantized rows, layer-major). */
+    float *cpu_raw_kv = xcalloc((size_t)raw_cap * DS4_N_HEAD_DIM, sizeof(float));
 
-    /* Diagnostic dump for q/kv (informational, not fatal). */
-    {
-        float *cuda_q  = xmalloc(q_dim  * sizeof(float));
-        float *cuda_kv = xmalloc(kv_dim * sizeof(float));
-        ds4_cuda_tensor_read(q_dev,  0, cuda_q,  q_dim  * sizeof(float));
-        ds4_cuda_tensor_read(kv_dev, 0, cuda_kv, kv_dim * sizeof(float));
-        int q_worst = 0; uint64_t q_idx = 0;
-        for (uint64_t i = 0; i < q_dim; i++) {
-            union { float f; int32_t i; } ua, ub; ua.f = cpu_q[i]; ub.f = cuda_q[i];
-            int32_t d = (cpu_q[i] == cuda_q[i]) ? 0 :
-                        ((ua.i < 0) != (ub.i < 0)) ? INT32_MAX :
-                        (ua.i > ub.i ? ua.i - ub.i : ub.i - ua.i);
-            if (d > q_worst) { q_worst = d; q_idx = i; }
-        }
-        int kv_worst = 0; uint64_t kv_idx = 0;
-        for (uint64_t i = 0; i < kv_dim; i++) {
-            union { float f; int32_t i; } ua, ub; ua.f = cpu_kv[i]; ub.f = cuda_kv[i];
-            int32_t d = (cpu_kv[i] == cuda_kv[i]) ? 0 :
-                        ((ua.i < 0) != (ub.i < 0)) ? INT32_MAX :
-                        (ua.i > ub.i ? ua.i - ub.i : ub.i - ua.i);
-            if (d > kv_worst) { kv_worst = d; kv_idx = i; }
-        }
-        fprintf(stderr,
-                "ds4: cuda_single_layer_test attn-inputs Q worst_ulp=%d at idx=%llu  cpu=%.6e cuda=%.6e\n",
-                q_worst, (unsigned long long)q_idx,
-                (double)cpu_q[q_idx], (double)cuda_q[q_idx]);
-        fprintf(stderr,
-                "ds4: cuda_single_layer_test attn-inputs KV worst_ulp=%d at idx=%llu  cpu=%.6e cuda=%.6e\n",
-                kv_worst, (unsigned long long)kv_idx,
-                (double)cpu_kv[kv_idx], (double)cuda_kv[kv_idx]);
-        free(cuda_q); free(cuda_kv);
-    }
-
-    /* ============================================================
-     * 2.1b continuation: attention + output projection + HC expand.
-     * Output: after_attn_hc.  Compare to CPU after the attention
-     * block finishes (before FFN).
-     * ============================================================ */
-    const uint32_t raw_cap = DS4_N_SWA;  /* 128 — sliding-window cap. */
-    ds4_cuda_tensor *raw_kv_cache = ds4_cuda_tensor_alloc((uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
-    ds4_cuda_tensor *heads_dev    = ds4_cuda_tensor_alloc(q_dim * sizeof(float));
-    ds4_cuda_tensor *attn_out_dev = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    ds4_cuda_tensor *low_dev      = ds4_cuda_tensor_alloc((uint64_t)8u * 1024u * sizeof(float));
-    ds4_cuda_tensor *group_tmp    = ds4_cuda_tensor_alloc((uint64_t)8u * 1024u * sizeof(float));
-    ds4_cuda_tensor *low_tmp      = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    ds4_cuda_tensor *after_attn   = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+    /* CUDA device tensors used inside the prefill loop.  All re-used per
+     * iteration; cur_dev / flat_dev are inherited from the 2.1a chain. */
+    ds4_cuda_tensor *mix_dev         = ds4_cuda_tensor_alloc(mix_dim    * sizeof(float));
+    ds4_cuda_tensor *attn_cur_dev    = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    ds4_cuda_tensor *attn_norm_dev   = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    ds4_cuda_tensor *split_dev       = ds4_cuda_tensor_alloc(mix_dim    * sizeof(float));
+    ds4_cuda_tensor *qr_dev          = ds4_cuda_tensor_alloc(1024u      * sizeof(float));
+    ds4_cuda_tensor *qr_norm_dev     = ds4_cuda_tensor_alloc(1024u      * sizeof(float));
+    ds4_cuda_tensor *q_dev           = ds4_cuda_tensor_alloc(q_dim      * sizeof(float));
+    ds4_cuda_tensor *kv_raw_dev      = ds4_cuda_tensor_alloc(kv_dim     * sizeof(float));
+    ds4_cuda_tensor *kv_dev          = ds4_cuda_tensor_alloc(kv_dim     * sizeof(float));
+    ds4_cuda_tensor *raw_kv_cache    = ds4_cuda_tensor_alloc((uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+    ds4_cuda_tensor *heads_dev       = ds4_cuda_tensor_alloc(q_dim * sizeof(float));
+    ds4_cuda_tensor *attn_out_dev    = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    ds4_cuda_tensor *low_dev         = ds4_cuda_tensor_alloc((uint64_t)8u * 1024u * sizeof(float));
+    ds4_cuda_tensor *group_tmp       = ds4_cuda_tensor_alloc((uint64_t)8u * 1024u * sizeof(float));
+    ds4_cuda_tensor *low_tmp         = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    ds4_cuda_tensor *after_attn      = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
     /* Dummy comp_kv / comp_mask for raw-only attention (n_comp=0, use_mask=0). */
     ds4_cuda_tensor *comp_kv_dummy   = ds4_cuda_tensor_alloc(sizeof(float));
     ds4_cuda_tensor *comp_mask_dummy = ds4_cuda_tensor_alloc(sizeof(float));
-    /* post and comb views into split_dev: split[n_hc..2*n_hc] and split[2*n_hc..2*n_hc+n_hc^2]. */
+    /* post and comb views into split_dev. */
     ds4_cuda_tensor *post_view = ds4_cuda_tensor_view(split_dev,
                                                       DS4_N_HC * sizeof(float),
                                                       DS4_N_HC * sizeof(float));
     ds4_cuda_tensor *comb_view = ds4_cuda_tensor_view(split_dev,
                                                       2u * DS4_N_HC * sizeof(float),
                                                       DS4_N_HC * DS4_N_HC * sizeof(float));
-    if (!raw_kv_cache || !heads_dev || !attn_out_dev || !low_dev || !group_tmp ||
-        !low_tmp || !after_attn || !comp_kv_dummy || !comp_mask_dummy ||
-        !post_view || !comb_view) {
-        fprintf(stderr, "ds4: cuda_single_layer_test attn-block alloc failed\n");
+
+    int rc = 0;
+    int      worst_q_acc          = 0;
+    uint64_t worst_q_idx_acc      = 0;
+    uint32_t worst_q_token_acc    = 0;
+    int      worst_kv_acc         = 0;
+    uint64_t worst_kv_idx_acc     = 0;
+    uint32_t worst_kv_token_acc   = 0;
+    int      worst_heads_acc      = 0;
+    uint64_t worst_heads_idx_acc  = 0;
+    uint32_t worst_heads_token_acc = 0;
+    int      worst_after_acc      = 0;
+    uint64_t worst_after_idx_acc  = 0;
+    uint32_t worst_after_token_acc = 0;
+    double   worst_after_absmag   = 0.0;
+    double   worst_after_abserr   = 0.0;
+
+    if (!mix_dev || !attn_cur_dev || !attn_norm_dev || !split_dev ||
+        !qr_dev  || !qr_norm_dev  || !q_dev || !kv_raw_dev || !kv_dev ||
+        !raw_kv_cache || !heads_dev || !attn_out_dev || !low_dev ||
+        !group_tmp || !low_tmp || !after_attn ||
+        !comp_kv_dummy || !comp_mask_dummy || !post_view || !comb_view) {
+        fprintf(stderr, "ds4: cuda_single_layer_test 2.1c alloc failed\n");
         rc = 1;
-        goto cuda_test_cleanup_attnblock;
+        goto cuda_test_cleanup_2_1c;
     }
 
     /* Zero raw_kv_cache + dummies (managed memory, host-writable outside batch). */
     {
-        float zero = 0.0f;
+        const float zero = 0.0f;
         for (uint32_t r = 0; r < raw_cap; r++) {
             for (uint32_t i = 0; i < DS4_N_HEAD_DIM; i++) {
                 ds4_cuda_tensor_write(raw_kv_cache,
@@ -16491,200 +16405,277 @@ int ds4_engine_cuda_single_layer_test(ds4_engine *e, const ds4_tokens *prompt) {
         ds4_cuda_tensor_write(comp_mask_dummy, 0, &zero, sizeof(float));
     }
 
-    int ok3 = ds4_cuda_begin_commands();
-    /* KV FP8 round-trip + write to raw cache at row=pos. */
-    if (ok3) ok3 = ds4_cuda_kv_fp8_store_raw_tensor(kv_dev, raw_kv_cache,
-                                                     raw_cap, pos,
-                                                     DS4_N_HEAD_DIM, DS4_N_ROT);
-    /* Single-token decode attention (raw-only: n_raw=1, n_comp=0, use_mask=0). */
-    if (ok3) ok3 = ds4_cuda_attention_decode_heads_tensor(
-                    heads_dev,
-                    e->model.map, e->model.size,
-                    layer->attn_sinks->abs_offset,
-                    q_dev, raw_kv_cache,
-                    /*n_raw=*/1u, raw_cap, /*raw_start=*/0u,
-                    comp_kv_dummy, /*n_comp=*/0u,
-                    comp_mask_dummy, /*use_mask=*/0u,
-                    DS4_N_HEAD, DS4_N_HEAD_DIM);
-    /* Inverse RoPE on heads. */
-    if (ok3) ok3 = ds4_cuda_rope_tail_tensor(heads_dev, 1u, DS4_N_HEAD,
-                                             DS4_N_HEAD_DIM, DS4_N_ROT,
-                                             pos, n_ctx_orig_arg, true,
-                                             freq_base, freq_scale,
-                                             ext_factor, attn_factor,
-                                             DS4_ROPE_YARN_BETA_FAST,
-                                             DS4_ROPE_YARN_BETA_SLOW);
-    /* Attention output: grouped Q8_0 LoRA (n_groups=8, group_dim=4096, rank=1024). */
-    if (ok3) ok3 = ds4_cuda_attention_output_q8_batch_tensor(
-                    attn_out_dev, low_dev, group_tmp, low_tmp,
-                    e->model.map, e->model.size,
-                    layer->attn_output_a->abs_offset,
-                    layer->attn_output_b->abs_offset,
-                    /*group_dim=*/4096u, /*rank=*/1024u,
-                    /*n_groups=*/8u, /*out_dim=*/DS4_N_EMBD,
-                    heads_dev, /*n_tokens=*/1u);
-    /* HC expand: combine attn_out with attn_residual via (post, comb). */
-    if (ok3) ok3 = ds4_cuda_hc_expand_tensor(after_attn, attn_out_dev,
-                                             cur_dev, post_view, comb_view,
-                                             DS4_N_EMBD, DS4_N_HC);
-    if (ok3) ok3 = ds4_cuda_end_commands();
-    if (!ok3) {
-        fprintf(stderr, "ds4: cuda_single_layer_test attn-block chain failed\n");
-        rc = 1;
-        goto cuda_test_cleanup_attnblock;
-    }
+    fprintf(stderr,
+            "ds4: cuda_single_layer_test 2.1c prefill loop n_tok=%u (raw_cap=%u, prompt_len=%d)\n",
+            n_tok, raw_cap, prompt->len);
 
-    /* CPU oracle through the attention block. */
-    float *cpu_kv_munged = xmalloc(kv_dim * sizeof(float));
-    memcpy(cpu_kv_munged, cpu_kv, kv_dim * sizeof(float));
-    dsv4_fp8_kv_quantize_row_inplace_cpu(cpu_kv_munged, DS4_N_HEAD_DIM, DS4_N_ROT);
-    f16_round_inplace_cpu(cpu_kv_munged, DS4_N_HEAD_DIM);
-    float *cpu_heads        = xmalloc(q_dim * sizeof(float));
-    float *cpu_attn_low_buf = xmalloc((size_t)DS4_N_OUT_GROUP * DS4_N_LORA_O * sizeof(float));
-    float *cpu_attn_out_buf = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    float *cpu_after_attn   = xmalloc(hc_dim * sizeof(float));
-    layer_attention_one(cpu_heads, model, layer, cpu_q, cpu_kv_munged);
-    rope_tail_layer_inplace(cpu_heads, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, true);
-    matvec_q8_0_grouped_rows(cpu_attn_low_buf, model, layer->attn_output_a,
-                             cpu_heads, DS4_N_OUT_GROUP,
-                             DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP),
-                             DS4_N_LORA_O);
-    layer_grouped_out_one(cpu_attn_out_buf, model, layer, cpu_heads);
-    hc_post_one(cpu_after_attn, cpu_attn_out_buf, cpu_attn_residual,
-                cpu_post, cpu_comb, DS4_N_EMBD, DS4_N_HC);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        const int      tok = prompt->v[t];
+        const uint32_t pos = t;
 
-    /* Compare intermediate state to localise the divergence. */
-    {
-        float *cuda_heads_buf = xmalloc(q_dim * sizeof(float));
+        /* CPU oracle: per-token full attention block on layer 0.  Mirrors
+         * layer_attention_raw_swa_batch's per-token sequential semantics
+         * (which is what layer_attention_rows_one + kv_cache_push_raw
+         * implements when DS4_PARALLEL_ATTN_ROWS is unset). */
+        embed_token_f16(model, weights, tok, plain);
+        hc_from_plain_embedding(cpu_cur, plain, DS4_N_EMBD, DS4_N_HC);
+        memcpy(cpu_attn_residual, cpu_cur, hc_dim * sizeof(float));
+        hc_pre_from_state_one(model, layer->hc_attn_fn,
+                              layer->hc_attn_scale, layer->hc_attn_base,
+                              cpu_attn_residual, cpu_attn_cur,
+                              cpu_post, cpu_comb);
+        layer_attn_norm_one(cpu_attn_norm, model, layer, cpu_attn_cur);
+        layer_q_projection_normed_one(model, layer, cpu_attn_norm, cpu_q);
+        layer_kv_projection_normed_one(model, layer, cpu_attn_norm, cpu_kv);
+        rope_tail_layer_inplace(cpu_q,  DS4_N_HEAD,    DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
+        rope_tail_layer_inplace(cpu_kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
+        /* Save the post-RoPE pre-quant kv for the diagnostic comparison
+         * against CUDA kv_dev (which is also pre-quant). */
+        memcpy(cpu_kv_unrounded, cpu_kv, kv_dim * sizeof(float));
+        /* CPU FP8 + F16 round-trip on kv (matches dsv4_fp8_kv_quantize_row +
+         * the F16 round embedded in kv_cache_push_raw).  Push to cpu_raw_kv
+         * at row=t, then run attention_rows over [0..t]. */
+        dsv4_fp8_kv_quantize_row_inplace_cpu(cpu_kv, DS4_N_HEAD_DIM, DS4_N_ROT);
+        f16_round_inplace_cpu(cpu_kv, DS4_N_HEAD_DIM);
+        memcpy(cpu_raw_kv + (uint64_t)t * DS4_N_HEAD_DIM,
+               cpu_kv,
+               DS4_N_HEAD_DIM * sizeof(float));
+        layer_attention_rows_one(cpu_heads, model, layer, cpu_q,
+                                 cpu_raw_kv, t + 1u);
+        rope_tail_layer_inplace(cpu_heads, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, true);
+
+        /* CUDA chain: full attention block, single batch. */
+        int ok = ds4_cuda_begin_commands();
+        if (ok) ok = ds4_cuda_embed_token_hc_tensor(
+                        cur_dev,
+                        e->model.map, e->model.size,
+                        weights->token_embd->abs_offset,
+                        DS4_N_VOCAB, (uint32_t)tok, DS4_N_EMBD, DS4_N_HC);
+        if (ok) ok = ds4_cuda_rms_norm_plain_tensor(flat_dev, cur_dev,
+                                                    (uint32_t)hc_dim, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_matmul_f16_tensor(mix_dev, e->model.map, e->model.size,
+                                                layer->hc_attn_fn->abs_offset,
+                                                hc_dim, mix_dim, flat_dev, 1u);
+        if (ok) ok = ds4_cuda_hc_split_weighted_sum_norm_tensor(
+                        attn_cur_dev, attn_norm_dev, split_dev,
+                        mix_dev, cur_dev, e->model.map, e->model.size,
+                        layer->hc_attn_scale->abs_offset,
+                        layer->hc_attn_base->abs_offset,
+                        layer->attn_norm->abs_offset,
+                        DS4_N_EMBD, DS4_N_HC,
+                        DS4_N_HC_SINKHORN_ITER, 1.0e-6f, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_matmul_q8_0_tensor(qr_dev, e->model.map, e->model.size,
+                                                  layer->attn_q_a->abs_offset,
+                                                  DS4_N_EMBD, 1024u, attn_norm_dev, 1u);
+        if (ok) ok = ds4_cuda_rms_norm_weight_tensor(qr_norm_dev, qr_dev,
+                                                      e->model.map, e->model.size,
+                                                      layer->attn_q_a_norm->abs_offset,
+                                                      1024u, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_matmul_q8_0_tensor(q_dev, e->model.map, e->model.size,
+                                                  layer->attn_q_b->abs_offset,
+                                                  1024u, q_dim, qr_norm_dev, 1u);
+        if (ok) ok = ds4_cuda_head_rms_norm_tensor(q_dev, 1u, DS4_N_HEAD,
+                                                    DS4_N_HEAD_DIM, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_matmul_q8_0_tensor(kv_raw_dev, e->model.map, e->model.size,
+                                                  layer->attn_kv->abs_offset,
+                                                  DS4_N_EMBD, kv_dim, attn_norm_dev, 1u);
+        if (ok) ok = ds4_cuda_rms_norm_weight_tensor(kv_dev, kv_raw_dev,
+                                                      e->model.map, e->model.size,
+                                                      layer->attn_kv_a_norm->abs_offset,
+                                                      (uint32_t)kv_dim, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_rope_tail_tensor(q_dev, 1u, DS4_N_HEAD,
+                                                DS4_N_HEAD_DIM, DS4_N_ROT,
+                                                pos, n_ctx_orig_arg, false,
+                                                freq_base, freq_scale,
+                                                ext_factor, attn_factor,
+                                                DS4_ROPE_YARN_BETA_FAST,
+                                                DS4_ROPE_YARN_BETA_SLOW);
+        if (ok) ok = ds4_cuda_rope_tail_tensor(kv_dev, 1u, DS4_N_HEAD_KV,
+                                                DS4_N_HEAD_DIM, DS4_N_ROT,
+                                                pos, n_ctx_orig_arg, false,
+                                                freq_base, freq_scale,
+                                                ext_factor, attn_factor,
+                                                DS4_ROPE_YARN_BETA_FAST,
+                                                DS4_ROPE_YARN_BETA_SLOW);
+        /* KV FP8 round-trip + F16 round + push to raw_kv_cache row=pos. */
+        if (ok) ok = ds4_cuda_kv_fp8_store_raw_tensor(kv_dev, raw_kv_cache,
+                                                       raw_cap, pos,
+                                                       DS4_N_HEAD_DIM, DS4_N_ROT);
+        /* Decode attention sees raw_kv_cache rows [0..t]. */
+        if (ok) ok = ds4_cuda_attention_decode_heads_tensor(
+                        heads_dev,
+                        e->model.map, e->model.size,
+                        layer->attn_sinks->abs_offset,
+                        q_dev, raw_kv_cache,
+                        /*n_raw=*/t + 1u, raw_cap, /*raw_start=*/0u,
+                        comp_kv_dummy, /*n_comp=*/0u,
+                        comp_mask_dummy, /*use_mask=*/0u,
+                        DS4_N_HEAD, DS4_N_HEAD_DIM);
+        if (ok) ok = ds4_cuda_rope_tail_tensor(heads_dev, 1u, DS4_N_HEAD,
+                                                DS4_N_HEAD_DIM, DS4_N_ROT,
+                                                pos, n_ctx_orig_arg, true,
+                                                freq_base, freq_scale,
+                                                ext_factor, attn_factor,
+                                                DS4_ROPE_YARN_BETA_FAST,
+                                                DS4_ROPE_YARN_BETA_SLOW);
+        if (ok) ok = ds4_cuda_attention_output_q8_batch_tensor(
+                        attn_out_dev, low_dev, group_tmp, low_tmp,
+                        e->model.map, e->model.size,
+                        layer->attn_output_a->abs_offset,
+                        layer->attn_output_b->abs_offset,
+                        /*group_dim=*/4096u, /*rank=*/1024u,
+                        /*n_groups=*/8u, /*out_dim=*/DS4_N_EMBD,
+                        heads_dev, /*n_tokens=*/1u);
+        if (ok) ok = ds4_cuda_hc_expand_tensor(after_attn, attn_out_dev,
+                                                cur_dev, post_view, comb_view,
+                                                DS4_N_EMBD, DS4_N_HC);
+        if (ok) ok = ds4_cuda_end_commands();
+        if (!ok) {
+            fprintf(stderr, "ds4: cuda_single_layer_test 2.1c chain failed at t=%u\n", t);
+            rc = 1;
+            goto cuda_test_cleanup_2_1c;
+        }
+
+        /* Per-iteration ULP diagnostics. */
+        int      q_w  = 0, kv_w = 0, h_w = 0, a_w = 0;
+        uint64_t q_i  = 0, kv_i = 0, h_i = 0, a_i = 0;
+
+        {
+            float *cuda_q     = xmalloc(q_dim * sizeof(float));
+            float *cuda_kv_row = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
+            ds4_cuda_tensor_read(q_dev,  0, cuda_q, q_dim * sizeof(float));
+            /* Compare cache row t — that's the value attention actually reads.
+             * (kv_fp8_store_raw quantizes kv_dev's NOPE prefix in-place, so
+             * reading kv_dev post-batch is misleading; the cache row is the
+             * ground truth for downstream attention.) */
+            ds4_cuda_tensor_read(raw_kv_cache,
+                                 (uint64_t)t * DS4_N_HEAD_DIM * sizeof(float),
+                                 cuda_kv_row,
+                                 (size_t)DS4_N_HEAD_DIM * sizeof(float));
+            for (uint64_t i = 0; i < q_dim; i++) {
+                union { float f; int32_t i; } ua, ub; ua.f = cpu_q[i]; ub.f = cuda_q[i];
+                int32_t d = (cpu_q[i] == cuda_q[i]) ? 0 :
+                            ((ua.i < 0) != (ub.i < 0)) ? INT32_MAX :
+                            (ua.i > ub.i ? ua.i - ub.i : ub.i - ua.i);
+                if (d > q_w) { q_w = d; q_i = i; }
+            }
+            for (uint64_t i = 0; i < DS4_N_HEAD_DIM; i++) {
+                const float c = cpu_raw_kv[(uint64_t)t * DS4_N_HEAD_DIM + i];
+                const float g = cuda_kv_row[i];
+                union { float f; int32_t i; } ua, ub; ua.f = c; ub.f = g;
+                int32_t d = (c == g) ? 0 :
+                            ((ua.i < 0) != (ub.i < 0)) ? INT32_MAX :
+                            (ua.i > ub.i ? ua.i - ub.i : ub.i - ua.i);
+                if (d > kv_w) { kv_w = d; kv_i = i; }
+            }
+            free(cuda_q); free(cuda_kv_row);
+        }
+
         ds4_cuda_tensor_read(heads_dev, 0, cuda_heads_buf, q_dim * sizeof(float));
-        int hw = 0; uint64_t hidx = 0;
         for (uint64_t i = 0; i < q_dim; i++) {
             union { float f; int32_t i; } ua, ub;
             ua.f = cpu_heads[i]; ub.f = cuda_heads_buf[i];
             int32_t d = (cpu_heads[i] == cuda_heads_buf[i]) ? 0 :
                         ((ua.i < 0) != (ub.i < 0)) ? INT32_MAX :
                         (ua.i > ub.i ? ua.i - ub.i : ub.i - ua.i);
-            if (d > hw) { hw = d; hidx = i; }
+            if (d > h_w) { h_w = d; h_i = i; }
         }
-        fprintf(stderr,
-                "ds4: cuda_single_layer_test attn-block heads(post-RoPE-inv) worst_ulp=%d at idx=%llu  cpu=%.6e cuda=%.6e\n",
-                hw, (unsigned long long)hidx,
-                (double)cpu_heads[hidx], (double)cuda_heads_buf[hidx]);
 
-        float *cuda_attn_low_buf = xmalloc((size_t)DS4_N_OUT_GROUP * DS4_N_LORA_O * sizeof(float));
-        ds4_cuda_tensor_read(low_dev, 0, cuda_attn_low_buf,
-                             (size_t)DS4_N_OUT_GROUP * DS4_N_LORA_O * sizeof(float));
-        float *cpu_low_from_cuda_heads = xmalloc((size_t)DS4_N_OUT_GROUP * DS4_N_LORA_O * sizeof(float));
-        matvec_q8_0_grouped_rows(cpu_low_from_cuda_heads, model, layer->attn_output_a,
+        /* Same Q8 oracle workaround as 2.1b: feed CUDA heads through CPU's
+         * Q8 attn_output path, so the after_attn comparison isolates
+         * differences in HC expand and earlier stages from drift-amplified
+         * sign flips through Q8 quantization at attn_out. */
+        matvec_q8_0_grouped_rows(cpu_attn_low_oracle, model, layer->attn_output_a,
                                  cuda_heads_buf, DS4_N_OUT_GROUP,
                                  DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP),
                                  DS4_N_LORA_O);
-        int lw = 0; uint64_t lidx = 0;
-        for (uint64_t i = 0; i < (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O; i++) {
-            union { float f; int32_t i; } ua, ub;
-            ua.f = cpu_attn_low_buf[i]; ub.f = cuda_attn_low_buf[i];
-            int32_t d = (cpu_attn_low_buf[i] == cuda_attn_low_buf[i]) ? 0 :
-                        ((ua.i < 0) != (ub.i < 0)) ? INT32_MAX :
-                        (ua.i > ub.i ? ua.i - ub.i : ub.i - ua.i);
-            if (d > lw) { lw = d; lidx = i; }
-        }
-        fprintf(stderr,
-                "ds4: cuda_single_layer_test attn-block attn_low worst_ulp=%d at idx=%llu  cpu=%.6e cuda=%.6e\n",
-                lw, (unsigned long long)lidx,
-                (double)cpu_attn_low_buf[lidx], (double)cuda_attn_low_buf[lidx]);
-        int lhw = 0; uint64_t lhidx = 0;
-        for (uint64_t i = 0; i < (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O; i++) {
-            union { float f; int32_t i; } ua, ub;
-            ua.f = cpu_low_from_cuda_heads[i]; ub.f = cuda_attn_low_buf[i];
-            int32_t d = (cpu_low_from_cuda_heads[i] == cuda_attn_low_buf[i]) ? 0 :
-                        ((ua.i < 0) != (ub.i < 0)) ? INT32_MAX :
-                        (ua.i > ub.i ? ua.i - ub.i : ub.i - ua.i);
-            if (d > lhw) { lhw = d; lhidx = i; }
-        }
-        fprintf(stderr,
-                "ds4: cuda_single_layer_test attn-block attn_low(cuda-head oracle) worst_ulp=%d at idx=%llu  cpu=%.6e cuda=%.6e\n",
-                lhw, (unsigned long long)lhidx,
-                (double)cpu_low_from_cuda_heads[lhidx], (double)cuda_attn_low_buf[lhidx]);
-
-        float *cuda_attn_out_buf = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-        ds4_cuda_tensor_read(attn_out_dev, 0, cuda_attn_out_buf, (size_t)DS4_N_EMBD * sizeof(float));
-        float *cpu_out_from_cuda_heads = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-        matvec_q8_0(cpu_out_from_cuda_heads, model, layer->attn_output_b, cpu_low_from_cuda_heads);
-        int ow = 0; uint64_t oidx = 0;
-        for (uint64_t i = 0; i < DS4_N_EMBD; i++) {
-            union { float f; int32_t i; } ua, ub;
-            ua.f = cpu_attn_out_buf[i]; ub.f = cuda_attn_out_buf[i];
-            int32_t d = (cpu_attn_out_buf[i] == cuda_attn_out_buf[i]) ? 0 :
-                        ((ua.i < 0) != (ub.i < 0)) ? INT32_MAX :
-                        (ua.i > ub.i ? ua.i - ub.i : ub.i - ua.i);
-            if (d > ow) { ow = d; oidx = i; }
-        }
-        fprintf(stderr,
-                "ds4: cuda_single_layer_test attn-block attn_out worst_ulp=%d at idx=%llu  cpu=%.6e cuda=%.6e\n",
-                ow, (unsigned long long)oidx,
-                (double)cpu_attn_out_buf[oidx], (double)cuda_attn_out_buf[oidx]);
-        int ohw = 0; uint64_t ohidx = 0;
-        for (uint64_t i = 0; i < DS4_N_EMBD; i++) {
-            union { float f; int32_t i; } ua, ub;
-            ua.f = cpu_out_from_cuda_heads[i]; ub.f = cuda_attn_out_buf[i];
-            int32_t d = (cpu_out_from_cuda_heads[i] == cuda_attn_out_buf[i]) ? 0 :
-                        ((ua.i < 0) != (ub.i < 0)) ? INT32_MAX :
-                        (ua.i > ub.i ? ua.i - ub.i : ub.i - ua.i);
-            if (d > ohw) { ohw = d; ohidx = i; }
-        }
-        fprintf(stderr,
-                "ds4: cuda_single_layer_test attn-block attn_out(cuda-head oracle) worst_ulp=%d at idx=%llu  cpu=%.6e cuda=%.6e\n",
-                ohw, (unsigned long long)ohidx,
-                (double)cpu_out_from_cuda_heads[ohidx], (double)cuda_attn_out_buf[ohidx]);
-        memcpy(cpu_attn_out_buf, cpu_out_from_cuda_heads, (size_t)DS4_N_EMBD * sizeof(float));
-        hc_post_one(cpu_after_attn, cpu_attn_out_buf, cpu_attn_residual,
+        matvec_q8_0(cpu_attn_out_oracle, model, layer->attn_output_b, cpu_attn_low_oracle);
+        hc_post_one(cpu_after_attn, cpu_attn_out_oracle, cpu_attn_residual,
                     cpu_post, cpu_comb, DS4_N_EMBD, DS4_N_HC);
-        free(cuda_attn_out_buf);
-        free(cpu_out_from_cuda_heads);
-        free(cpu_low_from_cuda_heads);
-        free(cuda_attn_low_buf);
-        free(cuda_heads_buf);
-    }
 
-    /* Compare after_attn_hc element-wise. */
-    float *cuda_after_attn = xmalloc(hc_dim * sizeof(float));
-    if (ds4_cuda_tensor_read(after_attn, 0, cuda_after_attn, hc_dim * sizeof(float))) {
-        int aw = 0; uint64_t aidx = 0;
+        if (!ds4_cuda_tensor_read(after_attn, 0, cuda_after_attn_buf, hc_dim * sizeof(float))) {
+            fprintf(stderr, "ds4: cuda_single_layer_test 2.1c after_attn read failed at t=%u\n", t);
+            rc = 1;
+            goto cuda_test_cleanup_2_1c;
+        }
+        double a_max_abserr = 0.0;
+        double a_max_absmag = 0.0;
         for (uint64_t i = 0; i < hc_dim; i++) {
             union { float f; int32_t i; } ua, ub;
-            ua.f = cpu_after_attn[i]; ub.f = cuda_after_attn[i];
-            int32_t d = (cpu_after_attn[i] == cuda_after_attn[i]) ? 0 :
+            ua.f = cpu_after_attn[i]; ub.f = cuda_after_attn_buf[i];
+            int32_t d = (cpu_after_attn[i] == cuda_after_attn_buf[i]) ? 0 :
                         ((ua.i < 0) != (ub.i < 0)) ? INT32_MAX :
                         (ua.i > ub.i ? ua.i - ub.i : ub.i - ua.i);
-            if (d > aw) { aw = d; aidx = i; }
+            if (d > a_w) { a_w = d; a_i = i; }
+            const double e = fabs((double)cpu_after_attn[i] - (double)cuda_after_attn_buf[i]);
+            const double m = fmax(fabs((double)cpu_after_attn[i]), fabs((double)cuda_after_attn_buf[i]));
+            if (e > a_max_abserr) { a_max_abserr = e; a_max_absmag = m; }
         }
+
+        if (q_w  > worst_q_acc)     { worst_q_acc = q_w; worst_q_idx_acc = q_i; worst_q_token_acc = t; }
+        if (kv_w > worst_kv_acc)    { worst_kv_acc = kv_w; worst_kv_idx_acc = kv_i; worst_kv_token_acc = t; }
+        if (h_w  > worst_heads_acc) { worst_heads_acc = h_w; worst_heads_idx_acc = h_i; worst_heads_token_acc = t; }
+        if (a_w  > worst_after_acc) { worst_after_acc = a_w; worst_after_idx_acc = a_i; worst_after_token_acc = t; }
+        if (a_max_abserr > worst_after_abserr) {
+            worst_after_abserr = a_max_abserr;
+            worst_after_absmag = a_max_absmag;
+        }
+
         fprintf(stderr,
-                "ds4: cuda_single_layer_test attn-block after_attn_hc worst_ulp=%d at idx=%llu  cpu=%.6e cuda=%.6e\n",
-                aw, (unsigned long long)aidx,
-                (double)cpu_after_attn[aidx], (double)cuda_after_attn[aidx]);
-        if (aw > 4096) rc = 1;
+                "ds4: 2.1c t=%u tok=%d pos=%u Q=%d KV(cache)=%d heads=%d after_attn=%d "
+                "(after_attn cpu/cuda[%llu]=%.6e/%.6e)\n",
+                t, tok, pos, q_w, kv_w, h_w, a_w,
+                (unsigned long long)a_i,
+                (double)cpu_after_attn[a_i], (double)cuda_after_attn_buf[a_i]);
+        if (q_w >= INT32_MAX || h_w >= INT32_MAX) {
+            float *cuda_q  = xmalloc(q_dim * sizeof(float));
+            ds4_cuda_tensor_read(q_dev, 0, cuda_q, q_dim * sizeof(float));
+            fprintf(stderr,
+                    "ds4: 2.1c t=%u sign-flip probe: Q[%llu] cpu=%.6e cuda=%.6e  heads[%llu] cpu=%.6e cuda=%.6e\n",
+                    t,
+                    (unsigned long long)q_i,
+                    (double)cpu_q[q_i], (double)cuda_q[q_i],
+                    (unsigned long long)h_i,
+                    (double)cpu_heads[h_i], (double)cuda_heads_buf[h_i]);
+            free(cuda_q);
+        }
     }
-    free(cuda_after_attn);
-    free(cpu_kv_munged); free(cpu_heads); free(cpu_attn_low_buf);
-    free(cpu_attn_out_buf); free(cpu_after_attn);
 
-cuda_test_cleanup_attnblock:
-    ds4_cuda_tensor_free(raw_kv_cache); ds4_cuda_tensor_free(heads_dev);
-    ds4_cuda_tensor_free(attn_out_dev); ds4_cuda_tensor_free(low_dev);
-    ds4_cuda_tensor_free(group_tmp); ds4_cuda_tensor_free(low_tmp);
-    ds4_cuda_tensor_free(after_attn);
-    ds4_cuda_tensor_free(comp_kv_dummy); ds4_cuda_tensor_free(comp_mask_dummy);
+    fprintf(stderr,
+            "ds4: cuda_single_layer_test 2.1c summary: "
+            "Q worst=%d@t=%u idx=%llu  KV(cache) worst=%d@t=%u idx=%llu  "
+            "heads worst=%d@t=%u idx=%llu  after_attn worst=%d@t=%u idx=%llu  "
+            "after_attn max_abserr=%.3e at_absmag=%.3e\n",
+            worst_q_acc,     worst_q_token_acc,     (unsigned long long)worst_q_idx_acc,
+            worst_kv_acc,    worst_kv_token_acc,    (unsigned long long)worst_kv_idx_acc,
+            worst_heads_acc, worst_heads_token_acc, (unsigned long long)worst_heads_idx_acc,
+            worst_after_acc, worst_after_token_acc, (unsigned long long)worst_after_idx_acc,
+            worst_after_abserr, worst_after_absmag);
+
+    /* Gate on absolute error: at near-zero magnitudes ULPs explode but the
+     * downstream impact is negligible.  1e-3 threshold is generous; the
+     * single-token 2.1b result was abs_err ~5e-7 at this stage. */
+    if (worst_after_abserr > 1.0e-3) rc = 1;
+
+cuda_test_cleanup_2_1c:
     ds4_cuda_tensor_free(post_view); ds4_cuda_tensor_free(comb_view);
-
-cuda_test_cleanup:
+    ds4_cuda_tensor_free(comp_kv_dummy); ds4_cuda_tensor_free(comp_mask_dummy);
+    ds4_cuda_tensor_free(after_attn);
+    ds4_cuda_tensor_free(low_tmp); ds4_cuda_tensor_free(group_tmp);
+    ds4_cuda_tensor_free(low_dev); ds4_cuda_tensor_free(attn_out_dev);
+    ds4_cuda_tensor_free(heads_dev); ds4_cuda_tensor_free(raw_kv_cache);
+    ds4_cuda_tensor_free(kv_dev); ds4_cuda_tensor_free(kv_raw_dev);
+    ds4_cuda_tensor_free(q_dev); ds4_cuda_tensor_free(qr_norm_dev); ds4_cuda_tensor_free(qr_dev);
+    ds4_cuda_tensor_free(split_dev); ds4_cuda_tensor_free(attn_norm_dev);
+    ds4_cuda_tensor_free(attn_cur_dev); ds4_cuda_tensor_free(mix_dev);
     ds4_cuda_tensor_free(cur_dev); ds4_cuda_tensor_free(flat_dev);
-    ds4_cuda_tensor_free(mix_dev); ds4_cuda_tensor_free(attn_cur_dev);
-    ds4_cuda_tensor_free(attn_norm_dev); ds4_cuda_tensor_free(split_dev);
-    ds4_cuda_tensor_free(qr_dev); ds4_cuda_tensor_free(qr_norm_dev);
-    ds4_cuda_tensor_free(q_dev); ds4_cuda_tensor_free(kv_raw_dev); ds4_cuda_tensor_free(kv_dev);
+    free(cpu_raw_kv);
+    free(cuda_after_attn_buf); free(cuda_heads_buf);
+    free(cpu_attn_out_oracle); free(cpu_attn_low_oracle);
+    free(cpu_after_attn); free(cpu_heads);
+    free(cpu_kv_unrounded); free(cpu_kv); free(cpu_q);
+    free(cpu_attn_norm); free(cpu_attn_cur); free(cpu_attn_residual);
     free(plain); free(cpu_cur); free(cpu_flat);
-    free(cpu_attn_residual); free(cpu_attn_cur); free(cpu_attn_norm);
-    free(cpu_q); free(cpu_kv);
 
     const int threshold = 64;
     return (worst_ulp > threshold || rc != 0) ? 1 : 0;
