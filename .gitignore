@@ -2,6 +2,8 @@
 /ds4-cuda
 /ds4-server
 /ds4-server-cuda
+/ds4_cuda_load_sanity
+/ds4_cuda_test
 /ds4_native
 /ds4_server_test
 /ds4_test
