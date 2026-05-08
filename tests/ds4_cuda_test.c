@@ -3112,8 +3112,13 @@ static int embed_hc_cpu(const float *in, float *out, void *cfg) {
     return 1;
 }
 
-/* Test-local F16→F32 helper (reuse the harness's test_f16_to_f32 helper if
- * it exists; otherwise a minimal one matching the CUDA conversion). */
+/* Test-local F16→F32 helper.  IMPORTANT: this must match the bit-correct
+ * conversion (i.e. ds4.c's `f16_to_f32`), NOT the CUDA kernel's
+ * implementation, otherwise a buggy CUDA kernel + buggy oracle agree and
+ * the parity test produces a false negative.  Phase 2.1a caught a
+ * 2-exponent subnormal bug exactly that way: oracle and kernel had
+ * `e_adj = -1` where the CPU truth requires `e_adj = 1`.  Subnormal path
+ * here mirrors ds4.c:1368 line-for-line. */
 static float test_f16_to_f32_value(uint16_t h) {
     const uint32_t s = (uint32_t)(h & 0x8000u) << 16;
     const uint32_t e = (uint32_t)(h >> 10) & 0x1fu;
@@ -3122,7 +3127,7 @@ static float test_f16_to_f32_value(uint16_t h) {
     if (e == 0u) {
         if (m == 0u) bits = s;
         else {
-            int e_adj = -1;
+            int e_adj = 1;
             uint32_t mm = m;
             while ((mm & 0x400u) == 0u) { mm <<= 1; e_adj--; }
             mm &= 0x3ffu;
@@ -3783,6 +3788,30 @@ DS4_CUDA_PARITY_TEST(prod_attention_output_q8_batch,
     .cpu_fn = attn_output_q8_batch_cpu, .cuda_fn = attn_output_q8_batch_cuda,
     .cfg = (void *)&attn_output_q8_batch_cfg_v);
 
+/* Phase 2.1b shape-mismatch hunt: production-shape parity for the same
+ * `attention_output_q8_batch_tensor` kernel.  The Phase 2.1a single-layer
+ * test caught a sign-mismatch in attn_out at this shape (heads bit-exact,
+ * attn_out cpu=-8.76e-3 cuda=+1.97e-3 → ULP=INT32_MAX).  This fixture
+ * exercises the same kernel with the actual DS4 layer-0 dimensions to
+ * confirm whether the bug reproduces in isolation. */
+static struct attn_output_q8_batch_cfg attn_output_q8_batch_prod_cfg =
+    { .group_dim=4096, .rank=1024, .n_groups=8, .out_dim=4096, .n_tokens=1 };
+
+DS4_CUDA_PARITY_TEST(prod_attention_output_q8_batch_prod_shape,
+    .seed = 0xA77AB,
+    /* heads = n_tokens * n_groups * group_dim = 1*8*4096 = 32768 */
+    .in_elems  = 1*8*4096,
+    /* out (n_tokens * out_dim = 4096) + low (n_tokens * n_groups * rank = 8192) = 12288 */
+    .out_elems = 1*4096 + 1*8*1024,
+    /* Two cascaded Q8_0 matvecs (the second over 8192 inputs to 4096 outputs)
+     * cumulate quantization rounding noise; ULP at near-zero output magnitudes
+     * blows up.  Tolerance generous; we want to catch bit-level *direction*
+     * issues (sign mismatch) that the small-shape test missed, not nit-pick
+     * a few ULPs on cascaded Q8 reductions. */
+    .ulp_tolerance = 256,
+    .cpu_fn = attn_output_q8_batch_cpu, .cuda_fn = attn_output_q8_batch_cuda,
+    .cfg = (void *)&attn_output_q8_batch_prod_cfg);
+
 struct attn_decode_cfg {
     uint32_t n_head;
     uint32_t head_dim;
@@ -4263,6 +4292,7 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_prod_matmul_q8_0_hc_expand,
     &ds4_cuda_parity_prod_shared_down_hc_expand_q8_0,
     &ds4_cuda_parity_prod_attention_output_q8_batch,
+    &ds4_cuda_parity_prod_attention_output_q8_batch_prod_shape,
     &ds4_cuda_parity_attention_decode_heads_no_mask,
     &ds4_cuda_parity_attention_decode_heads_mask,
     &ds4_cuda_parity_output_hc_weights,

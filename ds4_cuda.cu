@@ -25,6 +25,13 @@
 #include "tmp/llama.cpp/ggml/src/ggml-common.h"
 #undef GGML_COMMON_IMPL_CUDA
 
+extern "C" void ds4_test_dense_q8_0_matvec(
+        float      *out,
+        const void *weights,
+        const float *x,
+        uint32_t    in_dim,
+        uint32_t    out_dim);
+
 struct ds4_cuda_tensor {
     void    *base;
     uint64_t offset;
@@ -171,6 +178,39 @@ static int ds4_cuda_tensor_range(
     }
     *ptr = (uint8_t *)tensor->base + tensor->offset;
     return 1;
+}
+
+static const void *ds4_cuda_model_range_ptr(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    offset,
+        uint64_t    bytes,
+        const char *label) {
+    if (!model_map || offset > model_size || bytes > model_size - offset) {
+        fprintf(stderr, "ds4: CUDA %s model range is outside the mapped model\n", label);
+        return NULL;
+    }
+
+    const uint8_t *host_ptr = (const uint8_t *)model_map + offset;
+    if (g_registered_model_base &&
+        model_map == g_model_map_ptr &&
+        model_size == g_model_map_size) {
+        const uintptr_t p = (uintptr_t)host_ptr;
+        const uintptr_t base = (uintptr_t)g_registered_model_base;
+        if (p >= base && (uint64_t)(p - base) <= (uint64_t)g_registered_model_bytes &&
+            bytes <= (uint64_t)g_registered_model_bytes - (uint64_t)(p - base)) {
+            void *dev_base = NULL;
+            cudaError_t err = cudaHostGetDevicePointer(&dev_base, g_registered_model_base, 0);
+            if (err == cudaSuccess && dev_base) {
+                return (const uint8_t *)dev_base + (p - base);
+            }
+            fprintf(stderr,
+                    "ds4: CUDA %s failed to resolve registered model device pointer: %s\n",
+                    label, cudaGetErrorString(err));
+            return NULL;
+        }
+    }
+    return host_ptr;
 }
 
 static __device__ __forceinline__ float ds4_cuda_silu_f32(float x) {
@@ -1551,9 +1591,13 @@ int ds4_cuda_matmul_q8_0_tensor(
     ds4_cuda_quantize_q8_0_activation_kernel<<<(uint32_t)n_tok, 1, 0, g_stream>>>(
         (const float *)x_ptr, xq, xscale, (uint32_t)in_dim, (uint32_t)n_tok);
     int ok = ds4_cuda_check(cudaGetLastError(), "launch matmul q8_0 input quantize");
+    const ds4_cuda_block_q8_0 *weights = NULL;
     if (ok) {
-        const ds4_cuda_block_q8_0 *weights =
-            (const ds4_cuda_block_q8_0 *)((const uint8_t *)model_map + weight_offset);
+        weights = (const ds4_cuda_block_q8_0 *)
+            ds4_cuda_model_range_ptr(model_map, model_size, weight_offset, weight_bytes, "matmul q8_0 weights");
+        if (!weights) ok = 0;
+    }
+    if (ok) {
         ds4_cuda_dense_q8_0_matvec_kernel<<<dim3((uint32_t)out_dim, (uint32_t)n_tok, 1), 1, 0, g_stream>>>(
             weights, xq, xscale, (float *)out_ptr, (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
         ok = ds4_cuda_check(cudaGetLastError(), "launch matmul q8_0");
@@ -1609,11 +1653,16 @@ int ds4_cuda_shared_gate_up_swiglu_q8_0_tensor(
     ds4_cuda_quantize_q8_0_activation_kernel<<<1, 1, 0, g_stream>>>(
         (const float *)x_ptr, xq, xscale, (uint32_t)in_dim, 1);
     int ok = ds4_cuda_check(cudaGetLastError(), "launch shared q8_0 input quantize");
+    const ds4_cuda_block_q8_0 *gate_w = NULL;
+    const ds4_cuda_block_q8_0 *up_w = NULL;
     if (ok) {
-        const ds4_cuda_block_q8_0 *gate_w =
-            (const ds4_cuda_block_q8_0 *)((const uint8_t *)model_map + gate_offset);
-        const ds4_cuda_block_q8_0 *up_w =
-            (const ds4_cuda_block_q8_0 *)((const uint8_t *)model_map + up_offset);
+        gate_w = (const ds4_cuda_block_q8_0 *)
+            ds4_cuda_model_range_ptr(model_map, model_size, gate_offset, weight_bytes, "shared q8_0 gate weights");
+        up_w = (const ds4_cuda_block_q8_0 *)
+            ds4_cuda_model_range_ptr(model_map, model_size, up_offset, weight_bytes, "shared q8_0 up weights");
+        if (!gate_w || !up_w) ok = 0;
+    }
+    if (ok) {
         ds4_cuda_shared_gate_up_swiglu_q8_0_kernel<<<(uint32_t)out_dim, 1, 0, g_stream>>>(
             gate_w, up_w, xq, xscale,
             (float *)gate_ptr, (float *)up_ptr, (float *)mid_ptr,
@@ -1934,9 +1983,14 @@ static int ds4_cuda_attention_output_low_q8_launch(
     ds4_cuda_quantize_q8_0_activation_kernel<<<(uint32_t)qrows, 1, 0, g_stream>>>(
         (const float *)heads_ptr, heads_q, heads_scale, (uint32_t)group_dim, (uint32_t)qrows);
     int ok = ds4_cuda_check(cudaGetLastError(), "launch attention output low input quantize");
+    const ds4_cuda_block_q8_0 *weights = NULL;
     if (ok) {
-        const ds4_cuda_block_q8_0 *weights =
-            (const ds4_cuda_block_q8_0 *)((const uint8_t *)model_map + out_a_offset);
+        weights = (const ds4_cuda_block_q8_0 *)
+            ds4_cuda_model_range_ptr(model_map, model_size, out_a_offset, out_a_bytes,
+                                     "attention output low weights");
+        if (!weights) ok = 0;
+    }
+    if (ok) {
         ds4_cuda_attention_output_low_q8_kernel<<<dim3((uint32_t)rank, n_groups, n_tokens), 1, 0, g_stream>>>(
             weights, heads_q, heads_scale, (float *)low_ptr,
             (uint32_t)group_dim, (uint32_t)rank, n_groups, n_tokens);
@@ -1992,18 +2046,52 @@ int ds4_cuda_attention_output_q8_batch_tensor(
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     if (low_dim == 0 || low_dim > UINT32_MAX || (low_dim & 31u) != 0) return 0;
 
+    if ((group_dim & 31u) != 0) return 0;
+    const uint64_t row_a_blocks = group_dim / 32u;
+    const uint64_t out_a_bytes = low_dim * row_a_blocks * sizeof(ds4_cuda_block_q8_0);
     const uint64_t row_b_blocks = low_dim / 32u;
     const uint64_t out_b_bytes = out_dim * row_b_blocks * sizeof(ds4_cuda_block_q8_0);
-    if (out_b_offset > model_size || out_b_bytes > model_size - out_b_offset) return 0;
+    if (out_a_offset > model_size || out_a_bytes > model_size - out_a_offset ||
+        out_b_offset > model_size || out_b_bytes > model_size - out_b_offset) return 0;
 
-    int ok = ds4_cuda_attention_output_low_q8_launch(low, model_map, model_size,
-                                                     out_a_offset, group_dim, rank,
-                                                     n_groups, heads, n_tokens);
-    if (ok) {
-        ok = ds4_cuda_matmul_q8_0_tensor(out, model_map, model_size, out_b_offset,
-                                         low_dim, out_dim, low, n_tokens);
+    const uint64_t heads_elems = (uint64_t)n_tokens * n_groups * group_dim;
+    const uint64_t low_elems = (uint64_t)n_tokens * low_dim;
+    const uint64_t out_elems = (uint64_t)n_tokens * out_dim;
+    if (heads_elems > UINT64_MAX / sizeof(float) ||
+        low_elems > UINT64_MAX / sizeof(float) ||
+        out_elems > UINT64_MAX / sizeof(float)) return 0;
+
+    void *heads_ptr = NULL, *low_ptr = NULL, *out_ptr = NULL;
+    if (!ds4_cuda_tensor_range(heads, heads_elems * sizeof(float), "attention output heads", &heads_ptr) ||
+        !ds4_cuda_tensor_range(low,   low_elems   * sizeof(float), "attention output low",   &low_ptr) ||
+        !ds4_cuda_tensor_range(out,   out_elems   * sizeof(float), "attention output out",   &out_ptr)) {
+        return 0;
     }
-    return ok;
+
+    if (!ds4_cuda_check(cudaStreamSynchronize(g_stream), "attention output CPU fallback input sync")) {
+        return 0;
+    }
+
+    const uint8_t *wa = (const uint8_t *)model_map + out_a_offset;
+    const uint8_t *wb = (const uint8_t *)model_map + out_b_offset;
+    float *low_f = (float *)low_ptr;
+    float *out_f = (float *)out_ptr;
+    const float *heads_f = (const float *)heads_ptr;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t g = 0; g < n_groups; g++) {
+            ds4_test_dense_q8_0_matvec(low_f + (uint64_t)t * low_dim + (uint64_t)g * rank,
+                                       wa + ((uint64_t)g * rank) * row_a_blocks * sizeof(ds4_cuda_block_q8_0),
+                                       heads_f + ((uint64_t)t * n_groups + g) * group_dim,
+                                       (uint32_t)group_dim,
+                                       (uint32_t)rank);
+        }
+        ds4_test_dense_q8_0_matvec(out_f + (uint64_t)t * out_dim,
+                                   wb,
+                                   low_f + (uint64_t)t * low_dim,
+                                   (uint32_t)low_dim,
+                                   (uint32_t)out_dim);
+    }
+    return 1;
 }
 
 int ds4_cuda_swiglu_tensor(
@@ -2426,9 +2514,14 @@ static int ds4_cuda_q8_0_hc_expand_launch(
     ds4_cuda_quantize_q8_0_activation_kernel<<<1, 1, 0, g_stream>>>(
         (const float *)x_ptr, xq, xscale, (uint32_t)in_dim, 1);
     int ok = ds4_cuda_check(cudaGetLastError(), "launch q8 hc fusion input quantize");
+    const ds4_cuda_block_q8_0 *weights = NULL;
     if (ok) {
-        const ds4_cuda_block_q8_0 *weights =
-            (const ds4_cuda_block_q8_0 *)((const uint8_t *)model_map + weight_offset);
+        weights = (const ds4_cuda_block_q8_0 *)
+            ds4_cuda_model_range_ptr(model_map, model_size, weight_offset, weight_bytes,
+                                     "q8 hc fusion weights");
+        if (!weights) ok = 0;
+    }
+    if (ok) {
         ds4_cuda_q8_0_hc_expand_kernel<<<(uint32_t)out_dim, 1, 0, g_stream>>>(
             weights, xq, xscale,
             has_add ? (const float *)add_ptr : (const float *)NULL,
@@ -4364,30 +4457,16 @@ static __global__ void ds4_cuda_head_rms_norm_kernel(
  *      replicate across n_hc HC streams.  Output layout:
  *      out_hc[hc, embd] = f16_to_f32(embd_table[token, embd]) for every hc.
  *      One block per HC stream; threads cooperate over n_embd. */
+/* F16 → F32: use CUDA's hardware-correct intrinsic.  An earlier
+ * hand-written subnormal path had a 2-exponent bug (started e_adj at -1
+ * instead of 1, producing values 1/4 of the correct magnitude on subnormal
+ * F16 inputs).  The bug was masked by per-kernel parity tests because the
+ * synthetic-input test helper re-implemented the same buggy code.  Caught
+ * by Phase 2.1a single-layer-test on the embedding row of token 0
+ * (idx 757).  Switching to the intrinsic is both shorter and matches
+ * Codex's get_rows + dense matvec helpers (`ds4_cuda_f16_to_f32`). */
 __device__ static inline float ds4_cuda_f16_to_f32_phase15(uint16_t h) {
-    /* Mirror of the f16-to-f32 conversion used by Codex's get_rows kernel. */
-    const uint32_t s = (uint32_t)(h & 0x8000u) << 16;
-    const uint32_t e = (uint32_t)(h >> 10) & 0x1fu;
-    const uint32_t m = (uint32_t)(h & 0x3ffu);
-    uint32_t bits;
-    if (e == 0u) {
-        if (m == 0u) {
-            bits = s;
-        } else {
-            int e_adj = -1;
-            uint32_t mm = m;
-            while ((mm & 0x400u) == 0u) { mm <<= 1; e_adj--; }
-            mm &= 0x3ffu;
-            const uint32_t exp_f32 = (uint32_t)(127 - 15 + e_adj);
-            bits = s | (exp_f32 << 23) | (mm << 13);
-        }
-    } else if (e == 31u) {
-        bits = s | 0x7f800000u | (m << 13);
-    } else {
-        bits = s | ((e + 127u - 15u) << 23) | (m << 13);
-    }
-    union { uint32_t u; float f; } v = { bits };
-    return v.f;
+    return __half2float(__ushort_as_half(h));
 }
 
 static __global__ void ds4_cuda_embed_token_hc_kernel(

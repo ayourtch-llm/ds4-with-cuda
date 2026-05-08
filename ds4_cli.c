@@ -40,6 +40,7 @@ typedef struct {
     bool metal_graph_test;
     bool metal_graph_full_test;
     bool metal_graph_prompt_test;
+    bool cuda_single_layer_test;
 } cli_generation_options;
 
 typedef struct {
@@ -91,8 +92,10 @@ static void usage(FILE *fp) {
         "      Use the Metal graph backend. This is the normal fast path and the default.\n"
         "  --cpu\n"
         "      Use the CPU reference/debug backend. Not recommended for normal inference.\n"
+        "  --cuda\n"
+        "      Use the CUDA graph backend (Linux + NVIDIA only).\n"
         "  --backend NAME\n"
-        "      Select backend explicitly: metal or cpu. Default: metal\n"
+        "      Select backend explicitly: metal, cpu, or cuda. Default: metal\n"
         "  -t, --threads N\n"
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
@@ -203,8 +206,9 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
 static ds4_backend parse_backend(const char *s) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
+    if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
     fprintf(stderr, "ds4: invalid backend: %s\n", s);
-    fprintf(stderr, "ds4: valid backends are: metal, cpu\n");
+    fprintf(stderr, "ds4: valid backends are: metal, cpu, cuda\n");
     exit(2);
 }
 
@@ -695,6 +699,11 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     }
     if (cfg->gen.metal_graph_prompt_test) {
         rc = ds4_engine_metal_graph_prompt_test(engine, &prompt, cfg->gen.ctx_size);
+        ds4_tokens_free(&prompt);
+        return rc;
+    }
+    if (cfg->gen.cuda_single_layer_test) {
+        rc = ds4_engine_cuda_single_layer_test(engine, &prompt);
         ds4_tokens_free(&prompt);
         return rc;
     }
@@ -1219,6 +1228,11 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--cuda")) {
+            c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--cuda-single-layer-test")) {
+            c.gen.cuda_single_layer_test = true;
+            c.engine.backend = DS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logprobs")) {

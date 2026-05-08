@@ -17,6 +17,7 @@
 typedef enum {
     DS4_BACKEND_METAL,
     DS4_BACKEND_CPU,
+    DS4_BACKEND_CUDA,
 } ds4_backend;
 
 typedef enum {
@@ -103,6 +104,11 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, int ctx_size);
+/* Phase 2.1a: CUDA single-token, single-layer forward orchestration check.
+ * Embeds the first prompt token, runs layer 0 forward on both CPU and CUDA,
+ * compares the post-layer-0 HC tensors element-wise.  Returns 0 on success,
+ * non-zero on mismatch / setup failure. */
+int ds4_engine_cuda_single_layer_test(ds4_engine *e, const ds4_tokens *prompt);
 
 void ds4_tokens_push(ds4_tokens *tv, int token);
 void ds4_tokens_free(ds4_tokens *tv);
