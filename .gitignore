@@ -1,9 +1,12 @@
 /ds4
+/ds4-cuda
 /ds4-server
+/ds4-server-cuda
 /ds4_native
 /ds4_server_test
 /ds4_test
 /ds4flash.gguf
+/tmp
 /TODO.md
 /gguf/
 *.o
