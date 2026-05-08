@@ -5424,6 +5424,53 @@ void indexer_score_one_cpu(float       *scores,
     }
 }
 
+/* Batched DS4 indexer scoring with causal masking.  Same per-(token, comp)
+ * math as indexer_score_one_cpu, but spans n_tokens query tokens and applies
+ * the DS4 ratio-4 causal mask: a compressed row c is visible to token t only
+ * when c < (pos0 + t + 1) / ratio.  Invisible cells store -INFINITY so the
+ * downstream top-k cannot select them.  The Metal kernels (tiled_f32 and
+ * tiled half-staged) compute the same numerical result; the half staging in
+ * the decode variant is a Phase 2 perf optimisation, not a math difference.
+ * Used by ds4_cuda_indexer_scores_{prefill,decode_batch}_tensor parity. */
+void indexer_scores_batch_cpu(float       *scores,
+                              const float *q,
+                              const float *weights,
+                              const float *index_comp,
+                              uint32_t     n_comp,
+                              uint32_t     n_tokens,
+                              uint32_t     pos0,
+                              uint32_t     n_head,
+                              uint32_t     head_dim,
+                              uint32_t     ratio,
+                              float        scale) {
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const uint32_t visible_raw = (pos0 + t + 1u) / ratio;
+        const uint32_t visible = visible_raw < n_comp ? visible_raw : n_comp;
+        const float *q_token = q + (uint64_t)t * n_head * head_dim;
+        const float *w_token = weights + (uint64_t)t * n_head;
+        float       *scores_row = scores + (uint64_t)t * n_comp;
+
+        for (uint32_t c = 0; c < n_comp; c++) {
+            if (c >= visible) {
+                scores_row[c] = -INFINITY;
+                continue;
+            }
+            const float *kv = index_comp + (uint64_t)c * head_dim;
+            double s = 0.0;
+            for (uint32_t h = 0; h < n_head; h++) {
+                const float *qh = q_token + (uint64_t)h * head_dim;
+                double d = 0.0;
+                for (uint32_t i = 0; i < head_dim; i++) {
+                    d += (double)qh[i] * (double)kv[i];
+                }
+                if (d < 0.0) d = 0.0;
+                s += d * (double)w_token[h] * (double)scale;
+            }
+            scores_row[c] = (float)s;
+        }
+    }
+}
+
 /* Later layers choose the six experts by biased top-k, but weight them using
  * the unbiased router probabilities. */
 static void layer_topk_selected_experts_from_probs(

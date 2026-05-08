@@ -250,5 +250,16 @@ void ds4_test_dsv4_compressor_store_one(const float *kv,
                                         uint32_t     ratio,
                                         uint32_t     pos,
                                         uint32_t     ape_type);
+void indexer_scores_batch_cpu(float *scores,
+                              const float *q,
+                              const float *weights,
+                              const float *index_comp,
+                              uint32_t n_comp,
+                              uint32_t n_tokens,
+                              uint32_t pos0,
+                              uint32_t n_head,
+                              uint32_t head_dim,
+                              uint32_t ratio,
+                              float scale);
 
 #endif

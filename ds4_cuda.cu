@@ -1253,9 +1253,10 @@ int ds4_cuda_test_dense_iq2_xxs_pair_matvec_tensor(
 DS4_CUDA_STUB(ds4_cuda_embed_token_hc_tensor, (ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t))
 DS4_CUDA_STUB(ds4_cuda_embed_tokens_hc_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t))
 /* ds4_cuda_indexer_score_one_tensor / _topk_tensor / dsv4_topk_mask_tensor
- * are implemented in the m5 dsv4_misc section at the bottom of this file. */
-DS4_CUDA_STUB(ds4_cuda_indexer_scores_prefill_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float))
-DS4_CUDA_STUB(ds4_cuda_indexer_scores_decode_batch_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float))
+ * are implemented in the m5a dsv4_misc section.
+ * ds4_cuda_indexer_scores_prefill_tensor and _decode_batch_tensor are
+ * implemented in the m5b dsv4_misc-tiled section, both at the bottom of
+ * this file. */
 
 DS4_CUDA_STUB(ds4_cuda_matmul_q8_0_tensor, (ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, const ds4_cuda_tensor *, uint64_t))
 DS4_CUDA_STUB(ds4_cuda_shared_gate_up_swiglu_q8_0_tensor, (ds4_cuda_tensor *, ds4_cuda_tensor *, ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, const ds4_cuda_tensor *))
@@ -1449,7 +1450,8 @@ DS4_CUDA_STUB(ds4_cuda_attention_decode_heads_tensor, (ds4_cuda_tensor *, const 
  * section at the bottom of this file. */
 DS4_CUDA_STUB(ds4_cuda_attention_decode_raw_batch_heads_tensor, (ds4_cuda_tensor *, const void *, uint64_t, uint64_t, const ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))
 DS4_CUDA_STUB(ds4_cuda_attention_decode_mixed_batch_heads_tensor, (ds4_cuda_tensor *, const void *, uint64_t, uint64_t, const ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))
-DS4_CUDA_STUB(ds4_cuda_attention_indexed_mixed_batch_heads_tensor, (ds4_cuda_tensor *, const void *, uint64_t, uint64_t, const ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))
+/* ds4_cuda_attention_indexed_mixed_batch_heads_tensor is implemented in the
+ * m5b section at the bottom of this file. */
 DS4_CUDA_STUB(ds4_cuda_attention_prefill_static_mixed_heads_tensor, (ds4_cuda_tensor *, const void *, uint64_t, uint64_t, const ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))
 DS4_CUDA_STUB(ds4_cuda_attention_prefill_masked_mixed_heads_tensor, (ds4_cuda_tensor *, const void *, uint64_t, uint64_t, const ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))
 DS4_CUDA_STUB(ds4_cuda_attention_output_q8_batch_tensor, (ds4_cuda_tensor *, ds4_cuda_tensor *, ds4_cuda_tensor *, ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint64_t, const ds4_cuda_tensor *, uint32_t))
@@ -3118,6 +3120,497 @@ int ds4_cuda_test_dsv4_compressor_store_one_tensor(
         (float *)st_kv_ptr, (float *)st_sc_ptr,
         width, ratio, pos, ape_type);
     return ds4_cuda_check(cudaGetLastError(), "launch dsv4_compressor_store_one");
+}
+
+} /* extern "C" */
+
+/* =========================================================================
+ * Phase 1 m5b — dsv4_misc tiled indexer scores (prefill + decode_batch).
+ * =========================================================================
+ *
+ * Spec: metal/dsv4_misc.metal `kernel_dsv4_indexer_scores_tiled_f32`
+ *       (prefill) and `kernel_dsv4_indexer_scores_tiled` (decode batch).
+ *
+ * Math (identical for both variants):
+ *
+ *     score[t, c] = sum_h max(dot(Q[t, h, :], K[c, :]), 0) * W[t, h] * scale
+ *
+ * Causal mask: a compressed row c is visible to token t only when
+ *
+ *     c < (pos0 + t + 1) / ratio
+ *
+ * Invisible cells store -INFINITY so downstream top-k cannot select them.
+ *
+ * --- DS4-original notes ---------------------------------------------------
+ *
+ * The Metal kernels use simdgroup MMA across an 8-token x 32-comp tile per
+ * threadgroup, looping over 64 indexer heads.  The decode variant additionally
+ * stages Q and K as half precision (f32 accumulator) to halve shared memory
+ * footprint.  This is the one intentional precision tradeoff in the indexer
+ * — the score matrix only ranks compressed rows for top-k selection, and
+ * long-context profiling shows it dominates prefill.
+ *
+ * For Phase 1 m5b we land a CORRECTNESS-FIRST CUDA port: one block per
+ * (token, comp), threads cooperate on per-head dot via shmem tree-reduce,
+ * f32 throughout (matches the prefill variant exactly; the decode variant's
+ * f16-staged Q/K is a Phase 2 perf optimisation, not a math difference).
+ * Production shapes: n_head=64, head_dim=128, ratio=4 — generalised in the
+ * kernel for portability.
+ *
+ * --- Trap #5 audit (MMA fragment layout) ---------------------------------
+ *
+ * Trap #5 from the m5b brief flags simdgroup-MMA → CUDA WMMA/MMA layout
+ * mismatches.  Avoided here: m5b correctness path does NOT use CUDA WMMA
+ * — we use the proven shmem-tree-reduce pattern from m5a's
+ * indexer_score_one (which is bit-exact when CPU oracle is double-acc).
+ * WMMA tiling is left for the perf pass.
+ * ========================================================================= */
+
+template <int block_size>
+static __global__ void ds4_cuda_indexer_scores_kernel(
+        float        *scores,
+        const float  *q,
+        const float  *weights,
+        const float  *index_comp,
+        uint32_t      n_comp,
+        uint32_t      n_tokens,
+        uint32_t      pos0,
+        uint32_t      n_head,
+        uint32_t      head_dim,
+        uint32_t      ratio,
+        float         scale) {
+    const uint32_t c = blockIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (c >= n_comp || t >= n_tokens) return;
+
+    /* Causal mask: which compressed rows are visible to token t. */
+    const uint32_t visible_raw = (pos0 + t + 1u) / ratio;
+    const uint32_t visible = visible_raw < n_comp ? visible_raw : n_comp;
+
+    if (c >= visible) {
+        if (threadIdx.x == 0) {
+            scores[(uint64_t)t * n_comp + c] = -INFINITY;
+        }
+        return;
+    }
+
+    const float *kv      = index_comp + (uint64_t)c * head_dim;
+    const float *q_token = q       + (uint64_t)t * n_head * head_dim;
+    const float *w_token = weights + (uint64_t)t * n_head;
+
+    extern __shared__ float reduce[];
+
+    float head_acc = 0.0f;
+    for (uint32_t h = 0; h < n_head; h++) {
+        const float *qh = q_token + (uint64_t)h * head_dim;
+        float partial = 0.0f;
+        for (uint32_t i = threadIdx.x; i < head_dim; i += block_size) {
+            partial += qh[i] * kv[i];
+        }
+        reduce[threadIdx.x] = partial;
+        __syncthreads();
+        for (uint32_t s = block_size / 2u; s > 0u; s >>= 1) {
+            if (threadIdx.x < s) reduce[threadIdx.x] += reduce[threadIdx.x + s];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const float dot = reduce[0];
+            const float r   = (dot < 0.0f) ? 0.0f : dot;
+            head_acc += r * w_token[h] * scale;
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        scores[(uint64_t)t * n_comp + c] = head_acc;
+    }
+}
+
+extern "C" {
+
+static int ds4_cuda_indexer_scores_dispatch(
+        ds4_cuda_tensor       *scores,
+        const ds4_cuda_tensor *q,
+        const ds4_cuda_tensor *weights,
+        const ds4_cuda_tensor *index_comp,
+        uint32_t               n_comp,
+        uint32_t               n_tokens,
+        uint32_t               pos0,
+        uint32_t               n_head,
+        uint32_t               head_dim,
+        uint32_t               ratio,
+        float                  scale,
+        const char            *label) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (n_comp == 0u || n_tokens == 0u || n_head == 0u || head_dim == 0u || ratio == 0u) return 0;
+
+    const uint64_t scores_bytes  = (uint64_t)n_comp * n_tokens * sizeof(float);
+    const uint64_t q_bytes       = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
+    const uint64_t weights_bytes = (uint64_t)n_tokens * n_head * sizeof(float);
+    const uint64_t kv_bytes      = (uint64_t)n_comp * head_dim * sizeof(float);
+
+    void *scores_ptr = NULL, *q_ptr = NULL, *weights_ptr = NULL, *kv_ptr = NULL;
+    if (!ds4_cuda_tensor_range(scores,     scores_bytes,  "indexer_scores out",     &scores_ptr))  return 0;
+    if (!ds4_cuda_tensor_range(q,          q_bytes,       "indexer_scores q",       &q_ptr))       return 0;
+    if (!ds4_cuda_tensor_range(weights,    weights_bytes, "indexer_scores weights", &weights_ptr)) return 0;
+    if (!ds4_cuda_tensor_range(index_comp, kv_bytes,      "indexer_scores kv",      &kv_ptr))      return 0;
+
+    constexpr int block_size = 128;
+    const size_t shmem_bytes = (size_t)block_size * sizeof(float);
+    dim3 grid(n_comp, n_tokens, 1u);
+    ds4_cuda_indexer_scores_kernel<block_size><<<grid, block_size, shmem_bytes, g_stream>>>(
+        (float *)scores_ptr,
+        (const float *)q_ptr,
+        (const float *)weights_ptr,
+        (const float *)kv_ptr,
+        n_comp, n_tokens, pos0,
+        n_head, head_dim, ratio, scale);
+    return ds4_cuda_check(cudaGetLastError(), label);
+}
+
+int ds4_cuda_indexer_scores_prefill_tensor(
+        ds4_cuda_tensor       *scores,
+        const ds4_cuda_tensor *q,
+        const ds4_cuda_tensor *weights,
+        const ds4_cuda_tensor *index_comp,
+        uint32_t               n_comp,
+        uint32_t               n_tokens,
+        uint32_t               n_head,
+        uint32_t               head_dim,
+        uint32_t               ratio,
+        float                  scale) {
+    /* Prefill always starts at pos0=0 (the start of context). */
+    return ds4_cuda_indexer_scores_dispatch(
+        scores, q, weights, index_comp,
+        n_comp, n_tokens, /*pos0=*/0u, n_head, head_dim, ratio, scale,
+        "launch indexer_scores prefill");
+}
+
+int ds4_cuda_indexer_scores_decode_batch_tensor(
+        ds4_cuda_tensor       *scores,
+        const ds4_cuda_tensor *q,
+        const ds4_cuda_tensor *weights,
+        const ds4_cuda_tensor *index_comp,
+        uint32_t               n_comp,
+        uint32_t               n_tokens,
+        uint32_t               pos0,
+        uint32_t               n_head,
+        uint32_t               head_dim,
+        uint32_t               ratio,
+        float                  scale) {
+    return ds4_cuda_indexer_scores_dispatch(
+        scores, q, weights, index_comp,
+        n_comp, n_tokens, pos0, n_head, head_dim, ratio, scale,
+        "launch indexer_scores decode_batch");
+}
+
+} /* extern "C" */
+
+/* =========================================================================
+ * Phase 1 m5b — attention_indexed_mixed_batch_heads (DS4 sparse attention).
+ * =========================================================================
+ *
+ * Spec: metal/dsv4_misc.metal, kernel_dsv4_indexed_mixed_attention_heads8 +
+ * _rb4 (decode specialization).  Largest single Metal kernel in the project
+ * (~600 LoC including the staged-load _rb4 variant).  DS4-original — there
+ * is no llama.cpp template for sparse compressed-attention with sinks.
+ *
+ * --- What this kernel does -----------------------------------------------
+ *
+ * For each (token, head) pair, attend over a heterogeneous KV stream:
+ *   1. RAW: the recent sliding-window rows from a ring-buffer raw_kv cache
+ *      (bounded by `window` and the `[first_raw_pos, raw_last_pos]` range).
+ *   2. COMP: a sparse subset of older compressed-pool rows selected by the
+ *      indexer's top-k (with `idx >= visible` truncation, where
+ *      visible = (qpos+1)/ratio).
+ * Sinks are merged into the softmax denominator only (no value contribution).
+ *
+ * head_dim is hardcoded to 512 to match the Metal contract; n_head is up to
+ * the caller (DS4 production uses n_head=64 for attention).
+ *
+ * --- DS4-vs-vanilla divergence -------------------------------------------
+ *
+ *   * MLA: K and V are the same 512-dim latent vector per cache slot.  The
+ *     kernel reads each cache row once and uses it for both score and value.
+ *   * Sinks: a learned per-head bias that mixes into max + denom but
+ *     contributes no value (vanilla cross-attention has no sinks).  Same
+ *     shape as the m4 flash_attn kernel.
+ *   * Sparse compressed indexing: top-k indices are pre-sorted ascending
+ *     by row id (m5a indexer_topk's contract); the kernel iterates
+ *     top-k in given order.  Indices `< 0` are skipped; indices `>= visible`
+ *     terminate the scan (causal masking on compressed-pool age).
+ *   * Heterogeneous KV layout: raw rows come from a ring buffer
+ *     `raw_kv[(raw_start + logical) % raw_cap]`; compressed rows are at
+ *     `comp_kv[topk[i]]`.  The kernel cleanly separates the two sources;
+ *     softmax sees them as one concatenated stream.
+ *
+ * --- Algorithm strategy --------------------------------------------------
+ *
+ * Mirrors the m4 flash_attn pattern (correctness-first, two-pass softmax;
+ * tree-reduce per-row dot product).  Production-perf online-softmax + MMA
+ * pipelining is deferred to Phase 2 — same precedent as m4 / Metal's _rb4
+ * staged-load (which is a perf optimization, not a math change).
+ *
+ * --- Trap-list audit -----------------------------------------------------
+ *
+ *   * Trap #1 (--use_fast_math intrinsics): expf inside softmax could be
+ *     substituted with __expf at large arguments.  The DS4 sinks-aware
+ *     flash_attn (m4) kept libm `expf` and stayed within tolerance; the
+ *     same approach here.  Score magnitudes are bounded by `max_score` via
+ *     the `expf(score - max)` shift, keeping the argument in a stable range
+ *     where __expf is also accurate within ~3 ULP.
+ *   * Trap #2 (serial-multiply accumulator): N/A.  No position-derived
+ *     `pow` or repeated multiplies.
+ *   * Trap #3 (libm-vs-libdevice argument-reduction): N/A.  No trig.
+ *   * Trap #4 (CPU oracle precision): the test re-uses
+ *     `attention_rows_raw_cpu` (already exposed in m4); that helper does
+ *     score accumulation in f32 (no double accumulator), and m4's
+ *     flash_attn fixture used input transformation to keep magnitudes
+ *     bounded.  We apply the same input transform here.
+ *   * Trap #5 (MMA fragment layout): N/A for THIS kernel.  The Metal
+ *     indexed-mixed kernels use `simd_sum` lane-distributed fragments,
+ *     not simdgroup MMA.  Trap #5 applies to the indexer_scores_tiled_f32
+ *     kernel (pty-5's m5b task), not this one.
+ * ========================================================================= */
+
+template <int block_size>
+static __global__ void ds4_cuda_attention_indexed_mixed_kernel(
+        float       *heads,
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        const int32_t *topk,
+        const float *sinks,
+        uint32_t     n_tokens,
+        uint32_t     pos0,
+        uint32_t     n_raw,
+        uint32_t     raw_cap,
+        uint32_t     raw_start,
+        uint32_t     n_comp,
+        uint32_t     top_k,
+        uint32_t     window,
+        uint32_t     ratio,
+        uint32_t     n_head,
+        uint32_t     head_dim,
+        uint32_t     max_n_kv) {
+    const uint32_t tok = blockIdx.x;
+    const uint32_t h   = blockIdx.y;
+    if (tok >= n_tokens || h >= n_head) return;
+
+    /* Determine the visible raw window for this token, mirroring the Metal
+     * range computation exactly.  The ring buffer stores the last `n_raw`
+     * positions starting at `first_raw_pos`; `window_first` clamps the
+     * back-end of the visible range to a sliding window. */
+    const uint32_t qpos = pos0 + tok;
+    const uint32_t last_pos = pos0 + n_tokens - 1u;
+    const uint32_t first_raw_pos = last_pos + 1u - n_raw;
+    const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+    const uint32_t window_first = (window != 0u && qpos + 1u > window)
+                                ? (qpos + 1u - window) : 0u;
+    const uint32_t first = (first_raw_pos > window_first) ? first_raw_pos : window_first;
+    const uint32_t last  = (qpos < raw_last_pos) ? qpos : raw_last_pos;
+    const uint32_t n_raw_visible = (first <= last) ? (last - first + 1u) : 0u;
+    const uint32_t visible_comp_max = ((qpos + 1u) / ratio < n_comp) ? ((qpos + 1u) / ratio) : n_comp;
+
+    /* Shared memory layout (allocated by caller via shmem_bytes):
+     *   shmem[0 .. max_n_kv)             — score / weight cache (one float
+     *                                       per visible KV row, reused as
+     *                                       weights in phase 3)
+     *   shmem[max_n_kv .. +block_size)   — block-reduce scratch
+     */
+    extern __shared__ float shmem[];
+    float *score_shmem  = shmem;
+    float *reduce_shmem = shmem + max_n_kv;
+
+    const uint32_t tid = threadIdx.x;
+    const float kq_scale = rsqrtf((float)head_dim);
+    const float *qh = q + ((uint64_t)tok * n_head + h) * head_dim;
+    const int32_t *row_topk = topk + (uint64_t)tok * top_k;
+
+    /* Phase 1a: raw window scores.  Iterate raw rows in pos-order; that
+     * matches the CPU oracle (which iterates [0..n_raw)) when the test
+     * provides the raw_kv buffer pre-arranged in ring-order. */
+    uint32_t out_idx = 0;
+    for (uint32_t pos = first; pos <= last; pos++) {
+        const uint32_t logical = pos - first_raw_pos;
+        const uint32_t row     = (raw_start + logical) % raw_cap;
+        const float *kvr = raw_kv + (uint64_t)row * head_dim;
+        float partial = 0.0f;
+        for (uint32_t i = tid; i < head_dim; i += block_size) {
+            partial += qh[i] * kvr[i];
+        }
+        reduce_shmem[tid] = partial;
+        __syncthreads();
+        for (uint32_t s = block_size / 2u; s > 0u; s >>= 1) {
+            if (tid < s) reduce_shmem[tid] += reduce_shmem[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) score_shmem[out_idx] = reduce_shmem[0] * kq_scale;
+        __syncthreads();
+        out_idx++;
+    }
+    const uint32_t n_raw_out = out_idx;
+
+    /* Phase 1b: compressed-pool scores via top-k indices.  Mirrors Metal
+     * exactly: skip idx < 0; break on first idx >= visible_comp_max.
+     * `out_idx` is shared with Phase 1a (concatenated stream). */
+    for (uint32_t i = 0; i < top_k; i++) {
+        const int32_t idx = row_topk[i];
+        if (idx < 0) continue;
+        if ((uint32_t)idx >= visible_comp_max) break;
+        const float *kvr = comp_kv + (uint64_t)(uint32_t)idx * head_dim;
+        float partial = 0.0f;
+        for (uint32_t i2 = tid; i2 < head_dim; i2 += block_size) {
+            partial += qh[i2] * kvr[i2];
+        }
+        reduce_shmem[tid] = partial;
+        __syncthreads();
+        for (uint32_t s = block_size / 2u; s > 0u; s >>= 1) {
+            if (tid < s) reduce_shmem[tid] += reduce_shmem[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) score_shmem[out_idx] = reduce_shmem[0] * kq_scale;
+        __syncthreads();
+        out_idx++;
+    }
+    const uint32_t n_kv = out_idx;
+
+    /* Phase 2: max(sinks[h], all scores).  Serial by tid==0 since the
+     * compare is over n_kv (≤ n_raw + top_k, small).  Broadcast via shmem.
+     * Same shape as m4 flash_attn. */
+    __shared__ float smax;
+    if (tid == 0) {
+        float m = sinks[h];
+        for (uint32_t r = 0; r < n_kv; r++) {
+            const float s = score_shmem[r];
+            if (s > m) m = s;
+        }
+        smax = m;
+    }
+    __syncthreads();
+    const float max_score = smax;
+
+    /* Phase 2.5: convert scores → weights in-place; accumulate denom.
+     * sinks contributes one extra exp(sinks - max) added to denom only
+     * (no kv row to weight). */
+    float my_denom = 0.0f;
+    for (uint32_t r = tid; r < n_kv; r += block_size) {
+        const float w = expf(score_shmem[r] - max_score);
+        score_shmem[r] = w;
+        my_denom += w;
+    }
+    reduce_shmem[tid] = my_denom;
+    __syncthreads();
+    for (uint32_t s = block_size / 2u; s > 0u; s >>= 1) {
+        if (tid < s) reduce_shmem[tid] += reduce_shmem[tid + s];
+        __syncthreads();
+    }
+    const float denom = reduce_shmem[0] + expf(sinks[h] - max_score);
+    const float inv_denom = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+    (void)n_raw_visible;
+    (void)n_raw_out;
+
+    /* Phase 3: weighted-sum output.  Threads stride across head_dim; for
+     * each output dim each thread loops over visible KV rows accumulating
+     * weight * kv[r, dim].  The first n_raw_out rows are RAW (ring-indexed);
+     * the remainder are COMP (top-k indexed). */
+    float *oh = heads + ((uint64_t)tok * n_head + h) * head_dim;
+    for (uint32_t i = tid; i < head_dim; i += block_size) {
+        float acc = 0.0f;
+        /* Walk RAW rows in pos-order. */
+        uint32_t raw_pos = first;
+        for (uint32_t r = 0; r < n_raw_out; r++) {
+            const uint32_t logical = raw_pos - first_raw_pos;
+            const uint32_t row     = (raw_start + logical) % raw_cap;
+            acc += score_shmem[r] * raw_kv[(uint64_t)row * head_dim + i];
+            raw_pos++;
+        }
+        /* Walk COMP rows in top-k order, mirroring Phase 1b's stream. */
+        uint32_t out_r = n_raw_out;
+        for (uint32_t k = 0; k < top_k && out_r < n_kv; k++) {
+            const int32_t idx = row_topk[k];
+            if (idx < 0) continue;
+            if ((uint32_t)idx >= visible_comp_max) break;
+            acc += score_shmem[out_r] * comp_kv[(uint64_t)(uint32_t)idx * head_dim + i];
+            out_r++;
+        }
+        oh[i] = acc * inv_denom;
+    }
+}
+
+extern "C" {
+
+int ds4_cuda_attention_indexed_mixed_batch_heads_tensor(
+        ds4_cuda_tensor       *heads,
+        const void            *model_map,
+        uint64_t               model_size,
+        uint64_t               sinks_offset,
+        const ds4_cuda_tensor *q,
+        const ds4_cuda_tensor *raw_kv,
+        const ds4_cuda_tensor *comp_kv,
+        const ds4_cuda_tensor *topk,
+        uint32_t               n_tokens,
+        uint32_t               pos0,
+        uint32_t               n_raw,
+        uint32_t               raw_cap,
+        uint32_t               raw_start,
+        uint32_t               n_comp,
+        uint32_t               top_k,
+        uint32_t               window,
+        uint32_t               ratio,
+        uint32_t               n_head,
+        uint32_t               head_dim) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (!model_map || n_tokens == 0u || n_raw == 0u ||
+        raw_cap < n_raw || raw_start >= raw_cap ||
+        n_comp == 0u || top_k == 0u || top_k > n_comp ||
+        ratio == 0u || n_head == 0u || head_dim != 512u) {
+        return 0;
+    }
+
+    if (sinks_offset > model_size ||
+        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
+        fprintf(stderr,
+                "ds4: CUDA indexed_mixed_attention sinks range outside mapped model\n");
+        return 0;
+    }
+
+    const uint64_t row_bytes  = (uint64_t)head_dim * sizeof(float);
+    const uint64_t q_bytes    = (uint64_t)n_tokens * n_head * row_bytes;
+    const uint64_t raw_bytes  = (uint64_t)raw_cap * row_bytes;
+    const uint64_t comp_bytes = (uint64_t)n_comp * row_bytes;
+    const uint64_t topk_bytes = (uint64_t)top_k * n_tokens * sizeof(int32_t);
+
+    void *q_ptr = NULL, *raw_ptr = NULL, *comp_ptr = NULL, *topk_ptr = NULL, *heads_ptr = NULL;
+    if (!ds4_cuda_tensor_range(q,       q_bytes,    "indexed_mixed q",       &q_ptr))     return 0;
+    if (!ds4_cuda_tensor_range(raw_kv,  raw_bytes,  "indexed_mixed raw_kv",  &raw_ptr))   return 0;
+    if (!ds4_cuda_tensor_range(comp_kv, comp_bytes, "indexed_mixed comp_kv", &comp_ptr))  return 0;
+    if (!ds4_cuda_tensor_range(topk,    topk_bytes, "indexed_mixed topk",    &topk_ptr))  return 0;
+    if (!ds4_cuda_tensor_range(heads,   q_bytes,    "indexed_mixed heads",   &heads_ptr)) return 0;
+
+    const float *sinks_ptr = (const float *)((const uint8_t *)model_map + sinks_offset);
+
+    /* Worst-case n_kv per (token, head): all raw_visible + all top_k.
+     * Compute the harness shmem allocation accordingly.  Production
+     * call-sites obey n_raw + top_k ≤ a few hundred. */
+    const uint32_t max_n_kv = n_raw + top_k;
+    constexpr int block_size = 128;
+    const uint32_t shmem_floats = max_n_kv + (uint32_t)block_size;
+    const size_t shmem_bytes = (size_t)shmem_floats * sizeof(float);
+
+    dim3 grid(n_tokens, n_head, 1u);
+    dim3 block((uint32_t)block_size, 1u, 1u);
+    ds4_cuda_attention_indexed_mixed_kernel<block_size>
+        <<<grid, block, shmem_bytes, g_stream>>>(
+            (float *)heads_ptr, (const float *)q_ptr,
+            (const float *)raw_ptr, (const float *)comp_ptr,
+            (const int32_t *)topk_ptr, sinks_ptr,
+            n_tokens, pos0, n_raw, raw_cap, raw_start,
+            n_comp, top_k, window, ratio, n_head, head_dim,
+            max_n_kv);
+    return ds4_cuda_check(cudaGetLastError(), "launch indexed_mixed_attention");
 }
 
 } /* extern "C" */

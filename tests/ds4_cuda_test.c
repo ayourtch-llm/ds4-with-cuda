@@ -2193,6 +2193,360 @@ DS4_CUDA_PARITY_TEST(dsv4_compressor_store_one_r1_f16,
     .cfg = (void *)&dsv4_store_one_r1_f16_cfg);
 
 /* ---------------------------------------------------------------------------
+ * Phase 1 m5b — dsv4_misc tiled indexer scores.
+ *
+ * Two public APIs (prefill and decode_batch) sharing one underlying CUDA
+ * kernel (the math is identical; the Metal variants differ only in
+ * intermediate precision / shmem footprint, a Phase 2 perf concern).
+ * Causal mask: c < (pos0 + t + 1) / ratio.  Invisible cells -> -INFINITY.
+ * --------------------------------------------------------------------------- */
+
+extern int ds4_cuda_indexer_scores_prefill_tensor(
+        ds4_cuda_tensor *scores, const ds4_cuda_tensor *q,
+        const ds4_cuda_tensor *weights, const ds4_cuda_tensor *index_comp,
+        uint32_t n_comp, uint32_t n_tokens,
+        uint32_t n_head, uint32_t head_dim,
+        uint32_t ratio, float scale);
+extern int ds4_cuda_indexer_scores_decode_batch_tensor(
+        ds4_cuda_tensor *scores, const ds4_cuda_tensor *q,
+        const ds4_cuda_tensor *weights, const ds4_cuda_tensor *index_comp,
+        uint32_t n_comp, uint32_t n_tokens, uint32_t pos0,
+        uint32_t n_head, uint32_t head_dim,
+        uint32_t ratio, float scale);
+
+struct indexer_scores_cfg {
+    uint32_t n_comp;
+    uint32_t n_tokens;
+    uint32_t pos0;
+    uint32_t n_head;
+    uint32_t head_dim;
+    uint32_t ratio;
+    float    scale;
+};
+
+/* Layout of the synthetic input slab:
+ *   [ q (n_tokens * n_head * head_dim) | weights (n_tokens * n_head)
+ *     | kv (n_comp * head_dim) ] */
+static int indexer_scores_cpu_thunk(const float *in, float *out, void *cfg) {
+    const struct indexer_scores_cfg *c = cfg;
+    const size_t q_n  = (size_t)c->n_tokens * c->n_head * c->head_dim;
+    const size_t w_n  = (size_t)c->n_tokens * c->n_head;
+    const float *q       = in;
+    const float *weights = in + q_n;
+    const float *kv      = in + q_n + w_n;
+    indexer_scores_batch_cpu(out, q, weights, kv,
+                             c->n_comp, c->n_tokens, c->pos0,
+                             c->n_head, c->head_dim, c->ratio, c->scale);
+    return 1;
+}
+
+static int indexer_scores_prefill_cuda_thunk(const float *in, ds4_cuda_tensor *out_dev,
+                                             size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct indexer_scores_cfg *c = cfg;
+    const size_t q_n  = (size_t)c->n_tokens * c->n_head * c->head_dim;
+    const size_t w_n  = (size_t)c->n_tokens * c->n_head;
+    const size_t kv_n = (size_t)c->n_comp * c->head_dim;
+
+    ds4_cuda_tensor *q_dev  = ds4_cuda_tensor_alloc((uint64_t)q_n  * sizeof(float));
+    ds4_cuda_tensor *w_dev  = ds4_cuda_tensor_alloc((uint64_t)w_n  * sizeof(float));
+    ds4_cuda_tensor *kv_dev = ds4_cuda_tensor_alloc((uint64_t)kv_n * sizeof(float));
+    if (!q_dev || !w_dev || !kv_dev) {
+        ds4_cuda_tensor_free(q_dev); ds4_cuda_tensor_free(w_dev); ds4_cuda_tensor_free(kv_dev);
+        return 0;
+    }
+    int ok = ds4_cuda_tensor_write(q_dev,  0, in,             (uint64_t)q_n  * sizeof(float))
+          && ds4_cuda_tensor_write(w_dev,  0, in + q_n,       (uint64_t)w_n  * sizeof(float))
+          && ds4_cuda_tensor_write(kv_dev, 0, in + q_n + w_n, (uint64_t)kv_n * sizeof(float));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_indexer_scores_prefill_tensor(out_dev, q_dev, w_dev, kv_dev,
+                                                        c->n_comp, c->n_tokens,
+                                                        c->n_head, c->head_dim,
+                                                        c->ratio, c->scale);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(q_dev);
+    ds4_cuda_tensor_free(w_dev);
+    ds4_cuda_tensor_free(kv_dev);
+    return ok;
+}
+
+static int indexer_scores_decode_batch_cuda_thunk(const float *in, ds4_cuda_tensor *out_dev,
+                                                  size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct indexer_scores_cfg *c = cfg;
+    const size_t q_n  = (size_t)c->n_tokens * c->n_head * c->head_dim;
+    const size_t w_n  = (size_t)c->n_tokens * c->n_head;
+    const size_t kv_n = (size_t)c->n_comp * c->head_dim;
+
+    ds4_cuda_tensor *q_dev  = ds4_cuda_tensor_alloc((uint64_t)q_n  * sizeof(float));
+    ds4_cuda_tensor *w_dev  = ds4_cuda_tensor_alloc((uint64_t)w_n  * sizeof(float));
+    ds4_cuda_tensor *kv_dev = ds4_cuda_tensor_alloc((uint64_t)kv_n * sizeof(float));
+    if (!q_dev || !w_dev || !kv_dev) {
+        ds4_cuda_tensor_free(q_dev); ds4_cuda_tensor_free(w_dev); ds4_cuda_tensor_free(kv_dev);
+        return 0;
+    }
+    int ok = ds4_cuda_tensor_write(q_dev,  0, in,             (uint64_t)q_n  * sizeof(float))
+          && ds4_cuda_tensor_write(w_dev,  0, in + q_n,       (uint64_t)w_n  * sizeof(float))
+          && ds4_cuda_tensor_write(kv_dev, 0, in + q_n + w_n, (uint64_t)kv_n * sizeof(float));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_indexer_scores_decode_batch_tensor(out_dev, q_dev, w_dev, kv_dev,
+                                                             c->n_comp, c->n_tokens, c->pos0,
+                                                             c->n_head, c->head_dim,
+                                                             c->ratio, c->scale);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(q_dev);
+    ds4_cuda_tensor_free(w_dev);
+    ds4_cuda_tensor_free(kv_dev);
+    return ok;
+}
+
+/* Prefill fixture: pos0=0, n_tokens=8, ratio=4, n_head=8, head_dim=32,
+ * n_comp=8.  Visible compressed rows per token t: (0+t+1)/4 — so token 0
+ * sees 0 rows (all -inf), token 3 sees 1 row, token 7 sees 2 rows.  This
+ * exercises both the masking path and the full scoring path. */
+static const struct indexer_scores_cfg indexer_scores_prefill_cfg = {
+    .n_comp = 8, .n_tokens = 8, .pos0 = 0,
+    .n_head = 8, .head_dim = 32, .ratio = 4,
+    .scale = 1.0f / 16.0f,   /* sqrt(32 * 8) = 16 */
+};
+
+/* Tolerance 32: same family as m5a indexer_score_one (16) and sum_rows
+ * (8) — CPU oracle uses double accumulators (Trap #4), CUDA does f32
+ * tree-reduce per-head dot + f32 cross-head accumulator.  At cascaded
+ * scale (more tokens × heads), worst-case f32 reduction error at near-
+ * cancellation rows compounds to ~7 ULP (prefill) / ~19 ULP (decode_batch
+ * fixture, which happens to land at smaller output magnitudes for this
+ * seed).  32 leaves headroom; brief cap is 64. */
+DS4_CUDA_PARITY_TEST(indexer_scores_prefill,
+    .seed = 0x15CF11,
+    /* q + weights + kv = 8*8*32 + 8*8 + 8*32 = 2048 + 64 + 256 = 2368 */
+    .in_elems = 2368,
+    .out_elems = 64,    /* n_tokens * n_comp */
+    .ulp_tolerance = 32,
+    .cpu_fn = indexer_scores_cpu_thunk,
+    .cuda_fn = indexer_scores_prefill_cuda_thunk,
+    .cfg = (void *)&indexer_scores_prefill_cfg);
+
+/* Decode-batch fixture: same shape but with pos0=4096 (mid-context decode).
+ * At pos0=4096, ratio=4, every token sees the full n_comp=8 rows because
+ * (4096 + t + 1)/4 > 8 for all t — so the scoring path is exercised but
+ * the mask path is not.  This is intentional: pos0 only changes which
+ * cells are masked; the kernel math is identical to prefill. */
+static const struct indexer_scores_cfg indexer_scores_decode_batch_cfg = {
+    .n_comp = 8, .n_tokens = 8, .pos0 = 4096,
+    .n_head = 8, .head_dim = 32, .ratio = 4,
+    .scale = 1.0f / 16.0f,
+};
+
+DS4_CUDA_PARITY_TEST(indexer_scores_decode_batch,
+    .seed = 0x15CDB,
+    .in_elems = 2368,
+    .out_elems = 64,
+    .ulp_tolerance = 32,
+    .cpu_fn = indexer_scores_cpu_thunk,
+    .cuda_fn = indexer_scores_decode_batch_cuda_thunk,
+    .cfg = (void *)&indexer_scores_decode_batch_cfg);
+
+/* ---------------------------------------------------------------------------
+ * Phase 1 m5b — attention_indexed_mixed_batch_heads.  Sparse compressed-
+ * attention with sinks: each token attends to a recent raw window plus a
+ * top-k subset of older compressed-pool rows.  CPU oracle reuses
+ * attention_rows_raw_cpu (already public) by assembling the visible KV
+ * rows in iteration order [raw_in_pos_order | comp_in_topk_order].
+ * --------------------------------------------------------------------------- */
+
+struct indexed_mixed_attn_cfg {
+    uint32_t n_tokens;
+    uint32_t n_head;
+    uint32_t head_dim;     /* must be 512 */
+    uint32_t n_raw;
+    uint32_t raw_cap;
+    uint32_t raw_start;
+    uint32_t n_comp;
+    uint32_t top_k;        /* power of 2 */
+    uint32_t window;
+    uint32_t ratio;
+    uint32_t pos0;
+    const int32_t *topk;   /* length top_k * n_tokens, ascending per token */
+};
+
+/* Synthetic input slab layout (in [0..in_elems) range from harness):
+ *   q       : n_tokens * n_head * head_dim
+ *   raw_kv  : raw_cap * head_dim          (full ring; only visible rows are
+ *                                          attended to)
+ *   comp_kv : n_comp  * head_dim
+ *   sinks   : n_head
+ * Both thunks transform inputs identically (same as m4 flash_attn):
+ *   q *= 8           (peakier softmax, scores away from zero)
+ *   kv = abs(.)+0.5  (output magnitudes bounded away from zero)
+ *   sinks unmodified */
+static void indexed_mixed_attn_prep(const float *in_raw,
+                                    const struct indexed_mixed_attn_cfg *c,
+                                    float *q_buf, float *raw_kv_buf,
+                                    float *comp_kv_buf, float *sinks_buf) {
+    const size_t q_n     = (size_t)c->n_tokens * c->n_head * c->head_dim;
+    const size_t raw_n   = (size_t)c->raw_cap * c->head_dim;
+    const size_t comp_n  = (size_t)c->n_comp  * c->head_dim;
+    const float *src = in_raw;
+    for (size_t i = 0; i < q_n; i++)    q_buf[i]       = src[i] * 8.0f;
+    src += q_n;
+    for (size_t i = 0; i < raw_n; i++)  raw_kv_buf[i]  = fabsf(src[i]) + 0.5f;
+    src += raw_n;
+    for (size_t i = 0; i < comp_n; i++) comp_kv_buf[i] = fabsf(src[i]) + 0.5f;
+    src += comp_n;
+    for (uint32_t i = 0; i < c->n_head; i++) sinks_buf[i] = src[i];
+}
+
+static int indexed_mixed_attn_cpu(const float *in, float *out, void *cfg) {
+    const struct indexed_mixed_attn_cfg *c = cfg;
+    const size_t q_n     = (size_t)c->n_tokens * c->n_head * c->head_dim;
+    const size_t raw_n   = (size_t)c->raw_cap * c->head_dim;
+    const size_t comp_n  = (size_t)c->n_comp  * c->head_dim;
+
+    float *q       = (float *)malloc(q_n     * sizeof(float));
+    float *raw_kv  = (float *)malloc(raw_n   * sizeof(float));
+    float *comp_kv = (float *)malloc(comp_n  * sizeof(float));
+    float *sinks   = (float *)malloc((size_t)c->n_head * sizeof(float));
+    /* Worst-case visible KV count: all raw_visible + all top_k. */
+    float *visible_kv = (float *)malloc(((size_t)c->n_raw + c->top_k) * c->head_dim * sizeof(float));
+    if (!q || !raw_kv || !comp_kv || !sinks || !visible_kv) {
+        free(q); free(raw_kv); free(comp_kv); free(sinks); free(visible_kv); return 0;
+    }
+    indexed_mixed_attn_prep(in, c, q, raw_kv, comp_kv, sinks);
+
+    for (uint32_t t = 0; t < c->n_tokens; t++) {
+        const uint32_t qpos = c->pos0 + t;
+        const uint32_t last_pos = c->pos0 + c->n_tokens - 1u;
+        const uint32_t first_raw_pos = last_pos + 1u - c->n_raw;
+        const uint32_t raw_last_pos  = first_raw_pos + c->n_raw - 1u;
+        const uint32_t window_first  = (c->window != 0u && qpos + 1u > c->window)
+                                     ? (qpos + 1u - c->window) : 0u;
+        const uint32_t first = (first_raw_pos > window_first) ? first_raw_pos : window_first;
+        const uint32_t last  = (qpos < raw_last_pos) ? qpos : raw_last_pos;
+        const uint32_t n_raw_visible = (first <= last) ? (last - first + 1u) : 0u;
+        const uint32_t visible_comp_max = ((qpos + 1u) / c->ratio < c->n_comp)
+                                        ? ((qpos + 1u) / c->ratio) : c->n_comp;
+
+        /* Assemble visible KV rows in the same iteration order the CUDA
+         * kernel uses: raw rows in pos-order, then comp rows in top-k
+         * order (assumed ascending). */
+        size_t kv_count = 0;
+        for (uint32_t pos = first; pos <= last; pos++) {
+            const uint32_t logical = pos - first_raw_pos;
+            const uint32_t row     = (c->raw_start + logical) % c->raw_cap;
+            memcpy(visible_kv + kv_count * c->head_dim,
+                   raw_kv + (size_t)row * c->head_dim,
+                   (size_t)c->head_dim * sizeof(float));
+            kv_count++;
+        }
+        const int32_t *row_topk = c->topk + (size_t)t * c->top_k;
+        for (uint32_t i = 0; i < c->top_k; i++) {
+            const int32_t idx = row_topk[i];
+            if (idx < 0) continue;
+            if ((uint32_t)idx >= visible_comp_max) break;
+            memcpy(visible_kv + kv_count * c->head_dim,
+                   comp_kv + (size_t)(uint32_t)idx * c->head_dim,
+                   (size_t)c->head_dim * sizeof(float));
+            kv_count++;
+        }
+        (void)n_raw_visible;
+
+        attention_rows_raw_cpu(out + (size_t)t * c->n_head * c->head_dim,
+                               q + (size_t)t * c->n_head * c->head_dim,
+                               visible_kv, (uint32_t)kv_count,
+                               sinks, c->n_head, c->head_dim);
+    }
+    free(q); free(raw_kv); free(comp_kv); free(sinks); free(visible_kv);
+    return 1;
+}
+
+static int indexed_mixed_attn_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                   size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct indexed_mixed_attn_cfg *c = cfg;
+    const size_t q_n     = (size_t)c->n_tokens * c->n_head * c->head_dim;
+    const size_t raw_n   = (size_t)c->raw_cap * c->head_dim;
+    const size_t comp_n  = (size_t)c->n_comp  * c->head_dim;
+    const size_t topk_n  = (size_t)c->top_k * c->n_tokens;
+
+    float *q_host       = (float *)malloc(q_n     * sizeof(float));
+    float *raw_kv_host  = (float *)malloc(raw_n   * sizeof(float));
+    float *comp_kv_host = (float *)malloc(comp_n  * sizeof(float));
+    float *sinks_host   = (float *)malloc((size_t)c->n_head * sizeof(float));
+    if (!q_host || !raw_kv_host || !comp_kv_host || !sinks_host) {
+        free(q_host); free(raw_kv_host); free(comp_kv_host); free(sinks_host); return 0;
+    }
+    indexed_mixed_attn_prep(in, c, q_host, raw_kv_host, comp_kv_host, sinks_host);
+
+    ds4_cuda_tensor *q_dev      = ds4_cuda_tensor_alloc((uint64_t)q_n     * sizeof(float));
+    ds4_cuda_tensor *raw_dev    = ds4_cuda_tensor_alloc((uint64_t)raw_n   * sizeof(float));
+    ds4_cuda_tensor *comp_dev   = ds4_cuda_tensor_alloc((uint64_t)comp_n  * sizeof(float));
+    ds4_cuda_tensor *topk_dev   = ds4_cuda_tensor_alloc((uint64_t)topk_n  * sizeof(int32_t));
+    ds4_cuda_tensor *sinks_dev  = ds4_cuda_tensor_alloc((uint64_t)c->n_head * sizeof(float));
+    if (!q_dev || !raw_dev || !comp_dev || !topk_dev || !sinks_dev) {
+        ds4_cuda_tensor_free(q_dev);   ds4_cuda_tensor_free(raw_dev);
+        ds4_cuda_tensor_free(comp_dev); ds4_cuda_tensor_free(topk_dev);
+        ds4_cuda_tensor_free(sinks_dev);
+        free(q_host); free(raw_kv_host); free(comp_kv_host); free(sinks_host);
+        return 0;
+    }
+
+    int ok = ds4_cuda_tensor_write(q_dev,     0, q_host,       (uint64_t)q_n     * sizeof(float))
+          && ds4_cuda_tensor_write(raw_dev,   0, raw_kv_host,  (uint64_t)raw_n   * sizeof(float))
+          && ds4_cuda_tensor_write(comp_dev,  0, comp_kv_host, (uint64_t)comp_n  * sizeof(float))
+          && ds4_cuda_tensor_write(topk_dev,  0, c->topk,      (uint64_t)topk_n  * sizeof(int32_t))
+          && ds4_cuda_tensor_write(sinks_dev, 0, sinks_host,   (uint64_t)c->n_head * sizeof(float));
+
+    /* Use sinks_dev's contents as a fake model_map (matches m4 flash_attn). */
+    const void *fake_model_map = ds4_cuda_tensor_contents(sinks_dev);
+    const uint64_t fake_model_size = (uint64_t)c->n_head * sizeof(float);
+
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_attention_indexed_mixed_batch_heads_tensor(
+                    out_dev, fake_model_map, fake_model_size, /*sinks_offset=*/0,
+                    q_dev, raw_dev, comp_dev, topk_dev,
+                    c->n_tokens, c->pos0, c->n_raw, c->raw_cap, c->raw_start,
+                    c->n_comp, c->top_k, c->window, c->ratio,
+                    c->n_head, c->head_dim);
+    if (ok) ok = ds4_cuda_end_commands();
+
+    ds4_cuda_tensor_free(q_dev);   ds4_cuda_tensor_free(raw_dev);
+    ds4_cuda_tensor_free(comp_dev); ds4_cuda_tensor_free(topk_dev);
+    ds4_cuda_tensor_free(sinks_dev);
+    free(q_host); free(raw_kv_host); free(comp_kv_host); free(sinks_host);
+    return ok;
+}
+
+/* Hand-picked top-k for one token: indices ascending, all in [0, visible_comp).
+ * pos0=64, ratio=4, so visible_comp = (64+1)/4 = 16; n_comp=16 → all rows
+ * visible.  Indices spread non-contiguously to exercise gather (no shortcut
+ * for "first n consecutive rows"). */
+static const int32_t indexed_mixed_attn_topk[4] = { 2, 5, 8, 13 };
+
+static const struct indexed_mixed_attn_cfg indexed_mixed_attn_cfg_v = {
+    .n_tokens = 1, .n_head = 2, .head_dim = 512,
+    .n_raw = 4, .raw_cap = 8, .raw_start = 5,    /* ring offset: rows wrap */
+    .n_comp = 16, .top_k = 4,
+    .window = 4, .ratio = 4, .pos0 = 64,
+    .topk = indexed_mixed_attn_topk,
+};
+
+/* Tolerance 32 (m4 flash_attn baseline).  Reduction depth here is similar to
+ * m4 but with head_dim=512 (4× wider tree-reduce) and n_kv up to 8 rows.
+ * Worst observed should land in the 30-50 ULP range; bump to 64 only with
+ * documented cause. */
+DS4_CUDA_PARITY_TEST(indexed_mixed_attn,
+    .seed = 0xA771,
+    /* q(1*2*512=1024) + raw_kv(8*512=4096) + comp_kv(16*512=8192) + sinks(2) = 13314 */
+    .in_elems = 13314,
+    /* heads = n_tokens * n_head * head_dim = 1024 */
+    .out_elems = 1024,
+    .ulp_tolerance = 32,
+    .cpu_fn = indexed_mixed_attn_cpu,
+    .cuda_fn = indexed_mixed_attn_cuda,
+    .cfg = (void *)&indexed_mixed_attn_cfg_v);
+
+/* ---------------------------------------------------------------------------
  * Registry — order does not matter; failures are counted globally.
  * --------------------------------------------------------------------------- */
 
@@ -2231,6 +2585,9 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_dsv4_ratio4_shift,
     &ds4_cuda_parity_dsv4_compressor_store_one_r4_f32,
     &ds4_cuda_parity_dsv4_compressor_store_one_r1_f16,
+    &ds4_cuda_parity_indexer_scores_prefill,
+    &ds4_cuda_parity_indexer_scores_decode_batch,
+    &ds4_cuda_parity_indexed_mixed_attn,
     NULL,
 };
 
