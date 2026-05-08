@@ -114,6 +114,11 @@ typedef struct {
 
 typedef struct {
     uint16_t d;
+    int8_t  qs[32];
+} test_block_q8_0;
+
+typedef struct {
+    uint16_t d;
     uint16_t qs[32];
 } test_block_iq2_xxs;
 
@@ -832,6 +837,19 @@ static void dense_fill_f16(struct dense_cfg *c) {
     c->initialized = 1;
 }
 
+static void dense_fill_f32(struct dense_cfg *c) {
+    if (c->initialized) return;
+    c->weight0_bytes = (size_t)c->in_dim * c->out_dim * sizeof(float);
+    c->weights0 = calloc(1, c->weight0_bytes);
+    if (!c->weights0) return;
+    uint64_t s = 0xD3F320ULL;
+    float *w = (float *)c->weights0;
+    for (size_t i = 0; i < (size_t)c->in_dim * c->out_dim; i++) {
+        w[i] = 0.125f + (float)(test_rng_u32(&s) & 1023u) * (1.0f / 4096.0f);
+    }
+    c->initialized = 1;
+}
+
 static void dense_fill_q2_k(struct dense_cfg *c) {
     if (c->initialized) return;
     const size_t blocks = c->in_dim / 256u;
@@ -849,6 +867,43 @@ static void dense_fill_q2_k(struct dense_cfg *c) {
         for (uint32_t i = 0; i < 64; i++) w[b].qs[i] = (uint8_t)test_rng_u32(&s);
         w[b].d = test_f32_to_f16(0.015625f);
         w[b].dmin = test_f32_to_f16(0.00390625f);
+    }
+    c->initialized = 1;
+}
+
+static void dense_fill_q8_0_one(struct dense_cfg *c) {
+    if (c->initialized) return;
+    const size_t blocks = (c->in_dim + 31u) / 32u;
+    c->weight0_bytes = (size_t)c->out_dim * blocks * sizeof(test_block_q8_0);
+    c->weights0 = calloc(1, c->weight0_bytes);
+    if (!c->weights0) return;
+    uint64_t s = 0xD380ULL;
+    test_block_q8_0 *w = (test_block_q8_0 *)c->weights0;
+    for (size_t b = 0; b < (size_t)c->out_dim * blocks; b++) {
+        w[b].d = test_f32_to_f16(0.015625f);
+        for (uint32_t i = 0; i < 32u; i++) w[b].qs[i] = (int8_t)((int32_t)(test_rng_u32(&s) & 255u) - 128);
+    }
+    c->initialized = 1;
+}
+
+static void dense_fill_q8_0_pair(struct dense_cfg *c) {
+    if (c->initialized) return;
+    const size_t blocks = (c->in_dim + 31u) / 32u;
+    c->weight0_bytes = (size_t)c->out_dim * blocks * sizeof(test_block_q8_0);
+    c->weight1_bytes = c->weight0_bytes;
+    c->weights0 = calloc(1, c->weight0_bytes);
+    c->weights1 = calloc(1, c->weight1_bytes);
+    if (!c->weights0 || !c->weights1) return;
+    uint64_t s = 0xD3802ULL;
+    test_block_q8_0 *w0 = (test_block_q8_0 *)c->weights0;
+    test_block_q8_0 *w1 = (test_block_q8_0 *)c->weights1;
+    for (size_t b = 0; b < (size_t)c->out_dim * blocks; b++) {
+        w0[b].d = test_f32_to_f16(0.015625f);
+        w1[b].d = test_f32_to_f16(0.01171875f);
+        for (uint32_t i = 0; i < 32u; i++) {
+            w0[b].qs[i] = (int8_t)((int32_t)(test_rng_u32(&s) & 255u) - 128);
+            w1[b].qs[i] = (int8_t)((int32_t)(test_rng_u32(&s) & 255u) - 128);
+        }
     }
     c->initialized = 1;
 }
@@ -921,6 +976,178 @@ static int dense_f16_cuda(const float *in, ds4_cuda_tensor *out_dev,
     if (ok) ok = ds4_cuda_end_commands();
     ds4_cuda_tensor_free(w);
     ds4_cuda_tensor_free(x);
+    return ok;
+}
+
+static int prod_f32_matmul_cpu(const float *in, float *out, void *cfg) {
+    struct dense_cfg *c = cfg;
+    dense_fill_f32(c);
+    if (!c->initialized) return 0;
+    float *x = (float *)malloc((size_t)c->in_dim * sizeof(float));
+    if (!x) return 0;
+    for (uint32_t i = 0; i < c->in_dim; i++) x[i] = fabsf(in[i]) + 0.5f;
+    ds4_test_dense_f32_matvec(out, (const float *)c->weights0, x, c->in_dim, c->out_dim);
+    free(x);
+    return 1;
+}
+
+static int prod_f32_matmul_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                size_t in_elems, size_t out_elems, void *cfg) {
+    (void)out_elems;
+    struct dense_cfg *c = cfg;
+    dense_fill_f32(c);
+    if (!c->initialized) return 0;
+    ds4_cuda_tensor *w = ds4_cuda_tensor_alloc(c->weight0_bytes);
+    ds4_cuda_tensor *x = ds4_cuda_tensor_alloc((uint64_t)in_elems * sizeof(float));
+    if (!w || !x) { ds4_cuda_tensor_free(w); ds4_cuda_tensor_free(x); return 0; }
+    float *x_host = (float *)malloc((size_t)c->in_dim * sizeof(float));
+    if (!x_host) { ds4_cuda_tensor_free(w); ds4_cuda_tensor_free(x); return 0; }
+    for (uint32_t i = 0; i < c->in_dim; i++) x_host[i] = fabsf(in[i]) + 0.5f;
+    int ok = ds4_cuda_tensor_write(w, 0, c->weights0, c->weight0_bytes);
+    if (ok) ok = ds4_cuda_tensor_write(x, 0, x_host, (uint64_t)c->in_dim * sizeof(float));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_matmul_f32_tensor(out_dev, ds4_cuda_tensor_contents(w), c->weight0_bytes,
+                                            0, c->in_dim, c->out_dim, x, 1);
+    if (ok) ok = ds4_cuda_end_commands();
+    free(x_host);
+    ds4_cuda_tensor_free(w);
+    ds4_cuda_tensor_free(x);
+    return ok;
+}
+
+static int prod_f16_pair_cpu(const float *in, float *out, void *cfg) {
+    struct dense_cfg *c = cfg;
+    dense_fill_f16(c);
+    if (!c->initialized) return 0;
+    if (!c->weights1) {
+        c->weight1_bytes = c->weight0_bytes;
+        c->weights1 = calloc(1, c->weight1_bytes);
+        if (!c->weights1) return 0;
+        uint64_t s = 0xD3F162ULL;
+        uint16_t *w = (uint16_t *)c->weights1;
+        for (size_t i = 0; i < (size_t)c->in_dim * c->out_dim; i++) {
+            const int32_t v = (int32_t)(test_rng_u32(&s) & 0xffffu) - 32768;
+            w[i] = test_f32_to_f16((float)v / 32768.0f);
+        }
+    }
+    ds4_test_dense_f16_pair_matvec(out, out + c->out_dim,
+                                   (const uint16_t *)c->weights0,
+                                   (const uint16_t *)c->weights1,
+                                   in, c->in_dim, c->out_dim);
+    return 1;
+}
+
+static int prod_f16_pair_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                              size_t in_elems, size_t out_elems, void *cfg) {
+    (void)out_elems;
+    struct dense_cfg *c = cfg;
+    dense_fill_f16(c);
+    if (!c->initialized) return 0;
+    if (!c->weights1) {
+        c->weight1_bytes = c->weight0_bytes;
+        c->weights1 = calloc(1, c->weight1_bytes);
+        if (!c->weights1) return 0;
+        uint64_t s = 0xD3F162ULL;
+        uint16_t *w = (uint16_t *)c->weights1;
+        for (size_t i = 0; i < (size_t)c->in_dim * c->out_dim; i++) {
+            const int32_t v = (int32_t)(test_rng_u32(&s) & 0xffffu) - 32768;
+            w[i] = test_f32_to_f16((float)v / 32768.0f);
+        }
+    }
+    ds4_cuda_tensor *w = ds4_cuda_tensor_alloc(c->weight0_bytes + c->weight1_bytes);
+    ds4_cuda_tensor *x = ds4_cuda_tensor_alloc((uint64_t)in_elems * sizeof(float));
+    ds4_cuda_tensor *out0 = ds4_cuda_tensor_view(out_dev, 0, (uint64_t)c->out_dim * sizeof(float));
+    ds4_cuda_tensor *out1 = ds4_cuda_tensor_view(out_dev, (uint64_t)c->out_dim * sizeof(float),
+                                                 (uint64_t)c->out_dim * sizeof(float));
+    if (!w || !x || !out0 || !out1) {
+        ds4_cuda_tensor_free(w); ds4_cuda_tensor_free(x);
+        ds4_cuda_tensor_free(out0); ds4_cuda_tensor_free(out1);
+        return 0;
+    }
+    int ok = ds4_cuda_tensor_write(w, 0, c->weights0, c->weight0_bytes);
+    if (ok) ok = ds4_cuda_tensor_write(w, c->weight0_bytes, c->weights1, c->weight1_bytes);
+    if (ok) ok = ds4_cuda_tensor_write(x, 0, in, (uint64_t)in_elems * sizeof(float));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_matmul_f16_pair_tensor(out0, out1, ds4_cuda_tensor_contents(w),
+                                                 c->weight0_bytes + c->weight1_bytes,
+                                                 0, c->weight0_bytes,
+                                                 c->in_dim, c->out_dim, x, 1);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(w); ds4_cuda_tensor_free(x);
+    ds4_cuda_tensor_free(out0); ds4_cuda_tensor_free(out1);
+    return ok;
+}
+
+static int prod_q8_0_matmul_cpu(const float *in, float *out, void *cfg) {
+    struct dense_cfg *c = cfg;
+    dense_fill_q8_0_one(c);
+    if (!c->initialized) return 0;
+    ds4_test_dense_q8_0_matvec(out, c->weights0, in, c->in_dim, c->out_dim);
+    return 1;
+}
+
+static int prod_q8_0_matmul_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                 size_t in_elems, size_t out_elems, void *cfg) {
+    (void)out_elems;
+    struct dense_cfg *c = cfg;
+    dense_fill_q8_0_one(c);
+    if (!c->initialized) return 0;
+    ds4_cuda_tensor *w = ds4_cuda_tensor_alloc(c->weight0_bytes);
+    ds4_cuda_tensor *x = ds4_cuda_tensor_alloc((uint64_t)in_elems * sizeof(float));
+    if (!w || !x) { ds4_cuda_tensor_free(w); ds4_cuda_tensor_free(x); return 0; }
+    int ok = ds4_cuda_tensor_write(w, 0, c->weights0, c->weight0_bytes);
+    if (ok) ok = ds4_cuda_tensor_write(x, 0, in, (uint64_t)in_elems * sizeof(float));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_matmul_q8_0_tensor(out_dev, ds4_cuda_tensor_contents(w), c->weight0_bytes,
+                                             0, c->in_dim, c->out_dim, x, 1);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(w);
+    ds4_cuda_tensor_free(x);
+    return ok;
+}
+
+static int prod_shared_q8_0_swiglu_cpu(const float *in, float *out, void *cfg) {
+    struct dense_cfg *c = cfg;
+    dense_fill_q8_0_pair(c);
+    if (!c->initialized) return 0;
+    float *gate = out;
+    float *up = out + c->out_dim;
+    float *mid = out + (size_t)c->out_dim * 2u;
+    ds4_test_dense_q8_0_pair_matvec(gate, up, c->weights0, c->weights1, in, c->in_dim, c->out_dim);
+    for (uint32_t i = 0; i < c->out_dim; i++) mid[i] = silu(gate[i]) * up[i];
+    return 1;
+}
+
+static int prod_shared_q8_0_swiglu_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                        size_t in_elems, size_t out_elems, void *cfg) {
+    (void)out_elems;
+    struct dense_cfg *c = cfg;
+    dense_fill_q8_0_pair(c);
+    if (!c->initialized) return 0;
+    ds4_cuda_tensor *w = ds4_cuda_tensor_alloc(c->weight0_bytes + c->weight1_bytes);
+    ds4_cuda_tensor *x = ds4_cuda_tensor_alloc((uint64_t)in_elems * sizeof(float));
+    ds4_cuda_tensor *gate = ds4_cuda_tensor_view(out_dev, 0, (uint64_t)c->out_dim * sizeof(float));
+    ds4_cuda_tensor *up = ds4_cuda_tensor_view(out_dev, (uint64_t)c->out_dim * sizeof(float),
+                                               (uint64_t)c->out_dim * sizeof(float));
+    ds4_cuda_tensor *mid = ds4_cuda_tensor_view(out_dev, (uint64_t)c->out_dim * 2u * sizeof(float),
+                                                (uint64_t)c->out_dim * sizeof(float));
+    if (!w || !x || !gate || !up || !mid) {
+        ds4_cuda_tensor_free(w); ds4_cuda_tensor_free(x);
+        ds4_cuda_tensor_free(gate); ds4_cuda_tensor_free(up); ds4_cuda_tensor_free(mid);
+        return 0;
+    }
+    int ok = ds4_cuda_tensor_write(w, 0, c->weights0, c->weight0_bytes);
+    if (ok) ok = ds4_cuda_tensor_write(w, c->weight0_bytes, c->weights1, c->weight1_bytes);
+    if (ok) ok = ds4_cuda_tensor_write(x, 0, in, (uint64_t)in_elems * sizeof(float));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_shared_gate_up_swiglu_q8_0_tensor(
+                    gate, up, mid, ds4_cuda_tensor_contents(w),
+                    c->weight0_bytes + c->weight1_bytes,
+                    0, c->weight0_bytes,
+                    c->in_dim, c->out_dim, x);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(w); ds4_cuda_tensor_free(x);
+    ds4_cuda_tensor_free(gate); ds4_cuda_tensor_free(up); ds4_cuda_tensor_free(mid);
     return ok;
 }
 
@@ -1029,6 +1256,10 @@ static int dense_iq2_xxs_pair_cuda(const float *in, ds4_cuda_tensor *out_dev,
 }
 
 static struct dense_cfg dense_f16_cfg = { .in_dim = 4096, .out_dim = 64 };
+static struct dense_cfg prod_f32_matmul_cfg = { .in_dim = 512, .out_dim = 64 };
+static struct dense_cfg prod_f16_pair_cfg = { .in_dim = 512, .out_dim = 64 };
+static struct dense_cfg prod_q8_0_matmul_cfg = { .in_dim = 512, .out_dim = 64 };
+static struct dense_cfg prod_shared_q8_0_swiglu_cfg = { .in_dim = 512, .out_dim = 64 };
 static struct dense_cfg dense_q2_k_cfg = { .in_dim = 4096, .out_dim = 64 };
 static struct dense_cfg dense_iq2_xxs_cfg = { .in_dim = 4096, .out_dim = 64 };
 static struct dense_cfg dense_iq2_xxs_pair_cfg = { .in_dim = 4096, .out_dim = 64 };
@@ -1041,6 +1272,42 @@ DS4_CUDA_PARITY_TEST(dense_f16_matvec,
     .cpu_fn = dense_f16_cpu,
     .cuda_fn = dense_f16_cuda,
     .cfg = (void *)&dense_f16_cfg);
+
+DS4_CUDA_PARITY_TEST(prod_matmul_f32,
+    .seed = 0xD3F320,
+    .in_elems = 512,
+    .out_elems = 64,
+    .ulp_tolerance = 4,
+    .cpu_fn = prod_f32_matmul_cpu,
+    .cuda_fn = prod_f32_matmul_cuda,
+    .cfg = (void *)&prod_f32_matmul_cfg);
+
+DS4_CUDA_PARITY_TEST(prod_matmul_f16_pair,
+    .seed = 0xD3F162,
+    .in_elems = 512,
+    .out_elems = 128,
+    .ulp_tolerance = 0,
+    .cpu_fn = prod_f16_pair_cpu,
+    .cuda_fn = prod_f16_pair_cuda,
+    .cfg = (void *)&prod_f16_pair_cfg);
+
+DS4_CUDA_PARITY_TEST(prod_matmul_q8_0,
+    .seed = 0xD380,
+    .in_elems = 512,
+    .out_elems = 64,
+    .ulp_tolerance = 0,
+    .cpu_fn = prod_q8_0_matmul_cpu,
+    .cuda_fn = prod_q8_0_matmul_cuda,
+    .cfg = (void *)&prod_q8_0_matmul_cfg);
+
+DS4_CUDA_PARITY_TEST(prod_shared_gate_up_swiglu_q8_0,
+    .seed = 0xD382,
+    .in_elems = 512,
+    .out_elems = 192,
+    .ulp_tolerance = 16,
+    .cpu_fn = prod_shared_q8_0_swiglu_cpu,
+    .cuda_fn = prod_shared_q8_0_swiglu_cuda,
+    .cfg = (void *)&prod_shared_q8_0_swiglu_cfg);
 
 DS4_CUDA_PARITY_TEST(dense_q2_k_matvec,
     .seed = 0xD302,
@@ -2547,6 +2814,804 @@ DS4_CUDA_PARITY_TEST(indexed_mixed_attn,
     .cfg = (void *)&indexed_mixed_attn_cfg_v);
 
 /* ---------------------------------------------------------------------------
+ * Phase 1.5 (pty-5 chunk) — production-API stubs needed for 2.1a single-
+ * layer forward.  Six kernels: rms_norm_weight (single + rows),
+ * dsv4_qkv_rms_norm_rows, head_rms_norm, embed_token_hc, store_raw_kv.
+ * --------------------------------------------------------------------------- */
+
+extern int ds4_cuda_rms_norm_weight_tensor(
+        ds4_cuda_tensor *out, const ds4_cuda_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n, float eps);
+extern int ds4_cuda_rms_norm_weight_rows_tensor(
+        ds4_cuda_tensor *out, const ds4_cuda_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n, uint32_t rows, float eps);
+extern int ds4_cuda_dsv4_qkv_rms_norm_rows_tensor(
+        ds4_cuda_tensor *q_out, const ds4_cuda_tensor *q,
+        const void *model_map, uint64_t model_size,
+        uint64_t q_weight_offset, uint32_t q_n,
+        ds4_cuda_tensor *kv_out, const ds4_cuda_tensor *kv,
+        uint64_t kv_weight_offset, uint32_t kv_n,
+        uint32_t rows, float eps);
+extern int ds4_cuda_head_rms_norm_tensor(
+        ds4_cuda_tensor *x,
+        uint32_t n_tok, uint32_t n_head, uint32_t head_dim, float eps);
+extern int ds4_cuda_embed_token_hc_tensor(
+        ds4_cuda_tensor *out_hc,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc);
+extern int ds4_cuda_store_raw_kv_tensor(
+        ds4_cuda_tensor *raw_cache, const ds4_cuda_tensor *kv,
+        uint32_t raw_cap, uint32_t row, uint32_t head_dim);
+
+/* ---- rms_norm_weight (single row).  CPU oracle: rms_norm_weight (ds4.c)
+ *      already uses a double accumulator for the sum-of-squares, so it
+ *      tracks truth.  Float-tree-reduce CUDA vs double CPU at large n
+ *      lands at a few ULPs on output magnitudes ~1; tolerance 4. */
+
+struct rms_weight_cfg { uint32_t n; float eps; };
+
+static int rms_weight_cpu(const float *in, float *out, void *cfg) {
+    const struct rms_weight_cfg *c = cfg;
+    /* in layout: [x (n) | weight (n)].  out layout: norm(x) * weight. */
+    rms_norm_weight(out, in, in + c->n, c->n, c->eps);
+    return 1;
+}
+
+static int rms_weight_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                           size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct rms_weight_cfg *c = cfg;
+    /* Input device tensor + a "fake model map" containing the weight row. */
+    ds4_cuda_tensor *x_dev = ds4_cuda_tensor_alloc((uint64_t)c->n * sizeof(float));
+    ds4_cuda_tensor *w_dev = ds4_cuda_tensor_alloc((uint64_t)c->n * sizeof(float));
+    if (!x_dev || !w_dev) { ds4_cuda_tensor_free(x_dev); ds4_cuda_tensor_free(w_dev); return 0; }
+    int ok = ds4_cuda_tensor_write(x_dev, 0, in,        (uint64_t)c->n * sizeof(float))
+          && ds4_cuda_tensor_write(w_dev, 0, in + c->n, (uint64_t)c->n * sizeof(float));
+    const void *fake_model_map = ds4_cuda_tensor_contents(w_dev);
+    const uint64_t fake_model_size = (uint64_t)c->n * sizeof(float);
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_rms_norm_weight_tensor(out_dev, x_dev,
+                                                 fake_model_map, fake_model_size,
+                                                 /*weight_offset=*/0u, c->n, c->eps);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(x_dev);
+    ds4_cuda_tensor_free(w_dev);
+    return ok;
+}
+
+static const struct rms_weight_cfg rms_weight_cfg_v = { .n = 1024, .eps = 1e-6f };
+
+DS4_CUDA_PARITY_TEST(rms_norm_weight,
+    .seed = 0x60001,
+    .in_elems = 2048,
+    .out_elems = 1024,
+    .ulp_tolerance = 4,
+    .cpu_fn = rms_weight_cpu,
+    .cuda_fn = rms_weight_cuda,
+    .cfg = (void *)&rms_weight_cfg_v);
+
+/* ---- rms_norm_weight_rows: 4 rows of 1024 with shared per-channel weight. */
+
+struct rms_weight_rows_cfg { uint32_t n; uint32_t rows; float eps; };
+
+static int rms_weight_rows_cpu(const float *in, float *out, void *cfg) {
+    const struct rms_weight_rows_cfg *c = cfg;
+    /* in layout: [x (rows*n) | weight (n)]. */
+    const float *weight = in + (size_t)c->rows * c->n;
+    for (uint32_t r = 0; r < c->rows; r++) {
+        rms_norm_weight(out + (size_t)r * c->n,
+                        in  + (size_t)r * c->n,
+                        weight, c->n, c->eps);
+    }
+    return 1;
+}
+
+static int rms_weight_rows_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct rms_weight_rows_cfg *c = cfg;
+    const size_t x_n = (size_t)c->rows * c->n;
+    ds4_cuda_tensor *x_dev = ds4_cuda_tensor_alloc((uint64_t)x_n  * sizeof(float));
+    ds4_cuda_tensor *w_dev = ds4_cuda_tensor_alloc((uint64_t)c->n * sizeof(float));
+    if (!x_dev || !w_dev) { ds4_cuda_tensor_free(x_dev); ds4_cuda_tensor_free(w_dev); return 0; }
+    int ok = ds4_cuda_tensor_write(x_dev, 0, in,       (uint64_t)x_n  * sizeof(float))
+          && ds4_cuda_tensor_write(w_dev, 0, in + x_n, (uint64_t)c->n * sizeof(float));
+    const void *fake_model_map = ds4_cuda_tensor_contents(w_dev);
+    const uint64_t fake_model_size = (uint64_t)c->n * sizeof(float);
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_rms_norm_weight_rows_tensor(out_dev, x_dev,
+                                                      fake_model_map, fake_model_size,
+                                                      0u, c->n, c->rows, c->eps);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(x_dev);
+    ds4_cuda_tensor_free(w_dev);
+    return ok;
+}
+
+static const struct rms_weight_rows_cfg rms_weight_rows_cfg_v = { .n = 256, .rows = 4, .eps = 1e-6f };
+
+DS4_CUDA_PARITY_TEST(rms_norm_weight_rows,
+    .seed = 0x60002,
+    .in_elems = 4 * 256 + 256,   /* x rows + weight = 1280 */
+    .out_elems = 4 * 256,
+    .ulp_tolerance = 4,
+    .cpu_fn = rms_weight_rows_cpu,
+    .cuda_fn = rms_weight_rows_cuda,
+    .cfg = (void *)&rms_weight_rows_cfg_v);
+
+/* ---- dsv4_qkv_rms_norm_rows: two independent RMSNorms (Q and KV) fused
+ *      at the kernel-launch level on CUDA.  CPU oracle is two independent
+ *      rms_norm_weight calls per row.  Output layout: [q_out (rows*q_n) |
+ *      kv_out (rows*kv_n)]. */
+
+struct qkv_rms_cfg {
+    uint32_t q_n;
+    uint32_t kv_n;
+    uint32_t rows;
+    float    eps;
+};
+
+static int qkv_rms_cpu(const float *in, float *out, void *cfg) {
+    const struct qkv_rms_cfg *c = cfg;
+    const size_t qx_n  = (size_t)c->rows * c->q_n;
+    const size_t kvx_n = (size_t)c->rows * c->kv_n;
+    /* in layout: [q_x (rows*q_n) | q_w (q_n) | kv_x (rows*kv_n) | kv_w (kv_n)]. */
+    const float *q_x  = in;
+    const float *q_w  = in + qx_n;
+    const float *kv_x = in + qx_n + c->q_n;
+    const float *kv_w = in + qx_n + c->q_n + kvx_n;
+    float       *q_out  = out;
+    float       *kv_out = out + qx_n;
+    for (uint32_t r = 0; r < c->rows; r++) {
+        rms_norm_weight(q_out  + (size_t)r * c->q_n,  q_x  + (size_t)r * c->q_n,  q_w,  c->q_n,  c->eps);
+        rms_norm_weight(kv_out + (size_t)r * c->kv_n, kv_x + (size_t)r * c->kv_n, kv_w, c->kv_n, c->eps);
+    }
+    return 1;
+}
+
+static int qkv_rms_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                        size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems;
+    const struct qkv_rms_cfg *c = cfg;
+    const size_t qx_n  = (size_t)c->rows * c->q_n;
+    const size_t kvx_n = (size_t)c->rows * c->kv_n;
+    const float *q_x  = in;
+    const float *q_w  = in + qx_n;
+    const float *kv_x = in + qx_n + c->q_n;
+    const float *kv_w = in + qx_n + c->q_n + kvx_n;
+
+    ds4_cuda_tensor *q_in_dev   = ds4_cuda_tensor_alloc((uint64_t)qx_n  * sizeof(float));
+    ds4_cuda_tensor *kv_in_dev  = ds4_cuda_tensor_alloc((uint64_t)kvx_n * sizeof(float));
+    /* Fake "model map" holding [q_weight | kv_weight] back to back. */
+    ds4_cuda_tensor *w_dev      = ds4_cuda_tensor_alloc(((uint64_t)c->q_n + c->kv_n) * sizeof(float));
+    /* Q output is at offset 0; KV output is at offset qx_n in the harness's
+     * flat float buffer.  We use views over out_dev to give the wrapper two
+     * tensor handles. */
+    ds4_cuda_tensor *q_out_view  = ds4_cuda_tensor_view(out_dev, 0,
+                                                        (uint64_t)qx_n * sizeof(float));
+    ds4_cuda_tensor *kv_out_view = ds4_cuda_tensor_view(out_dev,
+                                                        (uint64_t)qx_n * sizeof(float),
+                                                        (uint64_t)kvx_n * sizeof(float));
+    if (!q_in_dev || !kv_in_dev || !w_dev || !q_out_view || !kv_out_view) {
+        ds4_cuda_tensor_free(q_in_dev); ds4_cuda_tensor_free(kv_in_dev);
+        ds4_cuda_tensor_free(w_dev);
+        ds4_cuda_tensor_free(q_out_view); ds4_cuda_tensor_free(kv_out_view);
+        return 0;
+    }
+
+    int ok = ds4_cuda_tensor_write(q_in_dev,  0, q_x,  (uint64_t)qx_n  * sizeof(float))
+          && ds4_cuda_tensor_write(kv_in_dev, 0, kv_x, (uint64_t)kvx_n * sizeof(float))
+          && ds4_cuda_tensor_write(w_dev,     0, q_w,  (uint64_t)c->q_n  * sizeof(float))
+          && ds4_cuda_tensor_write(w_dev, (uint64_t)c->q_n * sizeof(float),
+                                   kv_w, (uint64_t)c->kv_n * sizeof(float));
+
+    const void *fake_model_map = ds4_cuda_tensor_contents(w_dev);
+    const uint64_t fake_model_size = ((uint64_t)c->q_n + c->kv_n) * sizeof(float);
+    const uint64_t kv_w_offset = (uint64_t)c->q_n * sizeof(float);
+
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_dsv4_qkv_rms_norm_rows_tensor(
+                    q_out_view, q_in_dev, fake_model_map, fake_model_size,
+                    /*q_weight_offset=*/0u, c->q_n,
+                    kv_out_view, kv_in_dev, kv_w_offset, c->kv_n,
+                    c->rows, c->eps);
+    if (ok) ok = ds4_cuda_end_commands();
+
+    ds4_cuda_tensor_free(q_in_dev);
+    ds4_cuda_tensor_free(kv_in_dev);
+    ds4_cuda_tensor_free(w_dev);
+    ds4_cuda_tensor_free(q_out_view);
+    ds4_cuda_tensor_free(kv_out_view);
+    (void)out_elems;
+    return ok;
+}
+
+static const struct qkv_rms_cfg qkv_rms_cfg_v = {
+    .q_n = 1024, .kv_n = 512, .rows = 2, .eps = 1e-6f
+};
+
+DS4_CUDA_PARITY_TEST(dsv4_qkv_rms_norm_rows,
+    .seed = 0x90003,
+    /* q_x(2*1024) + q_w(1024) + kv_x(2*512) + kv_w(512) = 4608 */
+    .in_elems = 4608,
+    /* q_out(2*1024) + kv_out(2*512) = 3072 */
+    .out_elems = 3072,
+    .ulp_tolerance = 4,
+    .cpu_fn = qkv_rms_cpu,
+    .cuda_fn = qkv_rms_cuda,
+    .cfg = (void *)&qkv_rms_cfg_v);
+
+/* ---- head_rms_norm: in-place per-head RMSNorm over n_tok × n_head heads.
+ *      CPU oracle: head_rms_norm_inplace from ds4.c (already double-acc
+ *      sum-of-squares so tracks truth). */
+
+struct head_rms_cfg { uint32_t n_tok; uint32_t n_head; uint32_t head_dim; float eps; };
+
+static int head_rms_cpu(const float *in, float *out, void *cfg) {
+    const struct head_rms_cfg *c = cfg;
+    const size_t n = (size_t)c->n_tok * c->n_head * c->head_dim;
+    memcpy(out, in, n * sizeof(float));
+    head_rms_norm_inplace(out, c->n_tok * c->n_head, c->head_dim, c->eps);
+    return 1;
+}
+
+static int head_rms_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                         size_t in_elems, size_t out_elems, void *cfg) {
+    (void)out_elems;
+    const struct head_rms_cfg *c = cfg;
+    int ok = ds4_cuda_tensor_write(out_dev, 0, in, (uint64_t)in_elems * sizeof(float));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_head_rms_norm_tensor(out_dev, c->n_tok, c->n_head, c->head_dim, c->eps);
+    if (ok) ok = ds4_cuda_end_commands();
+    return ok;
+}
+
+static const struct head_rms_cfg head_rms_cfg_v = { .n_tok = 2, .n_head = 4, .head_dim = 64, .eps = 1e-6f };
+
+DS4_CUDA_PARITY_TEST(head_rms_norm,
+    .seed = 0xA0004,
+    .in_elems = 2 * 4 * 64,
+    .out_elems = 2 * 4 * 64,
+    .ulp_tolerance = 4,
+    .cpu_fn = head_rms_cpu,
+    .cuda_fn = head_rms_cuda,
+    .cfg = (void *)&head_rms_cfg_v);
+
+/* ---- embed_token_hc: lookup F16 row from synthetic embedding table,
+ *      convert to F32, replicate across n_hc HC streams.  Bit-exact since
+ *      both sides do the same F16→F32 conversion + memcpy; ULP=0. */
+
+struct embed_hc_cfg { uint32_t n_vocab; uint32_t token; uint32_t n_embd; uint32_t n_hc; };
+
+static float test_f16_to_f32_value(uint16_t h);
+
+static int embed_hc_cpu(const float *in, float *out, void *cfg) {
+    const struct embed_hc_cfg *c = cfg;
+    const uint16_t *table = (const uint16_t *)in;   /* in is the synthetic F16 table */
+    const uint16_t *row   = table + (size_t)c->token * c->n_embd;
+    for (uint32_t hc = 0; hc < c->n_hc; hc++) {
+        float *dst = out + (size_t)hc * c->n_embd;
+        for (uint32_t i = 0; i < c->n_embd; i++) {
+            dst[i] = (float)test_f16_to_f32_value(row[i]);
+        }
+    }
+    return 1;
+}
+
+/* Test-local F16→F32 helper (reuse the harness's test_f16_to_f32 helper if
+ * it exists; otherwise a minimal one matching the CUDA conversion). */
+static float test_f16_to_f32_value(uint16_t h) {
+    const uint32_t s = (uint32_t)(h & 0x8000u) << 16;
+    const uint32_t e = (uint32_t)(h >> 10) & 0x1fu;
+    const uint32_t m = (uint32_t)(h & 0x3ffu);
+    uint32_t bits;
+    if (e == 0u) {
+        if (m == 0u) bits = s;
+        else {
+            int e_adj = -1;
+            uint32_t mm = m;
+            while ((mm & 0x400u) == 0u) { mm <<= 1; e_adj--; }
+            mm &= 0x3ffu;
+            const uint32_t exp_f32 = (uint32_t)(127 - 15 + e_adj);
+            bits = s | (exp_f32 << 23) | (mm << 13);
+        }
+    } else if (e == 31u) {
+        bits = s | 0x7f800000u | (m << 13);
+    } else {
+        bits = s | ((e + 127u - 15u) << 23) | (m << 13);
+    }
+    union { uint32_t u; float f; } v = { bits };
+    return v.f;
+}
+
+static int embed_hc_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                         size_t in_elems, size_t out_elems, void *cfg) {
+    (void)out_elems;
+    const struct embed_hc_cfg *c = cfg;
+    /* Treat `in` as the F16 embedding table (uint16 packed in float buffer).
+     * Allocate a managed-memory tensor as the "model map" + write the table. */
+    const size_t table_bytes = (size_t)c->n_vocab * c->n_embd * sizeof(uint16_t);
+    ds4_cuda_tensor *table_dev = ds4_cuda_tensor_alloc(table_bytes);
+    if (!table_dev) return 0;
+    int ok = ds4_cuda_tensor_write(table_dev, 0, in, table_bytes);
+    const void *fake_model_map = ds4_cuda_tensor_contents(table_dev);
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_embed_token_hc_tensor(out_dev, fake_model_map, table_bytes,
+                                                /*weight_offset=*/0u,
+                                                c->n_vocab, c->token, c->n_embd, c->n_hc);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(table_dev);
+    (void)in_elems;
+    return ok;
+}
+
+/* n_vocab=8, n_embd=64, n_hc=4 — tiny but exercises the table+replicate. */
+static const struct embed_hc_cfg embed_hc_cfg_v = {
+    .n_vocab = 8, .token = 3, .n_embd = 64, .n_hc = 4
+};
+
+DS4_CUDA_PARITY_TEST(embed_token_hc,
+    .seed = 0xE7B0,
+    /* in_elems = ceil(table_bytes / sizeof(float)) = 8*64*2/4 = 256 floats. */
+    .in_elems = 256,
+    .out_elems = 4 * 64,
+    .ulp_tolerance = 0,
+    .cpu_fn = embed_hc_cpu,
+    .cuda_fn = embed_hc_cuda,
+    .cfg = (void *)&embed_hc_cfg_v);
+
+/* ---- store_raw_kv: write one head_dim-row of `kv` into the raw KV ring
+ *      at slot (row mod raw_cap).  Bit-exact (memcpy semantic). */
+
+struct store_raw_kv_cfg { uint32_t raw_cap; uint32_t row; uint32_t head_dim; };
+
+static int store_raw_kv_cpu(const float *in, float *out, void *cfg) {
+    const struct store_raw_kv_cfg *c = cfg;
+    /* in layout: [kv (head_dim) | initial_cache (raw_cap*head_dim)].
+     * out layout: [final_cache (raw_cap*head_dim)]. */
+    memcpy(out, in + c->head_dim, (size_t)c->raw_cap * c->head_dim * sizeof(float));
+    const uint32_t slot = c->row % c->raw_cap;
+    memcpy(out + (size_t)slot * c->head_dim, in, c->head_dim * sizeof(float));
+    return 1;
+}
+
+static int store_raw_kv_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                             size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct store_raw_kv_cfg *c = cfg;
+    /* Initial cache state goes into out_dev; kv goes into a separate device
+     * tensor; the kernel updates out_dev in place. */
+    int ok = ds4_cuda_tensor_write(out_dev, 0, in + c->head_dim,
+                                   (uint64_t)c->raw_cap * c->head_dim * sizeof(float));
+    ds4_cuda_tensor *kv_dev = ds4_cuda_tensor_alloc((uint64_t)c->head_dim * sizeof(float));
+    if (!kv_dev) return 0;
+    if (ok) ok = ds4_cuda_tensor_write(kv_dev, 0, in, (uint64_t)c->head_dim * sizeof(float));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_store_raw_kv_tensor(out_dev, kv_dev, c->raw_cap, c->row, c->head_dim);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(kv_dev);
+    return ok;
+}
+
+static const struct store_raw_kv_cfg store_raw_kv_cfg_v = { .raw_cap = 8, .row = 5, .head_dim = 64 };
+
+DS4_CUDA_PARITY_TEST(store_raw_kv,
+    .seed = 0x57084,
+    .in_elems = 64 + 8 * 64,    /* kv + initial cache = 576 */
+    .out_elems = 8 * 64,
+    .ulp_tolerance = 0,
+    .cpu_fn = store_raw_kv_cpu,
+    .cuda_fn = store_raw_kv_cuda,
+    .cfg = (void *)&store_raw_kv_cfg_v);
+
+/* ---------------------------------------------------------------------------
+ * Phase 1.5 — HC family (DS4-original) + decode attention.
+ * --------------------------------------------------------------------------- */
+
+struct hc_weighted_sum_cfg {
+    uint32_t n_embd;
+    uint32_t n_hc;
+    uint32_t n_tokens;
+    int      use_split_layout;
+};
+
+/* Input shaping (same idea as m4 flash_attn): x and w both mapped to
+ * abs(.)+0.5 so each FMA contributes a positive value >= 0.25 and the
+ * 4-FMA sum lands >= 1.0.  This keeps output magnitudes bounded away from
+ * zero so the ULP metric doesn't blow up on near-cancellation random
+ * inputs.  Also stays inside +/-2 so f32 has plenty of headroom. */
+static void hc_weighted_sum_shape(float *buf, size_t n) {
+    for (size_t i = 0; i < n; i++) buf[i] = fabsf(buf[i]) + 0.5f;
+}
+
+static int hc_weighted_sum_cpu(const float *in, float *out, void *cfg) {
+    const struct hc_weighted_sum_cfg *c = cfg;
+    const size_t res_n = (size_t)c->n_tokens * c->n_hc * c->n_embd;
+    const uint32_t w_stride = c->use_split_layout ? (2u * c->n_hc + c->n_hc * c->n_hc) : c->n_hc;
+    const size_t w_n = (size_t)c->n_tokens * w_stride;
+    float *res = (float *)malloc(res_n * sizeof(float));
+    float *w   = (float *)malloc(w_n   * sizeof(float));
+    if (!res || !w) { free(res); free(w); return 0; }
+    memcpy(res, in,         res_n * sizeof(float));
+    memcpy(w,   in + res_n, w_n   * sizeof(float));
+    hc_weighted_sum_shape(res, res_n);
+    hc_weighted_sum_shape(w,   w_n);
+    for (uint32_t t = 0; t < c->n_tokens; t++) {
+        hc_weighted_sum_one(out + (size_t)t * c->n_embd,
+                            res + (size_t)t * c->n_hc * c->n_embd,
+                            w   + (size_t)t * w_stride,
+                            c->n_embd, c->n_hc);
+    }
+    free(res); free(w);
+    return 1;
+}
+
+static int hc_weighted_sum_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct hc_weighted_sum_cfg *c = cfg;
+    const size_t res_n = (size_t)c->n_tokens * c->n_hc * c->n_embd;
+    const uint32_t w_stride = c->use_split_layout ? (2u * c->n_hc + c->n_hc * c->n_hc) : c->n_hc;
+    const size_t w_n = (size_t)c->n_tokens * w_stride;
+
+    /* Same shaping as the CPU thunk so both sides see identical inputs. */
+    float *res_h = (float *)malloc(res_n * sizeof(float));
+    float *w_h   = (float *)malloc(w_n   * sizeof(float));
+    if (!res_h || !w_h) { free(res_h); free(w_h); return 0; }
+    memcpy(res_h, in,         res_n * sizeof(float));
+    memcpy(w_h,   in + res_n, w_n   * sizeof(float));
+    hc_weighted_sum_shape(res_h, res_n);
+    hc_weighted_sum_shape(w_h,   w_n);
+
+    ds4_cuda_tensor *res_dev = ds4_cuda_tensor_alloc((uint64_t)res_n * sizeof(float));
+    ds4_cuda_tensor *w_dev   = ds4_cuda_tensor_alloc((uint64_t)w_n   * sizeof(float));
+    if (!res_dev || !w_dev) {
+        ds4_cuda_tensor_free(res_dev); ds4_cuda_tensor_free(w_dev);
+        free(res_h); free(w_h); return 0;
+    }
+    int ok = ds4_cuda_tensor_write(res_dev, 0, res_h, (uint64_t)res_n * sizeof(float))
+          && ds4_cuda_tensor_write(w_dev,   0, w_h,   (uint64_t)w_n   * sizeof(float));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) {
+        ok = c->use_split_layout
+           ? ds4_cuda_hc_weighted_sum_split_tensor(out_dev, res_dev, w_dev, c->n_embd, c->n_hc)
+           : ds4_cuda_hc_weighted_sum_tensor      (out_dev, res_dev, w_dev, c->n_embd, c->n_hc);
+    }
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(res_dev);
+    ds4_cuda_tensor_free(w_dev);
+    free(res_h); free(w_h);
+    return ok;
+}
+
+static const struct hc_weighted_sum_cfg hc_weighted_sum_cfg_v       = { .n_embd=256, .n_hc=4, .n_tokens=2, .use_split_layout=0 };
+static const struct hc_weighted_sum_cfg hc_weighted_sum_split_cfg_v = { .n_embd=256, .n_hc=4, .n_tokens=2, .use_split_layout=1 };
+
+DS4_CUDA_PARITY_TEST(hc_weighted_sum,
+    .seed = 0xDC10,
+    .in_elems  = 2 * 4 * 256 + 2 * 4,    /* res + w(tight) = 2056 */
+    .out_elems = 2 * 256,
+    .ulp_tolerance = 4,
+    .cpu_fn = hc_weighted_sum_cpu, .cuda_fn = hc_weighted_sum_cuda,
+    .cfg = (void *)&hc_weighted_sum_cfg_v);
+
+DS4_CUDA_PARITY_TEST(hc_weighted_sum_split,
+    .seed = 0xDC11,
+    .in_elems  = 2 * 4 * 256 + 2 * 24,   /* res + w(split mix_hc=24) = 2096 */
+    .out_elems = 2 * 256,
+    .ulp_tolerance = 4,
+    .cpu_fn = hc_weighted_sum_cpu, .cuda_fn = hc_weighted_sum_cuda,
+    .cfg = (void *)&hc_weighted_sum_split_cfg_v);
+
+struct hc_expand_cfg {
+    uint32_t n_embd;
+    uint32_t n_hc;
+    uint32_t n_tokens;
+    int      use_split_layout;
+    int      has_add;
+};
+
+/* Same input-shaping rationale as hc_weighted_sum: keep all inputs to FMAs
+ * positive and >= 0.5 so output magnitudes stay above ~1, suppressing the
+ * near-zero ULP-metric blowup from random cancellation. */
+static void hc_expand_shape_in(const float *src, float *dst, size_t n) {
+    for (size_t i = 0; i < n; i++) dst[i] = fabsf(src[i]) + 0.5f;
+}
+
+static int hc_expand_cpu(const float *in, float *out, void *cfg) {
+    const struct hc_expand_cfg *c = cfg;
+    const size_t block_n = (size_t)c->n_tokens * c->n_embd;
+    const size_t res_n   = (size_t)c->n_tokens * c->n_hc * c->n_embd;
+    const uint32_t mix_hc = 2u * c->n_hc + c->n_hc * c->n_hc;
+    const size_t total_n = ((c->has_add ? 2u : 1u) * block_n) + res_n
+                         + (c->use_split_layout
+                              ? (size_t)c->n_tokens * mix_hc
+                              : (size_t)c->n_tokens * (c->n_hc + c->n_hc * c->n_hc));
+    float *shaped = (float *)malloc(total_n * sizeof(float));
+    if (!shaped) return 0;
+    hc_expand_shape_in(in, shaped, total_n);
+    const float *block = shaped;
+    const float *block_add = c->has_add ? shaped + block_n : NULL;
+    const float *res = shaped + (c->has_add ? 2u : 1u) * block_n;
+    const float *post_base, *comb_base;
+    size_t post_stride, comb_stride;
+    if (c->use_split_layout) {
+        const float *split = res + res_n;
+        post_base = split + c->n_hc;
+        comb_base = split + 2u * c->n_hc;
+        post_stride = mix_hc;
+        comb_stride = mix_hc;
+    } else {
+        post_base = res + res_n;
+        comb_base = post_base + (size_t)c->n_tokens * c->n_hc;
+        post_stride = c->n_hc;
+        comb_stride = (size_t)c->n_hc * c->n_hc;
+    }
+
+    float *combined = (float *)malloc(block_n * sizeof(float));
+    if (!combined) return 0;
+    for (size_t i = 0; i < block_n; i++) combined[i] = c->has_add ? (block[i] + block_add[i]) : block[i];
+
+    for (uint32_t t = 0; t < c->n_tokens; t++) {
+        hc_post_one(out + (size_t)t * c->n_hc * c->n_embd,
+                    combined + (size_t)t * c->n_embd,
+                    res + (size_t)t * c->n_hc * c->n_embd,
+                    post_base + (size_t)t * post_stride,
+                    comb_base + (size_t)t * comb_stride,
+                    c->n_embd, c->n_hc);
+    }
+    free(combined);
+    free(shaped);
+    return 1;
+}
+
+static int hc_expand_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                          size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct hc_expand_cfg *c = cfg;
+    const size_t block_n = (size_t)c->n_tokens * c->n_embd;
+    const size_t res_n   = (size_t)c->n_tokens * c->n_hc * c->n_embd;
+    const uint32_t mix_hc = 2u * c->n_hc + c->n_hc * c->n_hc;
+
+    ds4_cuda_tensor *block_dev = ds4_cuda_tensor_alloc((uint64_t)block_n * sizeof(float));
+    ds4_cuda_tensor *add_dev   = c->has_add ? ds4_cuda_tensor_alloc((uint64_t)block_n * sizeof(float)) : NULL;
+    ds4_cuda_tensor *res_dev   = ds4_cuda_tensor_alloc((uint64_t)res_n   * sizeof(float));
+    ds4_cuda_tensor *post_dev  = NULL, *comb_dev = NULL, *split_dev = NULL;
+    if (c->use_split_layout) {
+        split_dev = ds4_cuda_tensor_alloc((uint64_t)c->n_tokens * mix_hc * sizeof(float));
+    } else {
+        post_dev = ds4_cuda_tensor_alloc((uint64_t)c->n_tokens * c->n_hc * sizeof(float));
+        comb_dev = ds4_cuda_tensor_alloc((uint64_t)c->n_tokens * c->n_hc * c->n_hc * sizeof(float));
+    }
+    if (!block_dev || !res_dev || (c->has_add && !add_dev) ||
+        (c->use_split_layout ? !split_dev : (!post_dev || !comb_dev))) {
+        ds4_cuda_tensor_free(block_dev); ds4_cuda_tensor_free(add_dev);
+        ds4_cuda_tensor_free(res_dev);   ds4_cuda_tensor_free(post_dev);
+        ds4_cuda_tensor_free(comb_dev);  ds4_cuda_tensor_free(split_dev);
+        return 0;
+    }
+
+    const size_t total_n = ((c->has_add ? 2u : 1u) * block_n) + res_n
+                         + (c->use_split_layout
+                              ? (size_t)c->n_tokens * mix_hc
+                              : (size_t)c->n_tokens * (c->n_hc + c->n_hc * c->n_hc));
+    float *shaped = (float *)malloc(total_n * sizeof(float));
+    if (!shaped) {
+        ds4_cuda_tensor_free(block_dev); ds4_cuda_tensor_free(add_dev);
+        ds4_cuda_tensor_free(res_dev);   ds4_cuda_tensor_free(post_dev);
+        ds4_cuda_tensor_free(comb_dev);  ds4_cuda_tensor_free(split_dev);
+        return 0;
+    }
+    hc_expand_shape_in(in, shaped, total_n);
+    const float *block = shaped;
+    const float *block_add = c->has_add ? shaped + block_n : NULL;
+    const float *res = shaped + (c->has_add ? 2u : 1u) * block_n;
+
+    int ok = ds4_cuda_tensor_write(block_dev, 0, block, (uint64_t)block_n * sizeof(float))
+          && ds4_cuda_tensor_write(res_dev,   0, res,   (uint64_t)res_n   * sizeof(float));
+    if (ok && c->has_add) ok = ds4_cuda_tensor_write(add_dev, 0, block_add, (uint64_t)block_n * sizeof(float));
+    if (ok) {
+        if (c->use_split_layout) {
+            const float *split = res + res_n;
+            ok = ds4_cuda_tensor_write(split_dev, 0, split,
+                                       (uint64_t)c->n_tokens * mix_hc * sizeof(float));
+        } else {
+            const float *post = res + res_n;
+            const float *comb = post + (size_t)c->n_tokens * c->n_hc;
+            ok = ds4_cuda_tensor_write(post_dev, 0, post,
+                                       (uint64_t)c->n_tokens * c->n_hc * sizeof(float))
+              && ds4_cuda_tensor_write(comb_dev, 0, comb,
+                                       (uint64_t)c->n_tokens * c->n_hc * c->n_hc * sizeof(float));
+        }
+    }
+
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) {
+        if (c->has_add) {
+            ok = ds4_cuda_hc_expand_add_split_tensor(out_dev, block_dev, add_dev, res_dev, split_dev,
+                                                     c->n_embd, c->n_hc);
+        } else if (c->use_split_layout) {
+            ok = ds4_cuda_hc_expand_split_tensor(out_dev, block_dev, res_dev, split_dev,
+                                                 c->n_embd, c->n_hc);
+        } else {
+            ok = ds4_cuda_hc_expand_tensor(out_dev, block_dev, res_dev, post_dev, comb_dev,
+                                           c->n_embd, c->n_hc);
+        }
+    }
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(block_dev); ds4_cuda_tensor_free(add_dev);
+    ds4_cuda_tensor_free(res_dev);   ds4_cuda_tensor_free(post_dev);
+    ds4_cuda_tensor_free(comb_dev);  ds4_cuda_tensor_free(split_dev);
+    free(shaped);
+    return ok;
+}
+
+static const struct hc_expand_cfg hc_expand_cfg_v           = { .n_embd=256, .n_hc=4, .n_tokens=2, .use_split_layout=0, .has_add=0 };
+static const struct hc_expand_cfg hc_expand_split_cfg_v     = { .n_embd=256, .n_hc=4, .n_tokens=2, .use_split_layout=1, .has_add=0 };
+static const struct hc_expand_cfg hc_expand_add_split_cfg_v = { .n_embd=256, .n_hc=4, .n_tokens=2, .use_split_layout=1, .has_add=1 };
+
+DS4_CUDA_PARITY_TEST(hc_expand,
+    .seed = 0xDC20,
+    .in_elems  = 2*256 + 2*4*256 + 2*4 + 2*4*4,   /* block + res + post + comb = 2600 */
+    .out_elems = 2*4*256,
+    .ulp_tolerance = 4,
+    .cpu_fn = hc_expand_cpu, .cuda_fn = hc_expand_cuda,
+    .cfg = (void *)&hc_expand_cfg_v);
+
+DS4_CUDA_PARITY_TEST(hc_expand_split,
+    .seed = 0xDC21,
+    .in_elems  = 2*256 + 2*4*256 + 2*24,
+    .out_elems = 2*4*256,
+    .ulp_tolerance = 4,
+    .cpu_fn = hc_expand_cpu, .cuda_fn = hc_expand_cuda,
+    .cfg = (void *)&hc_expand_split_cfg_v);
+
+DS4_CUDA_PARITY_TEST(hc_expand_add_split,
+    .seed = 0xDC22,
+    .in_elems  = 2*256 + 2*256 + 2*4*256 + 2*24,
+    .out_elems = 2*4*256,
+    .ulp_tolerance = 4,
+    .cpu_fn = hc_expand_cpu, .cuda_fn = hc_expand_cuda,
+    .cfg = (void *)&hc_expand_add_split_cfg_v);
+
+struct attn_decode_cfg {
+    uint32_t n_head;
+    uint32_t head_dim;
+    uint32_t n_raw;
+    uint32_t raw_cap;
+    uint32_t raw_start;
+    uint32_t n_comp;
+    int      use_mask;
+    const float *comp_mask;
+};
+
+static void attn_decode_prep(const float *in_raw, const struct attn_decode_cfg *c,
+                             float *q_buf, float *raw_buf, float *comp_buf, float *sinks_buf) {
+    const size_t q_n   = (size_t)c->n_head * c->head_dim;
+    const size_t raw_n = (size_t)c->raw_cap * c->head_dim;
+    const size_t comp_n = (size_t)c->n_comp * c->head_dim;
+    const float *src = in_raw;
+    for (size_t i = 0; i < q_n; i++)    q_buf[i]    = src[i] * 8.0f;
+    src += q_n;
+    for (size_t i = 0; i < raw_n; i++)  raw_buf[i]  = fabsf(src[i]) + 0.5f;
+    src += raw_n;
+    for (size_t i = 0; i < comp_n; i++) comp_buf[i] = fabsf(src[i]) + 0.5f;
+    src += comp_n;
+    for (uint32_t i = 0; i < c->n_head; i++) sinks_buf[i] = src[i];
+}
+
+static int attn_decode_cpu(const float *in, float *out, void *cfg) {
+    const struct attn_decode_cfg *c = cfg;
+    const size_t q_n   = (size_t)c->n_head * c->head_dim;
+    const size_t raw_n = (size_t)c->raw_cap * c->head_dim;
+    const size_t comp_n = (size_t)c->n_comp * c->head_dim;
+    float *q     = (float *)malloc(q_n   * sizeof(float));
+    float *raw   = (float *)malloc(raw_n * sizeof(float));
+    float *comp  = (float *)malloc(comp_n * sizeof(float));
+    float *sinks = (float *)malloc((size_t)c->n_head * sizeof(float));
+    float *visible = (float *)malloc(((size_t)c->n_raw + c->n_comp) * c->head_dim * sizeof(float));
+    if (!q || !raw || !comp || !sinks || !visible) {
+        free(q); free(raw); free(comp); free(sinks); free(visible); return 0;
+    }
+    attn_decode_prep(in, c, q, raw, comp, sinks);
+
+    size_t kv_count = 0;
+    for (uint32_t r = 0; r < c->n_raw; r++) {
+        const uint32_t row = (c->raw_start + r) % c->raw_cap;
+        memcpy(visible + kv_count * c->head_dim, raw + (size_t)row * c->head_dim,
+               (size_t)c->head_dim * sizeof(float));
+        kv_count++;
+    }
+    for (uint32_t cc = 0; cc < c->n_comp; cc++) {
+        if (c->use_mask && c->comp_mask[cc] < 0.0f) continue;
+        memcpy(visible + kv_count * c->head_dim, comp + (size_t)cc * c->head_dim,
+               (size_t)c->head_dim * sizeof(float));
+        kv_count++;
+    }
+    attention_rows_raw_cpu(out, q, visible, (uint32_t)kv_count, sinks, c->n_head, c->head_dim);
+    free(q); free(raw); free(comp); free(sinks); free(visible);
+    return 1;
+}
+
+static int attn_decode_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                            size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct attn_decode_cfg *c = cfg;
+    const size_t q_n   = (size_t)c->n_head * c->head_dim;
+    const size_t raw_n = (size_t)c->raw_cap * c->head_dim;
+    const size_t comp_n = (size_t)c->n_comp * c->head_dim;
+    float *q_h    = (float *)malloc(q_n   * sizeof(float));
+    float *raw_h  = (float *)malloc(raw_n * sizeof(float));
+    float *comp_h = (float *)malloc(comp_n * sizeof(float));
+    float *sinks_h = (float *)malloc((size_t)c->n_head * sizeof(float));
+    if (!q_h || !raw_h || !comp_h || !sinks_h) {
+        free(q_h); free(raw_h); free(comp_h); free(sinks_h); return 0;
+    }
+    attn_decode_prep(in, c, q_h, raw_h, comp_h, sinks_h);
+
+    ds4_cuda_tensor *q_dev    = ds4_cuda_tensor_alloc((uint64_t)q_n * sizeof(float));
+    ds4_cuda_tensor *raw_dev  = ds4_cuda_tensor_alloc((uint64_t)raw_n * sizeof(float));
+    ds4_cuda_tensor *comp_dev = c->n_comp ? ds4_cuda_tensor_alloc((uint64_t)comp_n * sizeof(float)) : NULL;
+    ds4_cuda_tensor *mask_dev = c->use_mask ? ds4_cuda_tensor_alloc((uint64_t)c->n_comp * sizeof(float)) : NULL;
+    ds4_cuda_tensor *sinks_dev = ds4_cuda_tensor_alloc((uint64_t)c->n_head * sizeof(float));
+
+    int ok = q_dev && raw_dev && (c->n_comp == 0 || comp_dev)
+          && (!c->use_mask || mask_dev) && sinks_dev;
+    if (ok) ok = ds4_cuda_tensor_write(q_dev,    0, q_h,    (uint64_t)q_n * sizeof(float))
+              && ds4_cuda_tensor_write(raw_dev,  0, raw_h,  (uint64_t)raw_n * sizeof(float))
+              && ds4_cuda_tensor_write(sinks_dev,0, sinks_h,(uint64_t)c->n_head * sizeof(float));
+    if (ok && c->n_comp) ok = ds4_cuda_tensor_write(comp_dev, 0, comp_h, (uint64_t)comp_n * sizeof(float));
+    if (ok && c->use_mask) ok = ds4_cuda_tensor_write(mask_dev, 0, c->comp_mask, (uint64_t)c->n_comp * sizeof(float));
+
+    const void *fake_model_map = sinks_dev ? ds4_cuda_tensor_contents(sinks_dev) : NULL;
+    const uint64_t fake_model_size = (uint64_t)c->n_head * sizeof(float);
+
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_attention_decode_heads_tensor(
+                    out_dev, fake_model_map, fake_model_size, /*sinks_offset=*/0,
+                    q_dev, raw_dev, c->n_raw, c->raw_cap, c->raw_start,
+                    comp_dev, c->n_comp, mask_dev, c->use_mask ? 1u : 0u,
+                    c->n_head, c->head_dim);
+    if (ok) ok = ds4_cuda_end_commands();
+
+    ds4_cuda_tensor_free(q_dev); ds4_cuda_tensor_free(raw_dev);
+    ds4_cuda_tensor_free(comp_dev); ds4_cuda_tensor_free(mask_dev);
+    ds4_cuda_tensor_free(sinks_dev);
+    free(q_h); free(raw_h); free(comp_h); free(sinks_h);
+    return ok;
+}
+
+static const float attn_decode_mask_v[4] = { 0.0f, -INFINITY, 0.0f, -INFINITY };
+
+static const struct attn_decode_cfg attn_decode_no_mask_cfg = {
+    .n_head=2, .head_dim=128, .n_raw=4, .raw_cap=8, .raw_start=3, .n_comp=4,
+    .use_mask=0, .comp_mask=NULL,
+};
+static const struct attn_decode_cfg attn_decode_mask_cfg = {
+    .n_head=2, .head_dim=128, .n_raw=4, .raw_cap=8, .raw_start=3, .n_comp=4,
+    .use_mask=1, .comp_mask=attn_decode_mask_v,
+};
+
+DS4_CUDA_PARITY_TEST(attention_decode_heads_no_mask,
+    .seed = 0x4DEC,
+    /* q(2*128=256) + raw(8*128=1024) + comp(4*128=512) + sinks(2) = 1794 */
+    .in_elems = 1794,
+    .out_elems = 256,
+    .ulp_tolerance = 32,
+    .cpu_fn = attn_decode_cpu, .cuda_fn = attn_decode_cuda,
+    .cfg = (void *)&attn_decode_no_mask_cfg);
+
+DS4_CUDA_PARITY_TEST(attention_decode_heads_mask,
+    .seed = 0x4DED,
+    .in_elems = 1794,
+    .out_elems = 256,
+    .ulp_tolerance = 32,
+    .cpu_fn = attn_decode_cpu, .cuda_fn = attn_decode_cuda,
+    .cfg = (void *)&attn_decode_mask_cfg);
+
+/* ---------------------------------------------------------------------------
  * Registry — order does not matter; failures are counted globally.
  * --------------------------------------------------------------------------- */
 
@@ -2569,6 +3634,10 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_unary_scale,
     &ds4_cuda_parity_set_rows,
     &ds4_cuda_parity_dense_f16_matvec,
+    &ds4_cuda_parity_prod_matmul_f32,
+    &ds4_cuda_parity_prod_matmul_f16_pair,
+    &ds4_cuda_parity_prod_matmul_q8_0,
+    &ds4_cuda_parity_prod_shared_gate_up_swiglu_q8_0,
     &ds4_cuda_parity_dense_q2_k_matvec,
     &ds4_cuda_parity_dense_iq2_xxs_matvec,
     &ds4_cuda_parity_dense_iq2_xxs_pair_matvec,
@@ -2588,6 +3657,19 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_indexer_scores_prefill,
     &ds4_cuda_parity_indexer_scores_decode_batch,
     &ds4_cuda_parity_indexed_mixed_attn,
+    &ds4_cuda_parity_rms_norm_weight,
+    &ds4_cuda_parity_rms_norm_weight_rows,
+    &ds4_cuda_parity_dsv4_qkv_rms_norm_rows,
+    &ds4_cuda_parity_head_rms_norm,
+    &ds4_cuda_parity_embed_token_hc,
+    &ds4_cuda_parity_store_raw_kv,
+    &ds4_cuda_parity_hc_weighted_sum,
+    &ds4_cuda_parity_hc_weighted_sum_split,
+    &ds4_cuda_parity_hc_expand,
+    &ds4_cuda_parity_hc_expand_split,
+    &ds4_cuda_parity_hc_expand_add_split,
+    &ds4_cuda_parity_attention_decode_heads_no_mask,
+    &ds4_cuda_parity_attention_decode_heads_mask,
     NULL,
 };
 

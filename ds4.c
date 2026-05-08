@@ -2630,7 +2630,7 @@ void rms_norm_no_weight(float *out, const float *x, uint64_t n, float eps) {
 }
 
 /* Standard DS4 RMSNorm with learned per-channel scale. */
-static void rms_norm_weight(float *out, const float *x, const float *weight, uint64_t n, float eps) {
+void rms_norm_weight(float *out, const float *x, const float *weight, uint64_t n, float eps) {
     double ss = 0.0;
     for (uint64_t i = 0; i < n; i++) ss += (double)x[i] * x[i];
 
@@ -2639,7 +2639,7 @@ static void rms_norm_weight(float *out, const float *x, const float *weight, uin
 }
 
 /* Normalize each attention head independently after Q projection. */
-static void head_rms_norm_inplace(float *x, uint32_t n_head, uint32_t head_dim, float eps) {
+void head_rms_norm_inplace(float *x, uint32_t n_head, uint32_t head_dim, float eps) {
     for (uint32_t h = 0; h < n_head; h++) {
         float *head = x + (uint64_t)h * head_dim;
         double ss = 0.0;
@@ -2726,6 +2726,34 @@ void ds4_test_dense_f16_matvec(
         uint32_t        out_dim) {
     for (uint32_t row = 0; row < out_dim; row++) {
         out[row] = dot_f16_row(weights + (uint64_t)row * in_dim, x, in_dim);
+    }
+}
+
+void ds4_test_dense_f32_matvec(
+        float       *out,
+        const float *weights,
+        const float *x,
+        uint32_t     in_dim,
+        uint32_t     out_dim) {
+    for (uint32_t row = 0; row < out_dim; row++) {
+        float acc = 0.0f;
+        const float *w = weights + (uint64_t)row * in_dim;
+        for (uint32_t i = 0; i < in_dim; i++) acc += w[i] * x[i];
+        out[row] = acc;
+    }
+}
+
+void ds4_test_dense_f16_pair_matvec(
+        float          *out0,
+        float          *out1,
+        const uint16_t *weights0,
+        const uint16_t *weights1,
+        const float    *x,
+        uint32_t        in_dim,
+        uint32_t        out_dim) {
+    for (uint32_t row = 0; row < out_dim; row++) {
+        out0[row] = dot_f16_row(weights0 + (uint64_t)row * in_dim, x, in_dim);
+        out1[row] = dot_f16_row(weights1 + (uint64_t)row * in_dim, x, in_dim);
     }
 }
 
@@ -3602,6 +3630,48 @@ static void matmul_q8_0_pair_batch(
     free(xq);
 }
 
+void ds4_test_dense_q8_0_matvec(
+        float      *out,
+        const void *weights,
+        const float *x,
+        uint32_t    in_dim,
+        uint32_t    out_dim) {
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    int8_t *xq = xmalloc((size_t)blocks * 32u);
+    float *xscale = xmalloc((size_t)blocks * sizeof(xscale[0]));
+    quantize_q8_0_activation(x, xq, xscale, in_dim);
+    const uint8_t *w = (const uint8_t *)weights;
+    for (uint32_t row = 0; row < out_dim; row++) {
+        out[row] = dot_q8_0_row(w + (uint64_t)row * blocks * 34u, xq, xscale, in_dim, blocks);
+    }
+    free(xscale);
+    free(xq);
+}
+
+void ds4_test_dense_q8_0_pair_matvec(
+        float      *out0,
+        float      *out1,
+        const void *weights0,
+        const void *weights1,
+        const float *x,
+        uint32_t    in_dim,
+        uint32_t    out_dim) {
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    int8_t *xq = xmalloc((size_t)blocks * 32u);
+    float *xscale = xmalloc((size_t)blocks * sizeof(xscale[0]));
+    quantize_q8_0_activation(x, xq, xscale, in_dim);
+    const uint8_t *w0 = (const uint8_t *)weights0;
+    const uint8_t *w1 = (const uint8_t *)weights1;
+    for (uint32_t row = 0; row < out_dim; row++) {
+        dot_q8_0_row_pair(w0 + (uint64_t)row * blocks * 34u,
+                          w1 + (uint64_t)row * blocks * 34u,
+                          xq, xscale, in_dim, blocks,
+                          out0 + row, out1 + row);
+    }
+    free(xscale);
+    free(xq);
+}
+
 static void matvec_q8_0_rows(
         float           * out,
         const ds4_model * m,
@@ -4397,7 +4467,7 @@ static void hc_split_sinkhorn_one(
 
 /* Reduce the four HC streams into the plain embedding vector consumed by a
  * normal attention or FFN sublayer. */
-static void hc_weighted_sum_one(
+void hc_weighted_sum_one(
         float       * out,
         const float * x,
         const float * weights,
@@ -4496,7 +4566,7 @@ void hc_from_plain_embedding(float *out_hc, const float *x, uint32_t n_embd, uin
 
 /* HC post step for one sublayer output.  It injects the new block output and
  * mixes the previous HC streams through the learned combine matrix. */
-static void hc_post_one(
+void hc_post_one(
         float       * out_hc,
         const float * block_out,
         const float * residual_hc,

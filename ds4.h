@@ -165,6 +165,10 @@ float softplus_stable(float x);
 void swiglu(float *out, const float *gate, const float *up, uint64_t n);
 void hc_from_plain_embedding(float *out_hc, const float *x, uint32_t n_embd, uint32_t n_hc);
 void ds4_test_dense_f16_matvec(float *out, const uint16_t *weights, const float *x, uint32_t in_dim, uint32_t out_dim);
+void ds4_test_dense_f32_matvec(float *out, const float *weights, const float *x, uint32_t in_dim, uint32_t out_dim);
+void ds4_test_dense_f16_pair_matvec(float *out0, float *out1, const uint16_t *weights0, const uint16_t *weights1, const float *x, uint32_t in_dim, uint32_t out_dim);
+void ds4_test_dense_q8_0_matvec(float *out, const void *weights, const float *x, uint32_t in_dim, uint32_t out_dim);
+void ds4_test_dense_q8_0_pair_matvec(float *out0, float *out1, const void *weights0, const void *weights1, const float *x, uint32_t in_dim, uint32_t out_dim);
 void ds4_test_quantize_row_q8_K(const float *x, void *y, int64_t k);
 void ds4_test_dense_q2_k_matvec(float *out, const void *weights, const void *xq, uint32_t in_dim, uint32_t out_dim);
 void ds4_test_dense_iq2_xxs_matvec(float *out, const void *weights, const void *xq, uint32_t in_dim, uint32_t out_dim);
@@ -261,5 +265,11 @@ void indexer_scores_batch_cpu(float *scores,
                               uint32_t head_dim,
                               uint32_t ratio,
                               float scale);
+void rms_norm_weight(float *out, const float *x, const float *weight, uint64_t n, float eps);
+void head_rms_norm_inplace(float *x, uint32_t n_head, uint32_t head_dim, float eps);
+void hc_weighted_sum_one(float *out, const float *x, const float *weights, uint32_t n_embd, uint32_t n_hc);
+void hc_post_one(float *out_hc, const float *block_out, const float *residual_hc,
+                 const float *post, const float *comb,
+                 uint32_t n_embd, uint32_t n_hc);
 
 #endif
