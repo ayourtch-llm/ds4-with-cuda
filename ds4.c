@@ -17528,6 +17528,23 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
             }
         }
 
+        /* Ratio-aware sanity: ratio-0 layers carry no compressor body, and
+         * ratio-128 layers carry no indexer body, so the corresponding row
+         * counters must be zero in any well-formed payload. */
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            if (ratio == 0 && (n_comp[il] != 0 || n_index_comp[il] != 0)) {
+                token_vec_free(&new_checkpoint);
+                payload_set_err(err, errlen, "KV checkpoint has nonzero counter on a ratio-0 layer");
+                return 1;
+            }
+            if (ratio == 128 && n_index_comp[il] != 0) {
+                token_vec_free(&new_checkpoint);
+                payload_set_err(err, errlen, "KV checkpoint has nonzero indexer counter on a ratio-128 layer");
+                return 1;
+            }
+        }
+
         uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
         int rc = 0;
         for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
