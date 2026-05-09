@@ -4029,14 +4029,18 @@ int ds4_cuda_attention_prefill_raw_heads_tensor(
  * Multi-token extension of decode_heads (cu:5935) with the causal raw-window
  * indexing of flash_attn_raw_kernel (cu:3884).  Each (token, head) block:
  *   - Phase 1a: scores for raw_kv[max(0,t+1-window) .. t+1) (causal, contiguous);
- *   - Phase 1b: scores for comp_kv[0..n_comp) (all comp rows visible to all
- *     tokens — the "static" in the name; see masked variant for grow-during-
- *     batch comp cache);
+ *   - Phase 1b: scores for comp_kv[0 .. n_visible) where
+ *     `n_visible = ratio ? min((t+1)/ratio, n_comp) : n_comp` — per-token
+ *     causal compression visibility, mirroring Metal's mask-fill at
+ *     ds4_metal.m:8815-8835 (static_mixed_prefill_mask).  Without this the
+ *     "static" path silently lets later-emitted comp rows leak into earlier
+ *     tokens' attention.
  *   - Phase 2/2.5/3: same 2-pass softmax shape as the rest of the family.
  *
- * Sinks-aware softmax matches both peers.  ratio is unused here (no causal
- * mask on comp_kv); kept in the signature for API symmetry with the masked
- * variant.
+ * Sinks-aware softmax matches both peers.  Caller-supplied pos0 is implicit
+ * (==0) in the static_mixed path: this kernel is dispatched only for
+ * zero-prefix prefill chunks where the comp emissions visible to token t are
+ * exactly comp[0..(t+1)/ratio), all from this same chunk's compressor pass.
  * ========================================================================= */
 
 template <int block_size>
@@ -4049,6 +4053,7 @@ static __global__ void ds4_cuda_attention_prefill_static_mixed_kernel(
         uint32_t     n_tokens,
         uint32_t     n_comp,
         uint32_t     window,
+        uint32_t     ratio,
         uint32_t     n_head,
         uint32_t     head_dim,
         uint32_t     max_n_kv) {
@@ -4066,6 +4071,16 @@ static __global__ void ds4_cuda_attention_prefill_static_mixed_kernel(
 
     const uint32_t kv_start = (tok + 1u > window) ? (tok + 1u - window) : 0u;
     const uint32_t n_raw    = tok + 1u - kv_start;
+
+    /* Per-token causal comp visibility — mirrors ds4_metal.m:8831
+     * (static_mixed_prefill_mask: `n_visible = (q + 1) / ratio`).  When ratio
+     * is zero the dispatcher should not be sending us through static_mixed
+     * (Metal early-returns at ds4_metal.m:8854); we treat ratio==0 as "all
+     * visible" defensively so the kernel still produces a sensible answer
+     * for parity-test fixtures that don't simulate a compressor. */
+    const uint32_t n_visible = ratio == 0u
+        ? n_comp
+        : ((tok + 1u) / ratio < n_comp ? (tok + 1u) / ratio : n_comp);
 
     /* Phase 1a: raw rows in causal range. */
     uint32_t out_idx = 0;
@@ -4087,8 +4102,8 @@ static __global__ void ds4_cuda_attention_prefill_static_mixed_kernel(
     }
     const uint32_t n_raw_out = out_idx;
 
-    /* Phase 1b: compressed rows.  All n_comp visible (no top-k, no mask). */
-    for (uint32_t c = 0; c < n_comp; c++) {
+    /* Phase 1b: compressed rows up to per-token causal limit. */
+    for (uint32_t c = 0; c < n_visible; c++) {
         const float *kvr = comp_kv + (uint64_t)c * head_dim;
         float partial = 0.0f;
         for (uint32_t i = tid; i < head_dim; i += block_size) {
@@ -4142,7 +4157,7 @@ static __global__ void ds4_cuda_attention_prefill_static_mixed_kernel(
         for (uint32_t r = 0; r < n_raw_out; r++) {
             acc += score_shmem[r] * raw_kv[(uint64_t)(kv_start + r) * head_dim + i];
         }
-        for (uint32_t c = 0; c < n_comp; c++) {
+        for (uint32_t c = 0; c < n_visible; c++) {
             acc += score_shmem[n_raw_out + c] * comp_kv[(uint64_t)c * head_dim + i];
         }
         oh[i] = acc * inv_denom;
@@ -4165,7 +4180,6 @@ int ds4_cuda_attention_prefill_static_mixed_heads_tensor(
         uint32_t               ratio,
         uint32_t               n_head,
         uint32_t               head_dim) {
-    (void)ratio;
     if (!g_initialized && !ds4_cuda_init()) return 0;
     if (!g_batch_open) return 0;
     if (!model_map || !heads || !q || !raw_kv ||
@@ -4207,7 +4221,7 @@ int ds4_cuda_attention_prefill_static_mixed_heads_tensor(
             (const float *)raw_ptr,
             n_comp != 0u ? (const float *)comp_ptr : (const float *)NULL,
             sinks_ptr,
-            n_tokens, n_comp, window, n_head, head_dim, max_n_kv);
+            n_tokens, n_comp, window, ratio, n_head, head_dim, max_n_kv);
     return ds4_cuda_check(cudaGetLastError(), "launch attention_prefill_static_mixed");
 }
 

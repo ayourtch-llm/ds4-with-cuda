@@ -4073,6 +4073,10 @@ static int attn_prefill_static_mixed_cpu(const float *in, float *out, void *cfg)
     for (uint32_t t = 0; t < c->n_tokens; t++) {
         const uint32_t kv_start = (t + 1u > c->window) ? (t + 1u - c->window) : 0u;
         const uint32_t n_raw    = t + 1u - kv_start;
+        /* Per-token causal comp visibility — mirrors ds4_metal.m:8831. */
+        const uint32_t n_visible = c->ratio == 0u
+            ? c->n_comp
+            : ((t + 1u) / c->ratio < c->n_comp ? (t + 1u) / c->ratio : c->n_comp);
         size_t kv_count = 0;
         for (uint32_t r = 0; r < n_raw; r++) {
             memcpy(visible + kv_count * c->head_dim,
@@ -4080,7 +4084,7 @@ static int attn_prefill_static_mixed_cpu(const float *in, float *out, void *cfg)
                    (size_t)c->head_dim * sizeof(float));
             kv_count++;
         }
-        for (uint32_t cc = 0; cc < c->n_comp; cc++) {
+        for (uint32_t cc = 0; cc < n_visible; cc++) {
             memcpy(visible + kv_count * c->head_dim,
                    comp + (size_t)cc * c->head_dim,
                    (size_t)c->head_dim * sizeof(float));
@@ -4165,6 +4169,23 @@ DS4_CUDA_PARITY_TEST(attention_prefill_static_mixed_heads_windowed,
     .ulp_tolerance = 32,
     .cpu_fn = attn_prefill_static_mixed_cpu, .cuda_fn = attn_prefill_static_mixed_cuda,
     .cfg = (void *)&attn_prefill_static_mixed_windowed_cfg);
+
+/* Fixture C: ratio=4 causal comp truncation.  n_tokens=16, n_comp=8, ratio=4
+ * — token 0..3 see 0 comp; token 4..7 see 1 comp; token 8..11 see 2 comp;
+ * etc.  All distinct visibility regimes exercised in one fixture.  Without
+ * the ratio-based per-token visibility this fixture would diverge from the
+ * Metal mask semantics (and from the production prefill path). */
+static const struct attn_prefill_static_mixed_cfg attn_prefill_static_mixed_ratio_causal_cfg = {
+    .n_tokens=16, .n_head=2, .head_dim=128, .n_comp=8, .window=8, .ratio=4,
+};
+DS4_CUDA_PARITY_TEST(attention_prefill_static_mixed_heads_ratio_causal,
+    .seed = 0x57A73,
+    /* q(16*2*128=4096) + raw(16*128=2048) + comp(8*128=1024) + sinks(2) = 7170 */
+    .in_elems = 7170,
+    .out_elems = 16*2*128,
+    .ulp_tolerance = 32,
+    .cpu_fn = attn_prefill_static_mixed_cpu, .cuda_fn = attn_prefill_static_mixed_cuda,
+    .cfg = (void *)&attn_prefill_static_mixed_ratio_causal_cfg);
 
 /* ---------------------------------------------------------------------------
  * Phase 1.5b — HC Sinkhorn family (3 sequenced APIs, all DS4-original).
@@ -5760,6 +5781,7 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_attention_decode_heads_mask,
     &ds4_cuda_parity_attention_prefill_static_mixed_heads_unwindowed,
     &ds4_cuda_parity_attention_prefill_static_mixed_heads_windowed,
+    &ds4_cuda_parity_attention_prefill_static_mixed_heads_ratio_causal,
     &ds4_cuda_parity_output_hc_weights,
     &ds4_cuda_parity_hc_split_sinkhorn,
     &ds4_cuda_parity_hc_split_weighted_sum,
