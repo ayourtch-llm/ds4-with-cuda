@@ -124,6 +124,12 @@ int ds4_engine_cuda_test_vectors_test(ds4_engine *e, const char *vec_path);
  * allocator + ds4_session_create / _free CUDA dispatch.  Returns 0 on success. */
 int ds4_engine_cuda_session_test(ds4_engine *e, int ctx_size);
 
+/* Phase 3c-2 (single-token decode): create a CUDA session, call
+ * ds4_session_eval(token=0), and compare the resulting logits against the
+ * forward_first_token_cpu / output_logits_one CPU oracle.  Acceptance: top-1
+ * argmax match, top-8 overlap >= 6/8, top-1 logit relative error <= 1e-2. */
+int ds4_engine_cuda_session_eval_test(ds4_engine *e, int ctx_size);
+
 void ds4_tokens_push(ds4_tokens *tv, int token);
 void ds4_tokens_free(ds4_tokens *tv);
 void ds4_tokens_copy(ds4_tokens *dst, const ds4_tokens *src);

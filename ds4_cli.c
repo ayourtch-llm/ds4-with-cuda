@@ -44,6 +44,7 @@ typedef struct {
     const char *cuda_test_vectors_path;  /* NULL unless --cuda-test-vectors */
     bool cuda_test_vectors;
     bool cuda_session_test;
+    bool cuda_session_eval_test;
 } cli_generation_options;
 
 typedef struct {
@@ -1254,6 +1255,9 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--cuda-session-test")) {
             c.gen.cuda_session_test = true;
             c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--cuda-session-eval-test")) {
+            c.gen.cuda_session_eval_test = true;
+            c.engine.backend = DS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logprobs")) {
@@ -1317,6 +1321,8 @@ int main(int argc, char **argv) {
         /* No prompt required; the smoke test only exercises ds4_session_create
          * / _free for the CUDA backend.  Bypass run_repl / run_generation. */
         rc = ds4_engine_cuda_session_test(engine, cfg.gen.ctx_size);
+    } else if (cfg.gen.cuda_session_eval_test) {
+        rc = ds4_engine_cuda_session_eval_test(engine, cfg.gen.ctx_size);
     } else if (cfg.gen.prompt == NULL) {
         rc = run_repl(engine, &cfg);
     } else {

@@ -14276,6 +14276,242 @@ static uint32_t cuda_graph_prefill_cap_for_prompt(int prompt_len) {
     return (uint32_t)prompt_len;
 }
 
+/* Single-token decode through the CUDA session graph.  Mirrors Metal's
+ * metal_graph_eval_token_raw_swa: read prior KV state from the persistent
+ * per-layer caches, embed `token`, run 43 layers + output head, write the new
+ * KV row at row = pos % raw_cap, write logits[DS4_N_VOCAB] into logits_out.
+ *
+ * Phase 3c-2 scope: pos=0 first-token decode (validated against
+ * forward_first_token_cpu).  For pos>0 the chain still runs raw-only
+ * attention with n_raw=pos+1 — correct as long as pos < raw_window AND no
+ * ratio!=0 layer needs compressed attention (no compressor calls landed yet).
+ *
+ * TODO 3c-3: wire compressor_update_tensor for ratio!=0 layers and switch to
+ * mixed-attention reads when g->layer_n_comp[il] > 0; handle ring-wrap
+ * (raw_start) when pos+1 > raw_window.
+ *
+ * TODO 3b: when batched-attention CUDA kernels land, prefill orchestration
+ * may call this function in a per-token loop -- that loop is the body-swap
+ * site for a future cuda_graph_prefill_chunked using batched kernels. */
+static bool cuda_graph_eval_token_raw_swa(
+        ds4_cuda_graph    *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           token,
+        uint32_t           pos,
+        float             *logits_out) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t expert_in_dim_g  = weights->layer[0].ffn_gate_exps->dim[0];
+    const uint64_t expert_mid_dim_g = weights->layer[0].ffn_gate_exps->dim[1];
+    const uint64_t down_in_dim_g    = weights->layer[0].ffn_down_exps->dim[0];
+    const uint64_t routed_out_dim_g = weights->layer[0].ffn_down_exps->dim[1];
+    const uint64_t shared_dim_g     = weights->layer[0].ffn_gate_shexp->dim[1];
+    (void)expert_mid_dim_g;
+
+    /* SWA window math.  3c-2 scope keeps raw_start=0 because pos < raw_window;
+     * 3c-3 will compute a ring-relative raw_start when the SWA wraps. */
+    const uint32_t row = pos % g->raw_cap;
+    uint32_t n_raw = pos + 1u;
+    if (n_raw > g->raw_window) n_raw = g->raw_window;
+    /* TODO 3c-3: const uint32_t raw_start = (pos + 1u > g->raw_window)
+     *     ? (row + g->raw_cap - g->raw_window + 1u) % g->raw_cap : 0u; */
+    const uint32_t raw_start = 0u;
+
+    /* Embed token into cur_hc. */
+    int ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_embed_token_hc_tensor(
+                    g->cur_hc, model->map, model->size,
+                    weights->token_embd->abs_offset,
+                    DS4_N_VOCAB, token, DS4_N_EMBD, DS4_N_HC);
+    if (ok) ok = ds4_cuda_end_commands();
+    if (!ok) return false;
+
+    /* Local cur/nxt aliases for HC ping-pong; they alternate between
+     * g->cur_hc and g->next_hc each layer.  After 43 swaps, cur points to
+     * whichever buffer holds the post-block-42 HC stream — the output head
+     * reads through `cur` directly without copying. */
+    ds4_cuda_tensor *cur = g->cur_hc;
+    ds4_cuda_tensor *nxt = g->next_hc;
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *L = &weights->layer[il];
+        const float fb  = layer_rope_freq_base(il);
+        const float fs  = layer_rope_freq_scale(il);
+        const bool  cmp = ds4_layer_compress_ratio(il) != 0;
+        const float ef  = cmp && DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
+        float       af  = 1.0f;
+        if (ef != 0.0f && fs > 0.0f) af /= 1.0f + 0.1f * logf(1.0f / fs);
+        const uint32_t nco = (uint32_t)(cmp ? DS4_ROPE_ORIG_CTX : 0);
+        const uint64_t gate_row_b    = routed_expert_row_bytes(L->ffn_gate_exps);
+        const uint64_t gate_expert_b = expert_mid_dim_g * gate_row_b;
+        const uint64_t down_row_b    = routed_expert_row_bytes(L->ffn_down_exps);
+        const uint64_t down_expert_b = routed_out_dim_g * down_row_b;
+        const bool     hbias = L->ffn_exp_probs_b != NULL;
+        const bool     hhash = L->ffn_gate_tid2eid != NULL;
+        const uint64_t boff  = hbias ? L->ffn_exp_probs_b->abs_offset : 0;
+        const uint64_t hoff  = hhash ? L->ffn_gate_tid2eid->abs_offset : 0;
+        const uint32_t hrows = hhash ? (uint32_t)L->ffn_gate_tid2eid->dim[1] : 0;
+
+        /* TODO 3c-3: for ratio!=0 layers, read g->layer_n_comp[il] and pass it
+         * to attention_decode_heads as n_comp; before that, call
+         * ds4_cuda_compressor_update_tensor and (for ratio==4) the indexer
+         * top-k chain to populate g->layer_attn_comp_cache and the indexer
+         * mask.  3c-2 leaves n_comp=0 — correct only at pos=0 where no
+         * compressed rows have been emitted yet. */
+        const uint32_t n_comp = 0u;
+
+        ok = ds4_cuda_begin_commands();
+        if (ok) ok = ds4_cuda_rms_norm_plain_tensor(g->flat_hc, cur,
+                                                     (uint32_t)hc_dim, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_matmul_f16_tensor(g->hc_mix, model->map, model->size,
+                                                 L->hc_attn_fn->abs_offset,
+                                                 hc_dim, mix_dim, g->flat_hc, 1u);
+        if (ok) ok = ds4_cuda_hc_split_weighted_sum_norm_tensor(
+                        g->attn_cur, g->attn_norm, g->hc_split, g->hc_mix, cur,
+                        model->map, model->size,
+                        L->hc_attn_scale->abs_offset, L->hc_attn_base->abs_offset,
+                        L->attn_norm->abs_offset, DS4_N_EMBD, DS4_N_HC,
+                        DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_matmul_q8_0_tensor(g->qr, model->map, model->size,
+                                                  L->attn_q_a->abs_offset,
+                                                  DS4_N_EMBD, DS4_N_LORA_O, g->attn_norm, 1u);
+        if (ok) ok = ds4_cuda_rms_norm_weight_tensor(g->qr_norm, g->qr,
+                                                     model->map, model->size,
+                                                     L->attn_q_a_norm->abs_offset,
+                                                     DS4_N_LORA_O, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_matmul_q8_0_tensor(g->q, model->map, model->size,
+                                                  L->attn_q_b->abs_offset,
+                                                  DS4_N_LORA_O, q_dim, g->qr_norm, 1u);
+        if (ok) ok = ds4_cuda_head_rms_norm_tensor(g->q, 1u, DS4_N_HEAD,
+                                                    DS4_N_HEAD_DIM, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
+                                                  L->attn_kv->abs_offset,
+                                                  DS4_N_EMBD, kv_dim, g->attn_norm, 1u);
+        if (ok) ok = ds4_cuda_rms_norm_weight_tensor(g->kv, g->kv_raw,
+                                                     model->map, model->size,
+                                                     L->attn_kv_a_norm->abs_offset,
+                                                     (uint32_t)kv_dim, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_rope_tail_tensor(g->q, 1u, DS4_N_HEAD,
+                                                DS4_N_HEAD_DIM, DS4_N_ROT,
+                                                pos, nco, false, fb, fs, ef, af,
+                                                DS4_ROPE_YARN_BETA_FAST,
+                                                DS4_ROPE_YARN_BETA_SLOW);
+        if (ok) ok = ds4_cuda_rope_tail_tensor(g->kv, 1u, DS4_N_HEAD_KV,
+                                                DS4_N_HEAD_DIM, DS4_N_ROT,
+                                                pos, nco, false, fb, fs, ef, af,
+                                                DS4_ROPE_YARN_BETA_FAST,
+                                                DS4_ROPE_YARN_BETA_SLOW);
+        /* fp8_kv_store_raw modifies kv's NOPE prefix in-place to its FP8
+         * round-trip and writes the F16-rounded full row to layer_raw_cache. */
+        if (ok) ok = ds4_cuda_kv_fp8_store_raw_tensor(g->kv, g->layer_raw_cache[il],
+                                                       g->raw_cap, row,
+                                                       DS4_N_HEAD_DIM, DS4_N_ROT);
+        /* comp_kv_cur and comp_mask are passed even when n_comp=0 because the
+         * attention kernel requires non-NULL pointers; their content is
+         * unread when n_comp=0. */
+        if (ok) ok = ds4_cuda_attention_decode_heads_tensor(
+                        g->heads, model->map, model->size,
+                        L->attn_sinks->abs_offset, g->q, g->layer_raw_cache[il],
+                        n_raw, g->raw_cap, raw_start,
+                        g->comp_kv_cur, n_comp, g->comp_mask, 0u,
+                        DS4_N_HEAD, DS4_N_HEAD_DIM);
+        if (ok) ok = ds4_cuda_rope_tail_tensor(g->heads, 1u, DS4_N_HEAD,
+                                                DS4_N_HEAD_DIM, DS4_N_ROT,
+                                                pos, nco, true, fb, fs, ef, af,
+                                                DS4_ROPE_YARN_BETA_FAST,
+                                                DS4_ROPE_YARN_BETA_SLOW);
+        if (ok) ok = ds4_cuda_attention_output_q8_batch_tensor(
+                        g->attn_out, g->attn_low, g->attn_group_tmp, g->attn_low_tmp,
+                        model->map, model->size,
+                        L->attn_output_a->abs_offset, L->attn_output_b->abs_offset,
+                        4096u, 1024u, 8u, DS4_N_EMBD, g->heads, 1u);
+        if (ok) ok = ds4_cuda_hc_expand_tensor(g->after_attn_hc, g->attn_out, cur,
+                                                g->hc_post, g->hc_comb,
+                                                DS4_N_EMBD, DS4_N_HC);
+        if (ok) ok = ds4_cuda_rms_norm_plain_tensor(g->ffn_flat, g->after_attn_hc,
+                                                     (uint32_t)hc_dim, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_matmul_f16_tensor(g->ffn_mix, model->map, model->size,
+                                                 L->hc_ffn_fn->abs_offset,
+                                                 hc_dim, mix_dim, g->ffn_flat, 1u);
+        if (ok) ok = ds4_cuda_hc_split_weighted_sum_norm_tensor(
+                        g->ffn_cur, g->ffn_norm, g->ffn_split, g->ffn_mix,
+                        g->after_attn_hc, model->map, model->size,
+                        L->hc_ffn_scale->abs_offset, L->hc_ffn_base->abs_offset,
+                        L->ffn_norm->abs_offset, DS4_N_EMBD, DS4_N_HC,
+                        DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_matmul_f16_tensor(g->router_logits, model->map, model->size,
+                                                 L->ffn_gate_inp->abs_offset,
+                                                 DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1u);
+        if (ok) ok = ds4_cuda_router_select_tensor(
+                        g->router_selected, g->router_weights, g->router_probs,
+                        model->map, model->size,
+                        boff, hoff, hrows, token,
+                        0u, 0u, hbias, hhash, g->router_logits);
+        if (ok) ok = ds4_cuda_routed_moe_one_tensor(
+                        g->routed_out, g->routed_gate, g->routed_up,
+                        g->routed_mid, g->routed_down,
+                        model->map, model->size,
+                        L->ffn_gate_exps->abs_offset, L->ffn_up_exps->abs_offset,
+                        L->ffn_down_exps->abs_offset,
+                        L->ffn_gate_exps->type, L->ffn_down_exps->type,
+                        gate_expert_b, gate_row_b, down_expert_b, down_row_b,
+                        (uint32_t)expert_in_dim_g, (uint32_t)down_in_dim_g,
+                        (uint32_t)routed_out_dim_g,
+                        g->router_selected, g->router_weights,
+                        DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm);
+        if (ok) ok = ds4_cuda_shared_gate_up_swiglu_q8_0_tensor(
+                        g->shared_gate, g->shared_up, g->shared_mid,
+                        model->map, model->size,
+                        L->ffn_gate_shexp->abs_offset, L->ffn_up_shexp->abs_offset,
+                        DS4_N_EMBD, shared_dim_g, g->ffn_norm);
+        if (ok) ok = ds4_cuda_shared_down_hc_expand_q8_0_tensor(
+                        nxt, g->shared_out, model->map, model->size,
+                        L->ffn_down_shexp->abs_offset,
+                        shared_dim_g, DS4_N_EMBD,
+                        g->shared_mid, g->routed_out, g->after_attn_hc,
+                        g->ffn_split, DS4_N_EMBD, DS4_N_HC);
+        if (ok) ok = ds4_cuda_end_commands();
+        if (!ok) return false;
+
+        ds4_cuda_tensor *tmp = cur; cur = nxt; nxt = tmp;
+    }
+
+    /* Output head: HC reduce -> rms -> vocab matmul. */
+    int oh_ok = ds4_cuda_begin_commands();
+    if (oh_ok) oh_ok = ds4_cuda_rms_norm_plain_tensor(g->output_flat, cur,
+                                                       (uint32_t)hc_dim, DS4_RMS_EPS);
+    if (oh_ok) oh_ok = ds4_cuda_matmul_f16_tensor(g->output_pre, model->map, model->size,
+                                                   weights->output_hc_fn->abs_offset,
+                                                   hc_dim, DS4_N_HC, g->output_flat, 1u);
+    if (oh_ok) oh_ok = ds4_cuda_output_hc_weights_tensor(
+                        g->output_weights, g->output_pre, model->map, model->size,
+                        weights->output_hc_scale->abs_offset,
+                        weights->output_hc_base->abs_offset,
+                        DS4_N_HC, DS4_HC_EPS);
+    if (oh_ok) oh_ok = ds4_cuda_hc_weighted_sum_tensor(g->output_embd, cur,
+                                                       g->output_weights,
+                                                       DS4_N_EMBD, DS4_N_HC);
+    if (oh_ok) oh_ok = ds4_cuda_rms_norm_weight_tensor(g->output_norm, g->output_embd,
+                                                       model->map, model->size,
+                                                       weights->output_norm->abs_offset,
+                                                       DS4_N_EMBD, DS4_RMS_EPS);
+    if (oh_ok) oh_ok = ds4_cuda_matmul_q8_0_tensor(g->logits, model->map, model->size,
+                                                    weights->output->abs_offset,
+                                                    DS4_N_EMBD, DS4_N_VOCAB,
+                                                    g->output_norm, 1u);
+    if (oh_ok) oh_ok = ds4_cuda_end_commands();
+    if (!oh_ok) return false;
+
+    if (!ds4_cuda_tensor_read(g->logits, 0, logits_out,
+                              (size_t)DS4_N_VOCAB * sizeof(float))) {
+        return false;
+    }
+    return true;
+}
+
 #endif /* DS4_USE_CUDA */
 
 typedef struct ds4_vocab ds4_vocab;
@@ -18453,6 +18689,127 @@ int ds4_engine_cuda_session_test(ds4_engine *e, int ctx_size) {
 #endif
 }
 
+/* Phase 3c-2: end-to-end single-token decode through ds4_session_eval, with
+ * a CPU-oracle parity check.  Creates a fresh CUDA session at the requested
+ * ctx_size, calls ds4_session_eval(token=0) so pos goes 0 -> 1, then compares
+ * s->logits against forward_first_token_cpu(0) -> output_logits_one.
+ *
+ * Acceptance gate matches 2.1c-4: top-1 argmax MUST match (greedy semantic
+ * agreement), top-8 overlap >= 6/8 (one tie-break tolerance), and the top-1
+ * logit relative error <= 1e-2 (1%).  The 2.1c-5 chain reports 92% top-1 over
+ * 13 token positions; a single-token gate is stricter to confirm the session
+ * graph wires the same chain. */
+int ds4_engine_cuda_session_eval_test(ds4_engine *e, int ctx_size) {
+#ifndef DS4_USE_CUDA
+    (void)e;
+    (void)ctx_size;
+    fprintf(stderr, "ds4: cuda_session_eval_test requires a build with DS4_USE_CUDA\n");
+    return 1;
+#else
+    if (!e->cuda_ready) {
+        fprintf(stderr, "ds4: cuda_session_eval_test requires the CUDA backend\n");
+        return 1;
+    }
+    if (ctx_size <= 0) ctx_size = 4096;
+    const int test_token = 0;  /* Token 0 is BOS in DS4's vocab. */
+
+    fprintf(stderr,
+            "ds4: cuda_session_eval_test ctx=%d token=%d\n",
+            ctx_size, test_token);
+
+    ds4_session *s = NULL;
+    if (ds4_session_create(&s, e, ctx_size) != 0) {
+        fprintf(stderr, "ds4: cuda_session_eval_test failed to create session\n");
+        return 1;
+    }
+
+    char eval_err[256] = {0};
+    if (ds4_session_eval(s, test_token, eval_err, sizeof(eval_err)) != 0) {
+        fprintf(stderr,
+                "ds4: cuda_session_eval_test ds4_session_eval failed: %s\n",
+                eval_err);
+        ds4_session_free(s);
+        return 1;
+    }
+
+    /* CPU oracle: forward_first_token_cpu + output_logits_one. */
+    float *cpu_final_hc = xmalloc((size_t)DS4_N_HC * DS4_N_EMBD *
+                                  sizeof(cpu_final_hc[0]));
+    float *cpu_logits   = xmalloc((size_t)DS4_N_VOCAB * sizeof(cpu_logits[0]));
+    forward_first_token_cpu(cpu_final_hc, &e->model, &e->weights, test_token);
+    output_logits_one(cpu_logits, &e->model, &e->weights, cpu_final_hc);
+
+    /* Top-K extraction (K=8) for both. */
+    const int K = 8;
+    int   cpu_top_id[8];
+    float cpu_top_logit[8];
+    int   cuda_top_id[8];
+    float cuda_top_logit[8];
+    for (int k = 0; k < K; k++) {
+        cpu_top_id[k] = -1; cpu_top_logit[k] = DS4_NEG_INF;
+        cuda_top_id[k] = -1; cuda_top_logit[k] = DS4_NEG_INF;
+    }
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        const float vc = cpu_logits[i];
+        const float vd = s->logits[i];
+        for (int k = 0; k < K; k++) {
+            if (cpu_top_id[k] < 0 || vc > cpu_top_logit[k]) {
+                for (int l = K - 1; l > k; l--) {
+                    cpu_top_id[l] = cpu_top_id[l - 1];
+                    cpu_top_logit[l] = cpu_top_logit[l - 1];
+                }
+                cpu_top_id[k] = (int)i; cpu_top_logit[k] = vc; break;
+            }
+        }
+        for (int k = 0; k < K; k++) {
+            if (cuda_top_id[k] < 0 || vd > cuda_top_logit[k]) {
+                for (int l = K - 1; l > k; l--) {
+                    cuda_top_id[l] = cuda_top_id[l - 1];
+                    cuda_top_logit[l] = cuda_top_logit[l - 1];
+                }
+                cuda_top_id[k] = (int)i; cuda_top_logit[k] = vd; break;
+            }
+        }
+    }
+
+    int overlap = 0;
+    for (int i = 0; i < K; i++) {
+        for (int j = 0; j < K; j++) {
+            if (cpu_top_id[i] >= 0 && cpu_top_id[i] == cuda_top_id[j]) {
+                overlap++; break;
+            }
+        }
+    }
+
+    const bool top1_match = (cpu_top_id[0] == cuda_top_id[0]);
+    const float t1_cpu = cpu_top_logit[0];
+    const float t1_cuda = (cpu_top_id[0] >= 0) ? s->logits[cpu_top_id[0]] : DS4_NEG_INF;
+    const float t1_abserr = fabsf(t1_cpu - t1_cuda);
+    const float t1_relerr = t1_abserr / (fabsf(t1_cpu) > 1.0f ? fabsf(t1_cpu) : 1.0f);
+
+    fprintf(stderr,
+            "ds4: cuda_session_eval_test top1 cpu=%d (logit=%.4f) cuda=%d (logit=%.4f) match=%d\n",
+            cpu_top_id[0], t1_cpu, cuda_top_id[0], cuda_top_logit[0], top1_match ? 1 : 0);
+    fprintf(stderr,
+            "ds4: cuda_session_eval_test top1_logit_at_cpu_id abserr=%.3e relerr=%.3e overlap=%d/%d\n",
+            t1_abserr, t1_relerr, overlap, K);
+    fprintf(stderr,
+            "ds4: cuda_session_eval_test post-eval pos=%d tokens.len=%d\n",
+            ds4_session_pos(s), ds4_session_tokens(s)->len);
+
+    free(cpu_logits);
+    free(cpu_final_hc);
+    ds4_session_free(s);
+
+    const bool pass = top1_match && (overlap >= 6) && (t1_relerr <= 1.0e-2f);
+    fprintf(stderr,
+            "ds4: cuda_session_eval_test %s (top1_match=%d overlap>=6 relerr<=1e-2)\n",
+            pass ? "PASS" : "FAIL",
+            top1_match ? 1 : 0);
+    return pass ? 0 : 1;
+#endif
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -18860,6 +19217,23 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
+#ifdef DS4_USE_CUDA
+    if (s->engine->backend == DS4_BACKEND_CUDA) {
+        (void)probe_mtp;  /* MTP/spec deferred from Phase 3c. */
+        if (!cuda_graph_eval_token_raw_swa(&s->cuda_graph,
+                                           &s->engine->model, &s->engine->weights,
+                                           (uint32_t)token,
+                                           (uint32_t)s->checkpoint.len,
+                                           s->logits))
+        {
+            snprintf(err, errlen, "CUDA decode failed");
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        return 0;
+    }
+#endif
 #ifdef DS4_NO_METAL
     (void)s;
     (void)token;
