@@ -109,6 +109,10 @@ static ds4_cuda_block_q8_K *g_scratch_routed_moe_xq;
 static size_t               g_scratch_routed_moe_xq_bytes;
 static ds4_cuda_block_q8_K *g_scratch_routed_moe_midq;
 static size_t               g_scratch_routed_moe_midq_bytes;
+static int8_t *g_scratch_attention_output_low_q8_heads_q;
+static size_t  g_scratch_attention_output_low_q8_heads_q_bytes;
+static float  *g_scratch_attention_output_low_q8_heads_scale;
+static size_t  g_scratch_attention_output_low_q8_heads_scale_bytes;
 
 static int ds4_cuda_check(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
@@ -1132,6 +1136,10 @@ void ds4_cuda_cleanup(void) {
                           &g_scratch_routed_moe_midq_bytes);
     ds4_cuda_scratch_free((void **)&g_scratch_routed_moe_xq,
                           &g_scratch_routed_moe_xq_bytes);
+    ds4_cuda_scratch_free((void **)&g_scratch_attention_output_low_q8_heads_scale,
+                          &g_scratch_attention_output_low_q8_heads_scale_bytes);
+    ds4_cuda_scratch_free((void **)&g_scratch_attention_output_low_q8_heads_q,
+                          &g_scratch_attention_output_low_q8_heads_q_bytes);
     if (g_stream) {
         (void)cudaStreamDestroy(g_stream);
         g_stream = NULL;
@@ -1982,18 +1990,27 @@ static int ds4_cuda_attention_output_low_q8_launch(
     }
 
     const uint64_t qrows = (uint64_t)n_tokens * n_groups;
-    int8_t *heads_q = NULL;
-    float *heads_scale = NULL;
-    if (!ds4_cuda_check(cudaMallocManaged((void **)&heads_q, (size_t)qrows * blocks * 32u),
-                        "attention output low q allocation")) return 0;
-    if (!ds4_cuda_check(cudaMallocManaged((void **)&heads_scale, (size_t)qrows * blocks * sizeof(*heads_scale)),
-                        "attention output low scale allocation")) {
-        (void)cudaFree(heads_q);
+    const uint64_t heads_q_bytes = qrows * blocks * 32u;
+    const uint64_t heads_scale_bytes =
+        qrows * blocks * sizeof(*g_scratch_attention_output_low_q8_heads_scale);
+    if (heads_q_bytes > SIZE_MAX || heads_scale_bytes > SIZE_MAX) return 0;
+    if (!ds4_cuda_scratch_reserve((void **)&g_scratch_attention_output_low_q8_heads_q,
+                                  &g_scratch_attention_output_low_q8_heads_q_bytes,
+                                  (size_t)heads_q_bytes,
+                                  "attention output low q scratch allocation") ||
+        !ds4_cuda_scratch_reserve((void **)&g_scratch_attention_output_low_q8_heads_scale,
+                                  &g_scratch_attention_output_low_q8_heads_scale_bytes,
+                                  (size_t)heads_scale_bytes,
+                                  "attention output low scale scratch allocation")) {
         return 0;
     }
 
     ds4_cuda_quantize_q8_0_activation_kernel<<<(uint32_t)qrows, 1, 0, g_stream>>>(
-        (const float *)heads_ptr, heads_q, heads_scale, (uint32_t)group_dim, (uint32_t)qrows);
+        (const float *)heads_ptr,
+        g_scratch_attention_output_low_q8_heads_q,
+        g_scratch_attention_output_low_q8_heads_scale,
+        (uint32_t)group_dim,
+        (uint32_t)qrows);
     int ok = ds4_cuda_check(cudaGetLastError(), "launch attention output low input quantize");
     const ds4_cuda_block_q8_0 *weights = NULL;
     if (ok) {
@@ -2004,13 +2021,13 @@ static int ds4_cuda_attention_output_low_q8_launch(
     }
     if (ok) {
         ds4_cuda_attention_output_low_q8_kernel<<<dim3((uint32_t)rank, n_groups, n_tokens), 1, 0, g_stream>>>(
-            weights, heads_q, heads_scale, (float *)low_ptr,
+            weights,
+            g_scratch_attention_output_low_q8_heads_q,
+            g_scratch_attention_output_low_q8_heads_scale,
+            (float *)low_ptr,
             (uint32_t)group_dim, (uint32_t)rank, n_groups, n_tokens);
         ok = ds4_cuda_check(cudaGetLastError(), "launch attention output low q8");
     }
-    if (ok) ok = ds4_cuda_check(cudaStreamSynchronize(g_stream), "attention output low scratch lifetime");
-    (void)cudaFree(heads_scale);
-    (void)cudaFree(heads_q);
     return ok;
 }
 
