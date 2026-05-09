@@ -105,6 +105,10 @@ static int8_t *g_scratch_q8_0_hc_expand_xq;
 static size_t  g_scratch_q8_0_hc_expand_xq_bytes;
 static float  *g_scratch_q8_0_hc_expand_xscale;
 static size_t  g_scratch_q8_0_hc_expand_xscale_bytes;
+static ds4_cuda_block_q8_K *g_scratch_routed_moe_xq;
+static size_t               g_scratch_routed_moe_xq_bytes;
+static ds4_cuda_block_q8_K *g_scratch_routed_moe_midq;
+static size_t               g_scratch_routed_moe_midq_bytes;
 
 static int ds4_cuda_check(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
@@ -1124,6 +1128,10 @@ void ds4_cuda_cleanup(void) {
                           &g_scratch_q8_0_hc_expand_xscale_bytes);
     ds4_cuda_scratch_free((void **)&g_scratch_q8_0_hc_expand_xq,
                           &g_scratch_q8_0_hc_expand_xq_bytes);
+    ds4_cuda_scratch_free((void **)&g_scratch_routed_moe_midq,
+                          &g_scratch_routed_moe_midq_bytes);
+    ds4_cuda_scratch_free((void **)&g_scratch_routed_moe_xq,
+                          &g_scratch_routed_moe_xq_bytes);
     if (g_stream) {
         (void)cudaStreamDestroy(g_stream);
         g_stream = NULL;
@@ -2286,11 +2294,17 @@ static int ds4_cuda_routed_moe_impl(
 
     const uint32_t xq_blocks = expert_in_dim / 256u;
     const uint32_t midq_blocks = expert_mid_dim / 256u;
-    ds4_cuda_block_q8_K *xq = NULL;
-    ds4_cuda_block_q8_K *midq = NULL;
-    if (!ds4_cuda_check(cudaMallocManaged(&xq, (size_t)n_tokens * xq_blocks * sizeof(*xq)), "routed MoE xq allocation")) return 0;
-    if (!ds4_cuda_check(cudaMallocManaged(&midq, (size_t)pair_rows * midq_blocks * sizeof(*midq)), "routed MoE midq allocation")) {
-        (void)cudaFree(xq);
+    const uint64_t xq_bytes = (uint64_t)n_tokens * xq_blocks * sizeof(*g_scratch_routed_moe_xq);
+    const uint64_t midq_bytes = pair_rows * midq_blocks * sizeof(*g_scratch_routed_moe_midq);
+    if (xq_bytes > SIZE_MAX || midq_bytes > SIZE_MAX) return 0;
+    if (!ds4_cuda_scratch_reserve((void **)&g_scratch_routed_moe_xq,
+                                  &g_scratch_routed_moe_xq_bytes,
+                                  (size_t)xq_bytes,
+                                  "routed MoE xq scratch allocation") ||
+        !ds4_cuda_scratch_reserve((void **)&g_scratch_routed_moe_midq,
+                                  &g_scratch_routed_moe_midq_bytes,
+                                  (size_t)midq_bytes,
+                                  "routed MoE midq scratch allocation")) {
         return 0;
     }
 
@@ -2302,11 +2316,11 @@ static int ds4_cuda_routed_moe_impl(
         (const ds4_cuda_block_q2_K *)((const uint8_t *)model_map + down_offset);
 
     ds4_cuda_quantize_rows_q8_K_kernel<<<n_tokens, 1, 0, g_stream>>>(
-        (const float *)x_ptr, xq, expert_in_dim, n_tokens);
+        (const float *)x_ptr, g_scratch_routed_moe_xq, expert_in_dim, n_tokens);
     int ok = ds4_cuda_check(cudaGetLastError(), "launch routed MoE input quantize");
     if (ok) {
         ds4_cuda_routed_moe_mid_iq2_xxs_kernel<<<dim3(expert_mid_dim, (uint32_t)pair_rows, 1), 1, 0, g_stream>>>(
-            gate_w, up_w, xq,
+            gate_w, up_w, g_scratch_routed_moe_xq,
             (const int32_t *)selected_ptr,
             (const float *)weights_ptr,
             (float *)gate_ptr,
@@ -2323,13 +2337,16 @@ static int ds4_cuda_routed_moe_impl(
     }
     if (ok) {
         ds4_cuda_quantize_rows_q8_K_kernel<<<(uint32_t)pair_rows, 1, 0, g_stream>>>(
-            (const float *)mid_ptr, midq, expert_mid_dim, (uint32_t)pair_rows);
+            (const float *)mid_ptr,
+            g_scratch_routed_moe_midq,
+            expert_mid_dim,
+            (uint32_t)pair_rows);
         ok = ds4_cuda_check(cudaGetLastError(), "launch routed MoE mid quantize");
     }
     if (ok) {
         ds4_cuda_routed_moe_down_q2_k_kernel<<<dim3(out_dim, n_tokens, 1), 1, 0, g_stream>>>(
             down_w,
-            midq,
+            g_scratch_routed_moe_midq,
             (const int32_t *)selected_ptr,
             (float *)experts_ptr,
             (float *)out_ptr,
@@ -2342,9 +2359,6 @@ static int ds4_cuda_routed_moe_impl(
         ok = ds4_cuda_check(cudaGetLastError(), "launch routed MoE down");
     }
 
-    if (ok) ok = ds4_cuda_check(cudaStreamSynchronize(g_stream), "routed MoE scratch lifetime");
-    (void)cudaFree(midq);
-    (void)cudaFree(xq);
     return ok;
 }
 
