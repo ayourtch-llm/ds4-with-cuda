@@ -93,6 +93,11 @@ static uint64_t g_model_register_bytes;
 static uint64_t g_kernel_stub_calls;
 static int g_kernel_stub_warned;
 
+static int8_t *g_scratch_matmul_q8_0_xq;
+static size_t  g_scratch_matmul_q8_0_xq_bytes;
+static float  *g_scratch_matmul_q8_0_xscale;
+static size_t  g_scratch_matmul_q8_0_xscale_bytes;
+
 static int ds4_cuda_check(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
     fprintf(stderr, "ds4: CUDA %s failed: %s\n", what, cudaGetErrorString(err));
@@ -111,6 +116,25 @@ static int ds4_cuda_get_device_attr(cudaDeviceAttr attr) {
 
 static double ds4_cuda_mib(uint64_t bytes) {
     return (double)bytes / (1024.0 * 1024.0);
+}
+
+static int ds4_cuda_scratch_reserve(void **ptr, size_t *cap, size_t bytes, const char *label) {
+    if (bytes <= *cap) return 1;
+    if (*ptr) {
+        if (!ds4_cuda_check(cudaStreamSynchronize(g_stream), label)) return 0;
+        (void)cudaFree(*ptr);
+        *ptr = NULL;
+        *cap = 0;
+    }
+    if (!ds4_cuda_check(cudaMallocManaged(ptr, bytes), label)) return 0;
+    *cap = bytes;
+    return 1;
+}
+
+static void ds4_cuda_scratch_free(void **ptr, size_t *cap) {
+    if (*ptr) (void)cudaFree(*ptr);
+    *ptr = NULL;
+    *cap = 0;
 }
 
 static int ds4_cuda_trace_allocs(void) {
@@ -1080,6 +1104,10 @@ void ds4_cuda_cleanup(void) {
     (void)cudaStreamSynchronize(g_stream);
     ds4_cuda_clear_pending_events();
     ds4_cuda_unregister_model();
+    ds4_cuda_scratch_free((void **)&g_scratch_matmul_q8_0_xscale,
+                          &g_scratch_matmul_q8_0_xscale_bytes);
+    ds4_cuda_scratch_free((void **)&g_scratch_matmul_q8_0_xq,
+                          &g_scratch_matmul_q8_0_xq_bytes);
     if (g_stream) {
         (void)cudaStreamDestroy(g_stream);
         g_stream = NULL;
@@ -1580,16 +1608,23 @@ int ds4_cuda_matmul_q8_0_tensor(
         return 0;
     }
 
-    int8_t *xq = NULL;
-    float *xscale = NULL;
-    if (!ds4_cuda_check(cudaMallocManaged((void **)&xq, (size_t)n_tok * blocks * 32u), "matmul q8_0 xq allocation")) return 0;
-    if (!ds4_cuda_check(cudaMallocManaged((void **)&xscale, (size_t)n_tok * blocks * sizeof(*xscale)), "matmul q8_0 scale allocation")) {
-        (void)cudaFree(xq);
+    const uint64_t xq_bytes = n_tok * blocks * 32u;
+    const uint64_t xscale_bytes = n_tok * blocks * sizeof(*g_scratch_matmul_q8_0_xscale);
+    if (xq_bytes > SIZE_MAX || xscale_bytes > SIZE_MAX) return 0;
+    if (!ds4_cuda_scratch_reserve((void **)&g_scratch_matmul_q8_0_xq,
+                                  &g_scratch_matmul_q8_0_xq_bytes,
+                                  (size_t)xq_bytes,
+                                  "matmul q8_0 xq scratch allocation") ||
+        !ds4_cuda_scratch_reserve((void **)&g_scratch_matmul_q8_0_xscale,
+                                  &g_scratch_matmul_q8_0_xscale_bytes,
+                                  (size_t)xscale_bytes,
+                                  "matmul q8_0 scale scratch allocation")) {
         return 0;
     }
 
     ds4_cuda_quantize_q8_0_activation_kernel<<<(uint32_t)n_tok, 1, 0, g_stream>>>(
-        (const float *)x_ptr, xq, xscale, (uint32_t)in_dim, (uint32_t)n_tok);
+        (const float *)x_ptr, g_scratch_matmul_q8_0_xq, g_scratch_matmul_q8_0_xscale,
+        (uint32_t)in_dim, (uint32_t)n_tok);
     int ok = ds4_cuda_check(cudaGetLastError(), "launch matmul q8_0 input quantize");
     const ds4_cuda_block_q8_0 *weights = NULL;
     if (ok) {
@@ -1599,12 +1634,15 @@ int ds4_cuda_matmul_q8_0_tensor(
     }
     if (ok) {
         ds4_cuda_dense_q8_0_matvec_kernel<<<dim3((uint32_t)out_dim, (uint32_t)n_tok, 1), 1, 0, g_stream>>>(
-            weights, xq, xscale, (float *)out_ptr, (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+            weights,
+            g_scratch_matmul_q8_0_xq,
+            g_scratch_matmul_q8_0_xscale,
+            (float *)out_ptr,
+            (uint32_t)in_dim,
+            (uint32_t)out_dim,
+            (uint32_t)n_tok);
         ok = ds4_cuda_check(cudaGetLastError(), "launch matmul q8_0");
     }
-    if (ok) ok = ds4_cuda_check(cudaStreamSynchronize(g_stream), "matmul q8_0 scratch lifetime");
-    (void)cudaFree(xscale);
-    (void)cudaFree(xq);
     return ok;
 }
 
