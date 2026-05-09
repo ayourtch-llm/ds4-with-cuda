@@ -101,6 +101,10 @@ static int8_t *g_scratch_shared_gate_up_q8_0_xq;
 static size_t  g_scratch_shared_gate_up_q8_0_xq_bytes;
 static float  *g_scratch_shared_gate_up_q8_0_xscale;
 static size_t  g_scratch_shared_gate_up_q8_0_xscale_bytes;
+static int8_t *g_scratch_q8_0_hc_expand_xq;
+static size_t  g_scratch_q8_0_hc_expand_xq_bytes;
+static float  *g_scratch_q8_0_hc_expand_xscale;
+static size_t  g_scratch_q8_0_hc_expand_xscale_bytes;
 
 static int ds4_cuda_check(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
@@ -1116,6 +1120,10 @@ void ds4_cuda_cleanup(void) {
                           &g_scratch_shared_gate_up_q8_0_xscale_bytes);
     ds4_cuda_scratch_free((void **)&g_scratch_shared_gate_up_q8_0_xq,
                           &g_scratch_shared_gate_up_q8_0_xq_bytes);
+    ds4_cuda_scratch_free((void **)&g_scratch_q8_0_hc_expand_xscale,
+                          &g_scratch_q8_0_hc_expand_xscale_bytes);
+    ds4_cuda_scratch_free((void **)&g_scratch_q8_0_hc_expand_xq,
+                          &g_scratch_q8_0_hc_expand_xq_bytes);
     if (g_stream) {
         (void)cudaStreamDestroy(g_stream);
         g_stream = NULL;
@@ -2465,18 +2473,26 @@ static int ds4_cuda_q8_0_hc_expand_launch(
     }
     if (has_add && !ds4_cuda_tensor_range(block_add, out_bytes, label, &add_ptr)) return 0;
 
-    int8_t *xq = NULL;
-    float *xscale = NULL;
-    if (!ds4_cuda_check(cudaMallocManaged((void **)&xq, (size_t)blocks * 32u),
-                        "q8 hc fusion xq allocation")) return 0;
-    if (!ds4_cuda_check(cudaMallocManaged((void **)&xscale, (size_t)blocks * sizeof(*xscale)),
-                        "q8 hc fusion scale allocation")) {
-        (void)cudaFree(xq);
+    const uint64_t xq_bytes = blocks * 32u;
+    const uint64_t xscale_bytes = blocks * sizeof(*g_scratch_q8_0_hc_expand_xscale);
+    if (xq_bytes > SIZE_MAX || xscale_bytes > SIZE_MAX) return 0;
+    if (!ds4_cuda_scratch_reserve((void **)&g_scratch_q8_0_hc_expand_xq,
+                                  &g_scratch_q8_0_hc_expand_xq_bytes,
+                                  (size_t)xq_bytes,
+                                  "q8 hc fusion xq scratch allocation") ||
+        !ds4_cuda_scratch_reserve((void **)&g_scratch_q8_0_hc_expand_xscale,
+                                  &g_scratch_q8_0_hc_expand_xscale_bytes,
+                                  (size_t)xscale_bytes,
+                                  "q8 hc fusion scale scratch allocation")) {
         return 0;
     }
 
     ds4_cuda_quantize_q8_0_activation_kernel<<<1, 1, 0, g_stream>>>(
-        (const float *)x_ptr, xq, xscale, (uint32_t)in_dim, 1);
+        (const float *)x_ptr,
+        g_scratch_q8_0_hc_expand_xq,
+        g_scratch_q8_0_hc_expand_xscale,
+        (uint32_t)in_dim,
+        1);
     int ok = ds4_cuda_check(cudaGetLastError(), "launch q8 hc fusion input quantize");
     const ds4_cuda_block_q8_0 *weights = NULL;
     if (ok) {
@@ -2487,16 +2503,15 @@ static int ds4_cuda_q8_0_hc_expand_launch(
     }
     if (ok) {
         ds4_cuda_q8_0_hc_expand_kernel<<<(uint32_t)out_dim, 1, 0, g_stream>>>(
-            weights, xq, xscale,
+            weights,
+            g_scratch_q8_0_hc_expand_xq,
+            g_scratch_q8_0_hc_expand_xscale,
             has_add ? (const float *)add_ptr : (const float *)NULL,
             (const float *)res_ptr, (const float *)split_ptr,
             (float *)block_ptr, (float *)out_ptr,
             (uint32_t)in_dim, (uint32_t)out_dim, n_embd, n_hc, has_add ? 1u : 0u);
         ok = ds4_cuda_check(cudaGetLastError(), "launch q8 hc fusion");
     }
-    if (ok) ok = ds4_cuda_check(cudaStreamSynchronize(g_stream), "q8 hc fusion scratch lifetime");
-    (void)cudaFree(xscale);
-    (void)cudaFree(xq);
     return ok;
 }
 
