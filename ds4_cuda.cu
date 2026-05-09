@@ -754,37 +754,92 @@ static __device__ __forceinline__ float ds4_cuda_warp_vec_dot_q8_0_f32(
     return acc;
 }
 
-/* Phase 3b-1 retile: one warp per output row, with the per-block 32-element
- * Q8_0 dot product parallelised across the 32 lanes and the across-block FP
- * accumulation kept serial.
+/* Phase 3b-5 fused helper: per Q8_0 K-block, perform the activation-side
+ * quantize AND the int8×int8 dot in one warp pass — no scratch round-trip.
  *
- * Each iteration of the K-axis loop:
- *   1. Lane `i` computes one int8×int8 product (`qs[i] * xq_row[i]`).
- *   2. Five `__shfl_xor_sync` steps tree-reduce the 32 int32 partials.
- *      Integer addition is associative, so this is bit-exact regardless of
- *      reduction order.
- *   3. All lanes hold the same `isum`; every lane then performs the same
- *      `acc += f16_to_f32(d) * xscale[b] * (float)isum`.  Because the FP
- *      arithmetic is identical across lanes (and identical to the original
- *      one-thread kernel — same FMA chain under `--use_fast_math`), the
- *      result is bit-exact with the prior tol=0 baseline.
+ * Math is bit-exact with the un-fused (`quantize_q8_0_activation_kernel`
+ * followed by `dense_q8_0_matvec_kernel`) path by construction:
+ *
+ *   1. Block scale: `amax = max(|x_i|, i ∈ [0,n))`, then `d = amax / 127.0f`,
+ *      `id = (d != 0) ? 1.0f / d : 0.0f`.  Float-max is associative for
+ *      non-NaN inputs, so the 5-step `__shfl_xor_sync` warp-tree reduction
+ *      lands on the same result as the original linear scan.
+ *   2. Per-lane quantize: `q_i = clamp(lrintf(x_i * id), -128, 127)`.  Same
+ *      rounding mode and clamping bounds as the device-side helper that the
+ *      pre-fusion path called (lrintf = round-half-to-even, clamp after
+ *      round).  Per-element, no cross-lane dependency.
+ *   3. Int dot: lane i contributes `q_i * w[b].qs[i]`; another 5-step
+ *      `__shfl_xor_sync` tree-reduces 32 int32 partials into a bit-exact
+ *      `isum` (integer addition is associative).
+ *   4. FP chain: every lane runs `acc += f16_to_f32(w[b].d) * d * isum`
+ *      in lock-step — same per-block FMA chain that the original linear
+ *      kernel compiled to under `--use_fast_math` (here `d` plays the role
+ *      `xscale[b]` did in the un-fused path; same expression, same value).
+ *
+ * Caller must invoke from a full warp (32 lanes participating). */
+static __device__ __forceinline__ float ds4_cuda_warp_quantize_and_dot_q8_0_f32(
+        const float                *x_row,
+        const ds4_cuda_block_q8_0  *w_row,
+        uint32_t                    in_dim,
+        uint32_t                    lane) {
+    const uint32_t blocks = (in_dim + 31u) / 32u;
+    float acc = 0.0f;
+    for (uint32_t b = 0; b < blocks; b++) {
+        const uint32_t i0 = b * 32u;
+        const uint32_t n  = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+
+        const float x_i = (lane < n) ? x_row[i0 + lane] : 0.0f;
+        const float ax  = (lane < n) ? fabsf(x_i)       : 0.0f;
+
+        float amax = ax;
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 16));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 8));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+
+        const float d  = amax / 127.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+
+        int32_t qv = 0;
+        if (lane < n) {
+            qv = (int32_t)lrintf(x_i * id);
+            if (qv > 127)  qv = 127;
+            if (qv < -128) qv = -128;
+        }
+
+        int32_t lane_isum = (lane < n) ? qv * (int32_t)w_row[b].qs[lane] : 0;
+        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 16);
+        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 8);
+        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 4);
+        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 2);
+        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 1);
+
+        acc += ds4_cuda_f16_to_f32(w_row[b].d) * d * (float)lane_isum;
+    }
+    return acc;
+}
+
+/* Phase 3b-5: fused quantize+matvec.  One warp per output row; the prior
+ * 3b-1 retile's int-dot body now lives inside the fused helper above
+ * alongside the on-the-fly activation quantize, eliminating the
+ * pre-launched `quantize_q8_0_activation_kernel` and the int8/scale scratch
+ * round-trip on this consumer's call path.  Bit-exactness preserved (see
+ * helper comment).
+ *
+ * Other Q8_0 consumers (attention_output_low_q8, shared_gate_up_swiglu_q8_0,
+ * q8_0_hc_expand) still call the pre-fusion path; their fusion is the
+ * 3b-6 bundle.
  *
  * blockDim is (32, ROWS_PER_BLOCK); each warp handles row
  * blockIdx.x*ROWS_PER_BLOCK + threadIdx.y.
- *
- * The redundant FP work in lanes 1..31 is intentional: it costs us nothing
- * (the warp executes in lock-step), it broadcasts `acc` for free, and it
- * preserves the FMA-per-block sequence that the prior linear kernel
- * compiled to.  Hot work parallelised: the 32-element int dot product is
- * now O(1) per block instead of O(32).
  *
  * TODO Phase 3b-x: extend to >1 warp/row if K grows past ~4K and a single
  * warp can no longer keep the SM busy. */
 template<uint32_t ROWS_PER_BLOCK>
 static __global__ void ds4_cuda_dense_q8_0_matvec_kernel(
         const ds4_cuda_block_q8_0 *weights,
-        const int8_t              *xq,
-        const float               *xscale,
+        const float               *x,
         float                     *out,
         uint32_t                   in_dim,
         uint32_t                   out_dim,
@@ -795,27 +850,11 @@ static __global__ void ds4_cuda_dense_q8_0_matvec_kernel(
     const uint32_t lane = threadIdx.x;
     const uint32_t blocks = (in_dim + 31u) / 32u;
 
-    const ds4_cuda_block_q8_0 *wrow      = weights + (uint64_t)row * blocks;
-    const int8_t              *xqrow     = xq      + (uint64_t)tok * blocks * 32u;
-    const float               *xscalerow = xscale  + (uint64_t)tok * blocks;
+    const ds4_cuda_block_q8_0 *wrow = weights + (uint64_t)row * blocks;
+    const float               *xrow = x       + (uint64_t)tok * in_dim;
 
-    float acc = 0.0f;
-    for (uint32_t b = 0; b < blocks; b++) {
-        const uint32_t i0 = b * 32u;
-        const uint32_t n  = in_dim - i0 < 32u ? in_dim - i0 : 32u;
-
-        int32_t lane_isum = 0;
-        if (lane < n) {
-            lane_isum = (int32_t)wrow[b].qs[lane] * (int32_t)xqrow[i0 + lane];
-        }
-        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 16);
-        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 8);
-        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 4);
-        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 2);
-        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 1);
-
-        acc += ds4_cuda_f16_to_f32(wrow[b].d) * xscalerow[b] * (float)lane_isum;
-    }
+    const float acc =
+        ds4_cuda_warp_quantize_and_dot_q8_0_f32(xrow, wrow, in_dim, lane);
 
     if (lane == 0) out[(uint64_t)tok * out_dim + row] = acc;
 }
@@ -1948,30 +1987,18 @@ int ds4_cuda_matmul_q8_0_tensor(
         return 0;
     }
 
-    const uint64_t xq_bytes = n_tok * blocks * 32u;
-    const uint64_t xscale_bytes = n_tok * blocks * sizeof(*g_scratch_matmul_q8_0_xscale);
-    if (xq_bytes > SIZE_MAX || xscale_bytes > SIZE_MAX) return 0;
-    if (!ds4_cuda_scratch_reserve((void **)&g_scratch_matmul_q8_0_xq,
-                                  &g_scratch_matmul_q8_0_xq_bytes,
-                                  (size_t)xq_bytes,
-                                  "matmul q8_0 xq scratch allocation") ||
-        !ds4_cuda_scratch_reserve((void **)&g_scratch_matmul_q8_0_xscale,
-                                  &g_scratch_matmul_q8_0_xscale_bytes,
-                                  (size_t)xscale_bytes,
-                                  "matmul q8_0 scale scratch allocation")) {
-        return 0;
-    }
+    /* Phase 3b-5: activation quantize is fused inside the matvec kernel; the
+     * pre-launch `quantize_q8_0_activation_kernel` and its scratch buffers
+     * (`g_scratch_matmul_q8_0_xq` / `_xscale`) are no longer used on this
+     * call path.  The scratch globals are intentionally left declared (and
+     * un-reserved here) — they may be revisited by 3b-6 when the remaining
+     * Q8 consumers fuse, after which a separate cleanup commit can retire
+     * the globals entirely. */
 
-    ds4_cuda_quantize_q8_0_activation_kernel<<<(uint32_t)n_tok, 1, 0, g_stream>>>(
-        (const float *)x_ptr, g_scratch_matmul_q8_0_xq, g_scratch_matmul_q8_0_xscale,
-        (uint32_t)in_dim, (uint32_t)n_tok);
-    int ok = ds4_cuda_check(cudaGetLastError(), "launch matmul q8_0 input quantize");
-    const ds4_cuda_block_q8_0 *weights = NULL;
-    if (ok) {
-        weights = (const ds4_cuda_block_q8_0 *)
-            ds4_cuda_model_range_ptr(model_map, model_size, weight_offset, weight_bytes, "matmul q8_0 weights");
-        if (!weights) ok = 0;
-    }
+    int ok = 1;
+    const ds4_cuda_block_q8_0 *weights = (const ds4_cuda_block_q8_0 *)
+        ds4_cuda_model_range_ptr(model_map, model_size, weight_offset, weight_bytes, "matmul q8_0 weights");
+    if (!weights) ok = 0;
     if (ok) {
         constexpr uint32_t ROWS_PER_BLOCK = 4u;
         const uint32_t row_blocks = ((uint32_t)out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
@@ -1980,13 +2007,12 @@ int ds4_cuda_matmul_q8_0_tensor(
                 dim3(32u, ROWS_PER_BLOCK, 1),
                 0, g_stream>>>(
             weights,
-            g_scratch_matmul_q8_0_xq,
-            g_scratch_matmul_q8_0_xscale,
+            (const float *)x_ptr,
             (float *)out_ptr,
             (uint32_t)in_dim,
             (uint32_t)out_dim,
             (uint32_t)n_tok);
-        ok = ds4_cuda_check(cudaGetLastError(), "launch matmul q8_0");
+        ok = ds4_cuda_check(cudaGetLastError(), "launch matmul q8_0 fused");
     }
     return ok;
 }
