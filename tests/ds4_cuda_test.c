@@ -4441,6 +4441,312 @@ DS4_CUDA_PARITY_TEST(compressor_store_batch_r4_f16,
     .cfg = (void *)&compressor_store_batch_r4_f16_cfg);
 
 /* ---------------------------------------------------------------------------
+ * Phase 3a-2 — compressor_update (single-token canonical path).
+ *
+ * Composes store_one + (on emit boundary) softmax_pool + rms_norm_weight +
+ * rope_tail + (ratio==4) ratio4_shift.  CPU oracle composes existing
+ * public helpers (ds4_test_dsv4_compressor_store_one, rms_norm_weight,
+ * rope_tail_ext_inplace, ds4_test_dsv4_ratio4_shift) plus an inline
+ * softmax_pool reference.
+ * --------------------------------------------------------------------------- */
+
+struct compressor_update_cfg {
+    uint32_t head_dim;
+    uint32_t ratio;
+    uint32_t n_rot;
+    uint32_t n_ctx_orig;
+    uint32_t pos;
+    uint32_t comp_row;
+    uint32_t comp_cache_rows;   /* total rows in comp_cache buffer */
+    int      ape_type;          /* 0 = f32 (avoid f16-NaN-from-random in test) */
+    float    rms_eps;
+    float    freq_base;
+    float    freq_scale;
+    float    ext_factor;
+    float    attn_factor;
+    float    beta_fast;
+    float    beta_slow;
+};
+
+/* Inline CPU softmax_pool reference for the ratio==4 packed pattern and
+ * the ratio!=4 direct pattern.  Matches the Metal kernel_dsv4_softmax_pool
+ * with n_comp=1 exactly.  Uses double accumulators (Trap #4) so the CPU
+ * oracle tracks f64 truth, leaving the harness ULP drift to the CUDA-vs-
+ * truth gap rather than CPU-vs-truth + CUDA-vs-truth combined. */
+static void compressor_pool_cpu(float *out, const float *state_kv,
+                                const float *state_score,
+                                uint32_t head_dim, uint32_t ratio, uint32_t width) {
+    if (ratio == 4u) {
+        for (uint32_t d = 0; d < head_dim; d++) {
+            double scores[8], values[8];
+            for (uint32_t i = 0; i < 4; i++) {
+                scores[i] = (double)state_score[i * width + d];
+                values[i] = (double)state_kv   [i * width + d];
+            }
+            for (uint32_t i = 0; i < 4; i++) {
+                const size_t off = (4u + i) * width + head_dim + d;
+                scores[4 + i] = (double)state_score[off];
+                values[4 + i] = (double)state_kv   [off];
+            }
+            double max_s = scores[0];
+            for (uint32_t i = 1; i < 8; i++) if (scores[i] > max_s) max_s = scores[i];
+            double sum = 0.0, acc = 0.0;
+            for (uint32_t i = 0; i < 8; i++) {
+                const double w = exp(scores[i] - max_s);
+                sum += w; acc += w * values[i];
+            }
+            out[d] = (float)(acc / sum);
+        }
+    } else {
+        for (uint32_t d = 0; d < head_dim; d++) {
+            double max_s = (double)state_score[d];
+            for (uint32_t i = 1; i < ratio; i++) {
+                const double s = (double)state_score[(size_t)i * width + d];
+                if (s > max_s) max_s = s;
+            }
+            double sum = 0.0, acc = 0.0;
+            for (uint32_t i = 0; i < ratio; i++) {
+                const double s = (double)state_score[(size_t)i * width + d];
+                const double v = (double)state_kv   [(size_t)i * width + d];
+                const double w = exp(s - max_s);
+                sum += w; acc += w * v;
+            }
+            out[d] = (float)(acc / sum);
+        }
+    }
+}
+
+/* Layout in `in`:
+ *   kv_cur       : width  (= coff*head_dim)
+ *   sc_cur       : width
+ *   ape (f32)    : width * ratio
+ *   norm_weight  : head_dim
+ *   state_kv0    : state_rows * width   (state_rows = coff*ratio)
+ *   state_score0 : state_rows * width
+ *   comp_cache0  : comp_cache_rows * head_dim
+ * Output: [state_kv | state_score | comp_cache] (full state arrays + full
+ * comp_cache).  Only one row of comp_cache is meaningfully changed (at
+ * comp_row), but the harness compares the whole tensor — unchanged rows
+ * contribute zero ULP. */
+
+/* Input shaping for the cascaded pool→rms→rope chain.  The CPU oracle and
+ * CUDA kernel both need to see the same shaped values.  We shape kv,
+ * state_kv (read by pool), and norm_weight to abs(.)+0.5 so values are
+ * positive and ~[0.5, 1.5] — output magnitudes after pool→rms_norm land
+ * near 1.0, giving ULPs proper signal-to-noise.  state_score is left raw
+ * to preserve the softmax non-trivially.  Without shaping, random pool
+ * outputs cancel near zero and cascaded f32 chain produces ~50-80 ULP
+ * drift at small output magnitudes (same dynamic as m4 flash_attn). */
+static void compressor_update_shape_buf(float *buf, size_t n) {
+    for (size_t i = 0; i < n; i++) buf[i] = fabsf(buf[i]) + 0.5f;
+}
+
+static int compressor_update_cpu(const float *in, float *out, void *cfg) {
+    const struct compressor_update_cfg *c = cfg;
+    const uint32_t coff = (c->ratio == 4u) ? 2u : 1u;
+    const uint32_t width = coff * c->head_dim;
+    const uint32_t state_rows = coff * c->ratio;
+    const size_t row_n     = (size_t)width;
+    const size_t state_n   = (size_t)state_rows * row_n;
+    const size_t ape_n     = (size_t)width * c->ratio;     /* f32 only */
+    const size_t comp_full = (size_t)c->comp_cache_rows * c->head_dim;
+    const float *kv0        = in;
+    const float *sc         = kv0 + row_n;
+    const float *ape        = sc + row_n;
+    const float *norm_w0    = ape + ape_n;
+    const float *state_kv00 = norm_w0 + c->head_dim;
+    const float *state_sc0  = state_kv00 + state_n;
+    const float *comp0      = state_sc0 + state_n;
+
+    /* Shape kv, state_kv (read by pool), norm_weight. */
+    float *kv      = (float *)malloc(row_n        * sizeof(float));
+    float *norm_w  = (float *)malloc(c->head_dim  * sizeof(float));
+    float *state_kv0 = (float *)malloc(state_n    * sizeof(float));
+    if (!kv || !norm_w || !state_kv0) {
+        free(kv); free(norm_w); free(state_kv0); return 0;
+    }
+    memcpy(kv,        kv0,        row_n       * sizeof(float));
+    memcpy(norm_w,    norm_w0,    c->head_dim * sizeof(float));
+    memcpy(state_kv0, state_kv00, state_n     * sizeof(float));
+    compressor_update_shape_buf(kv,        row_n);
+    compressor_update_shape_buf(norm_w,    c->head_dim);
+    compressor_update_shape_buf(state_kv0, state_n);
+
+    float *state_kv  = out;
+    float *state_sc  = out + state_n;
+    float *comp_cache = out + 2u * state_n;
+    memcpy(state_kv,   state_kv0, state_n   * sizeof(float));
+    memcpy(state_sc,   state_sc0, state_n   * sizeof(float));
+    memcpy(comp_cache, comp0,     comp_full * sizeof(float));
+
+    /* Stage 1: store_one. */
+    ds4_test_dsv4_compressor_store_one(kv, sc, ape, state_kv, state_sc,
+                                       width, c->ratio, c->pos, (uint32_t)c->ape_type);
+
+    const uint32_t emit = (((c->pos + 1u) % c->ratio) == 0u) ? 1u : 0u;
+    if (!emit) { free(kv); free(norm_w); free(state_kv0); return 1; }
+
+    /* Stage 2: softmax_pool → comp_cache[comp_row, :]. */
+    float *comp_row = comp_cache + (size_t)c->comp_row * c->head_dim;
+    compressor_pool_cpu(comp_row, state_kv, state_sc, c->head_dim, c->ratio, width);
+
+    /* Stage 3: rms_norm_weight in-place on the same row. */
+    rms_norm_weight(comp_row, comp_row, norm_w, (uint64_t)c->head_dim, c->rms_eps);
+
+    /* Stage 4: rope_tail in-place. */
+    const uint32_t comp_pos = c->pos + 1u - c->ratio;
+    rope_tail_ext_inplace(comp_row, /*n_head=*/1, c->head_dim, c->n_rot,
+                          comp_pos, (uint64_t)c->n_ctx_orig,
+                          c->freq_base, c->freq_scale, c->ext_factor, c->attn_factor,
+                          c->beta_fast, c->beta_slow, /*inverse=*/false);
+
+    /* Stage 5: ratio==4 frontier shift. */
+    if (c->ratio == 4u) {
+        ds4_test_dsv4_ratio4_shift(state_kv, state_sc, width);
+    }
+    free(kv); free(norm_w); free(state_kv0);
+    return 1;
+}
+
+static int compressor_update_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                  size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct compressor_update_cfg *c = cfg;
+    const uint32_t coff = (c->ratio == 4u) ? 2u : 1u;
+    const uint32_t width = coff * c->head_dim;
+    const uint32_t state_rows = coff * c->ratio;
+    const size_t row_n     = (size_t)width;
+    const size_t state_n   = (size_t)state_rows * row_n;
+    const size_t ape_n     = (size_t)width * c->ratio;
+    const size_t comp_full = (size_t)c->comp_cache_rows * c->head_dim;
+    const float *kv0        = in;
+    const float *sc         = kv0 + row_n;
+    const float *ape        = sc + row_n;
+    const float *norm_w0    = ape + ape_n;
+    const float *state_kv00 = norm_w0 + c->head_dim;
+    const float *state_sc0  = state_kv00 + state_n;
+    const float *comp0      = state_sc0 + state_n;
+
+    /* Match the CPU thunk's shaping (kv, state_kv, norm_weight → abs+0.5)
+     * so both sides see the same values. */
+    float *kv      = (float *)malloc(row_n        * sizeof(float));
+    float *norm_w  = (float *)malloc(c->head_dim  * sizeof(float));
+    float *state_kv0 = (float *)malloc(state_n    * sizeof(float));
+    if (!kv || !norm_w || !state_kv0) {
+        free(kv); free(norm_w); free(state_kv0); return 0;
+    }
+    memcpy(kv,        kv0,        row_n       * sizeof(float));
+    memcpy(norm_w,    norm_w0,    c->head_dim * sizeof(float));
+    memcpy(state_kv0, state_kv00, state_n     * sizeof(float));
+    compressor_update_shape_buf(kv,        row_n);
+    compressor_update_shape_buf(norm_w,    c->head_dim);
+    compressor_update_shape_buf(state_kv0, state_n);
+
+    /* Pack a fake model_map: [ape (ape_n f32) | norm_weight (head_dim f32)]. */
+    const size_t model_n = ape_n + c->head_dim;
+    float *model_h = (float *)malloc(model_n * sizeof(float));
+    if (!model_h) { free(kv); free(norm_w); free(state_kv0); return 0; }
+    memcpy(model_h,         ape,    ape_n         * sizeof(float));
+    memcpy(model_h + ape_n, norm_w, c->head_dim   * sizeof(float));
+
+    ds4_cuda_tensor *kv_dev    = ds4_cuda_tensor_alloc((uint64_t)row_n   * sizeof(float));
+    ds4_cuda_tensor *sc_dev    = ds4_cuda_tensor_alloc((uint64_t)row_n   * sizeof(float));
+    ds4_cuda_tensor *st_kv_dev = ds4_cuda_tensor_alloc((uint64_t)state_n * sizeof(float));
+    ds4_cuda_tensor *st_sc_dev = ds4_cuda_tensor_alloc((uint64_t)state_n * sizeof(float));
+    ds4_cuda_tensor *comp_dev  = ds4_cuda_tensor_alloc((uint64_t)comp_full * sizeof(float));
+    ds4_cuda_tensor *model_dev = ds4_cuda_tensor_alloc((uint64_t)model_n   * sizeof(float));
+    if (!kv_dev || !sc_dev || !st_kv_dev || !st_sc_dev || !comp_dev || !model_dev) {
+        ds4_cuda_tensor_free(kv_dev);    ds4_cuda_tensor_free(sc_dev);
+        ds4_cuda_tensor_free(st_kv_dev); ds4_cuda_tensor_free(st_sc_dev);
+        ds4_cuda_tensor_free(comp_dev);  ds4_cuda_tensor_free(model_dev);
+        free(model_h); return 0;
+    }
+    int ok = ds4_cuda_tensor_write(kv_dev,    0, kv,        (uint64_t)row_n     * sizeof(float))
+          && ds4_cuda_tensor_write(sc_dev,    0, sc,        (uint64_t)row_n     * sizeof(float))
+          && ds4_cuda_tensor_write(st_kv_dev, 0, state_kv0, (uint64_t)state_n   * sizeof(float))
+          && ds4_cuda_tensor_write(st_sc_dev, 0, state_sc0, (uint64_t)state_n   * sizeof(float))
+          && ds4_cuda_tensor_write(comp_dev,  0, comp0,     (uint64_t)comp_full * sizeof(float))
+          && ds4_cuda_tensor_write(model_dev, 0, model_h,   (uint64_t)model_n   * sizeof(float));
+    free(model_h);
+
+    const void *fake_model_map = ds4_cuda_tensor_contents(model_dev);
+    const uint64_t fake_model_size = (uint64_t)model_n * sizeof(float);
+    const uint64_t ape_offset  = 0;
+    const uint64_t norm_offset = ape_n * sizeof(float);
+
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_compressor_update_tensor(
+                    kv_dev, sc_dev, st_kv_dev, st_sc_dev, comp_dev,
+                    fake_model_map, fake_model_size,
+                    ape_offset, (uint32_t)c->ape_type,
+                    norm_offset, /*norm_type=*/0u,
+                    c->head_dim, c->ratio, c->pos, c->comp_row,
+                    c->n_rot, c->n_ctx_orig,
+                    c->freq_base, c->freq_scale, c->ext_factor, c->attn_factor,
+                    c->beta_fast, c->beta_slow, c->rms_eps);
+    if (ok) {
+        /* Copy state_kv | state_score | comp_cache into the harness output. */
+        ok = ds4_cuda_tensor_copy(out_dev, 0,                                       st_kv_dev, 0, (uint64_t)state_n   * sizeof(float))
+          && ds4_cuda_tensor_copy(out_dev, (uint64_t)state_n         * sizeof(float),   st_sc_dev, 0, (uint64_t)state_n   * sizeof(float))
+          && ds4_cuda_tensor_copy(out_dev, (uint64_t)(2u * state_n)  * sizeof(float),   comp_dev,  0, (uint64_t)comp_full * sizeof(float));
+    }
+    if (ok) ok = ds4_cuda_end_commands();
+
+    ds4_cuda_tensor_free(kv_dev);    ds4_cuda_tensor_free(sc_dev);
+    ds4_cuda_tensor_free(st_kv_dev); ds4_cuda_tensor_free(st_sc_dev);
+    ds4_cuda_tensor_free(comp_dev);  ds4_cuda_tensor_free(model_dev);
+    free(kv); free(norm_w); free(state_kv0);
+    return ok;
+}
+
+/* DS4 production: head_dim=128, ratio=4, n_rot=64, comp_row varies.
+ *   r4_emit:    pos=3 → (pos+1)%ratio == 0, emit fires; full chain.
+ *   r4_no_emit: pos=2 → no emit; only store_one runs.  Verifies that
+ *                       comp_cache and the second half of state are
+ *                       untouched on the no-emit path. */
+static const struct compressor_update_cfg compressor_update_r4_emit_cfg = {
+    .head_dim = 128, .ratio = 4, .n_rot = 64, .n_ctx_orig = 65536,
+    .pos = 3, .comp_row = 2, .comp_cache_rows = 4,
+    .ape_type = 0,
+    .rms_eps = 1e-6f,
+    .freq_base = 10000.0f, .freq_scale = 1.0f,
+    .ext_factor = 0.0f, .attn_factor = 1.0f,
+    .beta_fast = 32.0f, .beta_slow = 1.0f,
+};
+static const struct compressor_update_cfg compressor_update_r4_no_emit_cfg = {
+    .head_dim = 128, .ratio = 4, .n_rot = 64, .n_ctx_orig = 65536,
+    .pos = 2, .comp_row = 2, .comp_cache_rows = 4,
+    .ape_type = 0,
+    .rms_eps = 1e-6f,
+    .freq_base = 10000.0f, .freq_scale = 1.0f,
+    .ext_factor = 0.0f, .attn_factor = 1.0f,
+    .beta_fast = 32.0f, .beta_slow = 1.0f,
+};
+
+DS4_CUDA_PARITY_TEST(compressor_update_r4_emit,
+    .seed = 0xC0F1,
+    /* width=256, ape_n=256*4=1024, state_n=8*256=2048, comp_full=4*128=512.
+     *   kv(256) + sc(256) + ape(1024) + norm_w(128) + state(2*2048=4096) + comp(512)
+     *   = 6272 */
+    .in_elems  = 6272,
+    /* state_kv(2048) + state_score(2048) + comp_cache(512) = 4608 */
+    .out_elems = 4608,
+    /* Tolerance 32: rope+rms chain plus expf in pool.  m4 dsv4_rope baseline. */
+    .ulp_tolerance = 32,
+    .cpu_fn = compressor_update_cpu, .cuda_fn = compressor_update_cuda,
+    .cfg = (void *)&compressor_update_r4_emit_cfg);
+
+DS4_CUDA_PARITY_TEST(compressor_update_r4_no_emit,
+    .seed = 0xC0F2,
+    .in_elems  = 6272,
+    .out_elems = 4608,
+    /* No emit → state_kv/score change deterministically (just store_one),
+     * comp_cache untouched.  Bit-exact expected. */
+    .ulp_tolerance = 0,
+    .cpu_fn = compressor_update_cpu, .cuda_fn = compressor_update_cuda,
+    .cfg = (void *)&compressor_update_r4_no_emit_cfg);
+
+/* ---------------------------------------------------------------------------
  * Registry — order does not matter; failures are counted globally.
  * --------------------------------------------------------------------------- */
 
@@ -4509,6 +4815,8 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_hc_split_weighted_sum_norm,
     &ds4_cuda_parity_compressor_store_batch_r4_f32,
     &ds4_cuda_parity_compressor_store_batch_r4_f16,
+    &ds4_cuda_parity_compressor_update_r4_emit,
+    &ds4_cuda_parity_compressor_update_r4_no_emit,
     NULL,
 };
 

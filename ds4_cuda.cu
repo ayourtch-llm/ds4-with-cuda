@@ -1856,7 +1856,8 @@ int ds4_cuda_rms_norm_plain_rows_tensor(
  * bottom of this file. */
 DS4_CUDA_STUB(ds4_cuda_store_raw_kv_batch_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t, uint32_t))
 
-DS4_CUDA_STUB(ds4_cuda_compressor_update_tensor, (const ds4_cuda_tensor *, const ds4_cuda_tensor *, ds4_cuda_tensor *, ds4_cuda_tensor *, ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint32_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, float, float, float, float, float, float))
+/* ds4_cuda_compressor_update_tensor implemented in the Phase 3a
+ * compressor section at the bottom of this file. */
 /* ds4_cuda_compressor_store_batch_tensor implemented in the Phase 3a
  * compressor section at the bottom of this file. */
 int ds4_cuda_compressor_prefill_tensor(
@@ -5969,6 +5970,219 @@ int ds4_cuda_compressor_store_batch_tensor(
         (float *)st_kv_ptr, (float *)st_sc_ptr,
         width, ratio, pos0, n_tokens, ape_type);
     return ds4_cuda_check(cudaGetLastError(), "launch compressor_store_batch");
+}
+
+} /* extern "C" */
+
+/* compressor_pool kernel.  Output one head_dim-wide row that is the
+ * softmax-weighted sum of n_rows source rows.  Per dim d of the output:
+ *   max_s = max over ir of score[ir, d]
+ *   w_ir  = exp(score[ir, d] - max_s)
+ *   out[d] = sum_ir(w_ir * kv[ir, d]) / sum_ir(w_ir)
+ *
+ * Two ratio cases:
+ *   - ratio != 4: read ratio rows from state at row stride `width` (= head_dim
+ *     for ratio==1).  Each row contributes one (score, kv) pair per dim.
+ *   - ratio == 4: read 8 rows in the packed pattern that Metal's pre-pool
+ *     concat materialises.  Rows 0..3 come from state[0..3, 0:head_dim];
+ *     rows 4..7 come from state[4..7, head_dim:2*head_dim].  CUDA fuses
+ *     the concat into the pool kernel by addressing state directly with
+ *     offset arithmetic — no scratch buffer needed.
+ *
+ * Mirrors metal/dsv4_misc.metal:1012 kernel_dsv4_softmax_pool with n_comp=1.
+ * Compressor_update always uses n_comp=1, so we don't need the n_comp loop. */
+static __global__ void ds4_cuda_compressor_pool_kernel(
+        float       *out,
+        const float *state_kv,
+        const float *state_score,
+        uint32_t     head_dim,
+        uint32_t     ratio,
+        uint32_t     width) {
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= head_dim) return;
+
+    if (ratio == 4u) {
+        /* 8 rows packed per Metal's concat pattern. */
+        float scores[8], values[8];
+        #pragma unroll
+        for (uint32_t i = 0; i < 4u; i++) {
+            scores[i] = state_score[(uint64_t)i * width + d];
+            values[i] = state_kv   [(uint64_t)i * width + d];
+        }
+        #pragma unroll
+        for (uint32_t i = 0; i < 4u; i++) {
+            const uint64_t off = (uint64_t)(4u + i) * width + head_dim + d;
+            scores[4u + i] = state_score[off];
+            values[4u + i] = state_kv   [off];
+        }
+
+        float max_s = scores[0];
+        #pragma unroll
+        for (uint32_t i = 1u; i < 8u; i++) if (scores[i] > max_s) max_s = scores[i];
+
+        float sum = 0.0f, acc = 0.0f;
+        #pragma unroll
+        for (uint32_t i = 0u; i < 8u; i++) {
+            const float w = expf(scores[i] - max_s);
+            sum += w;
+            acc += w * values[i];
+        }
+        out[d] = acc / sum;
+    } else {
+        /* General path: ratio rows at stride `width` (= head_dim for ratio==1). */
+        float max_s = state_score[d];
+        for (uint32_t i = 1u; i < ratio; i++) {
+            const float s = state_score[(uint64_t)i * width + d];
+            if (s > max_s) max_s = s;
+        }
+        float sum = 0.0f, acc = 0.0f;
+        for (uint32_t i = 0u; i < ratio; i++) {
+            const float s = state_score[(uint64_t)i * width + d];
+            const float v = state_kv   [(uint64_t)i * width + d];
+            const float w = expf(s - max_s);
+            sum += w;
+            acc += w * v;
+        }
+        out[d] = acc / sum;
+    }
+}
+
+extern "C" {
+
+/* compressor_update — single-token canonical compressor path.  Mirrors
+ * Metal ds4_metal.m:7732-7887 step-for-step:
+ *   1. compressor_store_one (always — writes kv, score+ape into state).
+ *   2. If (pos+1) % ratio == 0 ("emit boundary"):
+ *        a. compressor_pool → comp_cache[comp_row, :]    (head_dim-wide)
+ *        b. rms_norm_weight on that row
+ *        c. rope_tail with comp_pos = pos + 1 - ratio
+ *        d. If ratio == 4: ratio4_shift on state_kv, state_score
+ *
+ * All of (a)-(d) operate on tensor views of comp_cache and state, dispatched
+ * sequentially on g_stream so the implicit ordering is in effect.  No
+ * cross-stream sync needed (Metal needs explicit cb finish_command_buffer
+ * between pool and rope because the rope wrapper opens its own cb; CUDA
+ * single-stream sequential dispatch is already ordered). */
+int ds4_cuda_compressor_update_tensor(
+        const ds4_cuda_tensor *kv_cur,
+        const ds4_cuda_tensor *sc_cur,
+        ds4_cuda_tensor       *state_kv,
+        ds4_cuda_tensor       *state_score,
+        ds4_cuda_tensor       *comp_cache,
+        const void            *model_map,
+        uint64_t               model_size,
+        uint64_t               ape_offset,
+        uint32_t               ape_type,
+        uint64_t               norm_offset,
+        uint32_t               norm_type,
+        uint32_t               head_dim,
+        uint32_t               ratio,
+        uint32_t               pos,
+        uint32_t               comp_row,
+        uint32_t               n_rot,
+        uint32_t               n_ctx_orig,
+        float                  freq_base,
+        float                  freq_scale,
+        float                  ext_factor,
+        float                  attn_factor,
+        float                  beta_fast,
+        float                  beta_slow,
+        float                  rms_eps) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
+        !model_map || head_dim == 0u || ratio == 0u ||
+        n_rot > head_dim || (n_rot & 1u) != 0u ||
+        (ape_type != 0u && ape_type != 1u) ||
+        norm_type != 0u) return 0;
+
+    const uint32_t coff = (ratio == 4u) ? 2u : 1u;
+    const uint32_t width = coff * head_dim;
+    const uint32_t state_rows = coff * ratio;
+    const uint32_t emit = (((pos + 1u) % ratio) == 0u) ? 1u : 0u;
+    const uint64_t row_bytes   = (uint64_t)width * sizeof(float);
+    const uint64_t state_bytes = (uint64_t)state_rows * row_bytes;
+    const uint64_t ape_elem    = (ape_type == 1u) ? 2u : 4u;
+    const uint64_t ape_bytes   = (uint64_t)width * ratio * ape_elem;
+    const uint64_t norm_bytes  = (uint64_t)head_dim * sizeof(float);
+
+    if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
+        norm_offset > model_size || norm_bytes > model_size - norm_offset) {
+        fprintf(stderr, "ds4: CUDA compressor_update tensor range outside mapped model\n");
+        return 0;
+    }
+
+    /* Stage 1: store_one (matches Metal's use_store_one branch — the
+     * batch-with-n_tokens=1 fallback is mathematically identical and
+     * we don't need both paths in CUDA). */
+    void *kv_ptr = NULL, *sc_ptr = NULL, *st_kv_ptr = NULL, *st_sc_ptr = NULL;
+    if (!ds4_cuda_tensor_range(kv_cur,      row_bytes,   "compressor_update kv",          &kv_ptr))    return 0;
+    if (!ds4_cuda_tensor_range(sc_cur,      row_bytes,   "compressor_update sc",          &sc_ptr))    return 0;
+    if (!ds4_cuda_tensor_range(state_kv,    state_bytes, "compressor_update state_kv",    &st_kv_ptr)) return 0;
+    if (!ds4_cuda_tensor_range(state_score, state_bytes, "compressor_update state_score", &st_sc_ptr)) return 0;
+
+    const void *ape_ptr = (const uint8_t *)model_map + ape_offset;
+    {
+        constexpr uint32_t block_size = 256u;
+        const uint32_t grid = (width + block_size - 1u) / block_size;
+        ds4_cuda_dsv4_compressor_store_one_kernel<<<grid, block_size, 0, g_stream>>>(
+            (const float *)kv_ptr, (const float *)sc_ptr, ape_ptr,
+            (float *)st_kv_ptr, (float *)st_sc_ptr,
+            width, ratio, pos, ape_type);
+        if (!ds4_cuda_check(cudaGetLastError(), "launch compressor_update store_one")) return 0;
+    }
+
+    if (!emit) return 1;
+
+    /* Stage 2: pool → comp_cache[comp_row, :] (head_dim-wide row). */
+    const uint64_t comp_row_offset_bytes = (uint64_t)comp_row * head_dim * sizeof(float);
+    const uint64_t comp_total_bytes = (uint64_t)(comp_row + 1u) * head_dim * sizeof(float);
+    if (comp_cache->bytes < comp_total_bytes) {
+        fprintf(stderr, "ds4: CUDA compressor_update comp_cache too small for comp_row\n");
+        return 0;
+    }
+    float *comp_row_ptr = (float *)((uint8_t *)comp_cache->base + comp_cache->offset + comp_row_offset_bytes);
+    {
+        constexpr uint32_t block_size = 128u;
+        const uint32_t grid = (head_dim + block_size - 1u) / block_size;
+        ds4_cuda_compressor_pool_kernel<<<grid, block_size, 0, g_stream>>>(
+            comp_row_ptr,
+            (const float *)st_kv_ptr, (const float *)st_sc_ptr,
+            head_dim, ratio, width);
+        if (!ds4_cuda_check(cudaGetLastError(), "launch compressor_update pool")) return 0;
+    }
+
+    /* Stage 3 & 4: rms_norm + rope on the same row.  Build a tensor view
+     * pointing into comp_cache and dispatch the existing public APIs. */
+    ds4_cuda_tensor *comp_view = ds4_cuda_tensor_view(comp_cache, comp_row_offset_bytes,
+                                                     (uint64_t)head_dim * sizeof(float));
+    if (!comp_view) return 0;
+
+    int ok = ds4_cuda_rms_norm_weight_rows_tensor(comp_view, comp_view,
+                                                  model_map, model_size, norm_offset,
+                                                  head_dim, /*rows=*/1, rms_eps);
+    if (ok) {
+        const uint32_t comp_pos = pos + 1u - ratio;
+        ok = ds4_cuda_rope_tail_tensor(comp_view, /*n_tok=*/1, /*n_head=*/1,
+                                       head_dim, n_rot, comp_pos, n_ctx_orig,
+                                       /*inverse=*/false,
+                                       freq_base, freq_scale, ext_factor, attn_factor,
+                                       beta_fast, beta_slow);
+    }
+    ds4_cuda_tensor_free(comp_view);
+    if (!ok) return 0;
+
+    /* Stage 5: ratio==4 frontier shift. */
+    if (ratio == 4u) {
+        constexpr uint32_t block_size = 256u;
+        const uint32_t n = 4u * width;
+        const uint32_t grid = (n + block_size - 1u) / block_size;
+        ds4_cuda_dsv4_ratio4_shift_kernel<<<grid, block_size, 0, g_stream>>>(
+            (float *)st_kv_ptr, (float *)st_sc_ptr, width);
+        if (!ds4_cuda_check(cudaGetLastError(), "launch compressor_update ratio4_shift")) return 0;
+    }
+
+    return 1;
 }
 
 } /* extern "C" */
