@@ -15168,9 +15168,18 @@ static bool cuda_graph_verify_decode2_exact(
                                           token0, cur0, next0);
         if (!ok) break;
 
-        /* Capture post-token0 prefix1 state for partial-accept rollback. */
-        ok = cuda_graph_capture_prefix1_attn_state(g, il) &&
-             cuda_graph_capture_prefix1_index_state(g, il);
+        /* Capture post-token0 prefix1 state for partial-accept rollback.
+         * Codex review fix (Step 6 BLOCKER): cuda_graph_capture_prefix1_*
+         * call ds4_cuda_tensor_copy which requires g_batch_open, but the
+         * encode_one_layer call above already closed its batch via
+         * end_commands_async.  Wrap the captures in their own batch so the
+         * D2D copies actually issue (was silently failing → verifier
+         * returned false → --mtp fell through to first-token-only path,
+         * never accepting any drafts). */
+        ok = ds4_cuda_begin_commands() != 0;
+        if (ok) ok = cuda_graph_capture_prefix1_attn_state(g, il);
+        if (ok) ok = cuda_graph_capture_prefix1_index_state(g, il);
+        if (ok) ok = ds4_cuda_end_commands_async() != 0;
         if (!ok) break;
 
         /* token1 advances per-layer state on top of token0. */
@@ -15314,6 +15323,21 @@ static bool cuda_graph_eval_token_raw_swa(
         }
         ds4_cuda_tensor *tmp = cur; cur = nxt; nxt = tmp;
     }
+
+    /* Codex review fix (Step 6 MAJOR): sync g->cur_hc / g->next_hc to the
+     * post-final-layer pointers.  The per-layer loop above swaps LOCAL
+     * cur/nxt only, leaving g->cur_hc pointing at the pre-decode embed
+     * buffer.  Downstream code that reads g->cur_hc as "the current HC
+     * stream" — most importantly the MTP probe in
+     * ds4_session_eval_internal which calls cuda_graph_eval_mtp_draft
+     * (whose `_from_hc` thin wrapper passes g->cur_hc as prev_hc) — would
+     * otherwise see a stale buffer and produce drafts conditioned on the
+     * wrong HC, driving accept-rate to zero.  Metal handles this by
+     * mutating g->cur_hc/g->after_ffn_hc per layer (ds4.c:10769); the
+     * CUDA helper takes HC tensors as explicit parameters so we sync
+     * once at the end instead. */
+    g->cur_hc = cur;
+    g->next_hc = nxt;
 
     /* Output head: HC reduce -> rms -> vocab matmul.  Skipped entirely when
      * logits_out is NULL — prefill calls into eval many times and only the
@@ -21147,10 +21171,21 @@ static int cuda_session_eval_speculative_argmax_impl(
 
     /* Verifier dispatch.  This commit ships strict + N=2 only. */
     if (!strict_mtp || draft_n != 2) {
+        /* Codex review fix (Step 6 minor): log used to say "committing
+         * drafts[0] only" but the code returns just first_token (which was
+         * already committed by ds4_session_eval at the top).  drafts[0]
+         * was verified-for-free against target's argmax-after-prefix at the
+         * sample_argmax check above, so it WOULD be safe to commit; doing
+         * so however requires re-decoding it through target (see Metal's
+         * margin-gate fallback at ds4.c:21222), which the CUDA path
+         * doesn't yet implement — that's the deferred follow-up.  Match
+         * the log to the actual safe behaviour: first_token only, no
+         * drafts committed. */
         if (getenv("DS4_MTP_SPEC_LOG")) {
             fprintf(stderr,
                     "ds4: cuda mtp spec — strict=%d draft_n=%d, only strict+N=2 verifier "
-                    "is wired on CUDA; committing drafts[0] only.\n",
+                    "is wired on CUDA; returning first_token only "
+                    "(no drafts committed; margin-gate re-decode fallback deferred).\n",
                     strict_mtp ? 1 : 0, draft_n);
         }
         DS4_CUDA_MTP_KEEP_ACCEPTED(0);
