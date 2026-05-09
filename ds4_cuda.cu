@@ -1239,30 +1239,47 @@ static __global__ void ds4_cuda_dense_f16_matvec_kernel(
     if (lane == 0u) out[row] = acc;
 }
 
+/* Phase 3b-8 retile: literal-mirror clones onto the warp helpers established
+ * in 3b-3 (warp_vec_dot_q2_K_q8_K) and 3b-2 (warp_vec_dot_iq2_xxs_q8_K).
+ * Both helpers are integer-associative inside (tree-reduce of int partials)
+ * and run their FP outer chain in lock-step on every lane, so dropping the
+ * scalar `vec_dot_*` calls in for the warp variants is bit-exact.  Pair
+ * variant goes "option (a)" sequential — two warp calls with different weight
+ * rows; sharing the activation tile via a pair helper is a possible 3b-x
+ * optimization. */
+template<uint32_t ROWS_PER_BLOCK>
 static __global__ void ds4_cuda_dense_q2_k_matvec_kernel(
         const ds4_cuda_block_q2_K *weights,
         const ds4_cuda_block_q8_K *xq,
         float                     *out,
         uint32_t                   in_dim,
         uint32_t                   out_dim) {
-    const uint32_t row = blockIdx.x;
-    if (row >= out_dim || threadIdx.x != 0) return;
+    const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
+    if (row >= out_dim) return;
+    const uint32_t lane = threadIdx.x;
     const uint32_t nb = in_dim / 256u;
-    out[row] = ds4_cuda_vec_dot_q2_K_q8_K(weights + (uint64_t)row * nb, xq, nb);
+    const float v = ds4_cuda_warp_vec_dot_q2_K_q8_K(
+            weights + (uint64_t)row * nb, xq, nb, lane);
+    if (lane == 0u) out[row] = v;
 }
 
+template<uint32_t ROWS_PER_BLOCK>
 static __global__ void ds4_cuda_dense_iq2_xxs_matvec_kernel(
         const ds4_cuda_block_iq2_xxs *weights,
         const ds4_cuda_block_q8_K    *xq,
         float                        *out,
         uint32_t                      in_dim,
         uint32_t                      out_dim) {
-    const uint32_t row = blockIdx.x;
-    if (row >= out_dim || threadIdx.x != 0) return;
+    const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
+    if (row >= out_dim) return;
+    const uint32_t lane = threadIdx.x;
     const uint32_t nb = in_dim / 256u;
-    out[row] = ds4_cuda_vec_dot_iq2_xxs_q8_K(weights + (uint64_t)row * nb, xq, nb);
+    const float v = ds4_cuda_warp_vec_dot_iq2_xxs_q8_K(
+            weights + (uint64_t)row * nb, xq, nb, lane);
+    if (lane == 0u) out[row] = v;
 }
 
+template<uint32_t ROWS_PER_BLOCK>
 static __global__ void ds4_cuda_dense_iq2_xxs_pair_matvec_kernel(
         const ds4_cuda_block_iq2_xxs *weights0,
         const ds4_cuda_block_iq2_xxs *weights1,
@@ -1271,11 +1288,18 @@ static __global__ void ds4_cuda_dense_iq2_xxs_pair_matvec_kernel(
         float                        *out1,
         uint32_t                      in_dim,
         uint32_t                      out_dim) {
-    const uint32_t row = blockIdx.x;
-    if (row >= out_dim || threadIdx.x != 0) return;
+    const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
+    if (row >= out_dim) return;
+    const uint32_t lane = threadIdx.x;
     const uint32_t nb = in_dim / 256u;
-    out0[row] = ds4_cuda_vec_dot_iq2_xxs_q8_K(weights0 + (uint64_t)row * nb, xq, nb);
-    out1[row] = ds4_cuda_vec_dot_iq2_xxs_q8_K(weights1 + (uint64_t)row * nb, xq, nb);
+    const float v0 = ds4_cuda_warp_vec_dot_iq2_xxs_q8_K(
+            weights0 + (uint64_t)row * nb, xq, nb, lane);
+    const float v1 = ds4_cuda_warp_vec_dot_iq2_xxs_q8_K(
+            weights1 + (uint64_t)row * nb, xq, nb, lane);
+    if (lane == 0u) {
+        out0[row] = v0;
+        out1[row] = v1;
+    }
 }
 
 static __device__ void ds4_cuda_quantize_row_q8_K_device(
@@ -2029,7 +2053,12 @@ int ds4_cuda_test_dense_q2_k_matvec_tensor(
         return 0;
     }
 
-    ds4_cuda_dense_q2_k_matvec_kernel<<<out_dim, 1, 0, g_stream>>>(
+    constexpr uint32_t ROWS_PER_BLOCK = 4u;
+    const uint32_t row_blocks = (out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
+    ds4_cuda_dense_q2_k_matvec_kernel<ROWS_PER_BLOCK><<<
+            dim3(row_blocks, 1, 1),
+            dim3(32u, ROWS_PER_BLOCK, 1),
+            0, g_stream>>>(
         (const ds4_cuda_block_q2_K *)w_ptr,
         (const ds4_cuda_block_q8_K *)xq_ptr,
         (float *)out_ptr,
@@ -2059,7 +2088,12 @@ int ds4_cuda_test_dense_iq2_xxs_matvec_tensor(
         return 0;
     }
 
-    ds4_cuda_dense_iq2_xxs_matvec_kernel<<<out_dim, 1, 0, g_stream>>>(
+    constexpr uint32_t ROWS_PER_BLOCK = 4u;
+    const uint32_t row_blocks = (out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
+    ds4_cuda_dense_iq2_xxs_matvec_kernel<ROWS_PER_BLOCK><<<
+            dim3(row_blocks, 1, 1),
+            dim3(32u, ROWS_PER_BLOCK, 1),
+            0, g_stream>>>(
         (const ds4_cuda_block_iq2_xxs *)w_ptr,
         (const ds4_cuda_block_q8_K *)xq_ptr,
         (float *)out_ptr,
@@ -2092,7 +2126,12 @@ int ds4_cuda_test_dense_iq2_xxs_pair_matvec_tensor(
     }
 
     float *out_f = (float *)out_ptr;
-    ds4_cuda_dense_iq2_xxs_pair_matvec_kernel<<<out_dim, 1, 0, g_stream>>>(
+    constexpr uint32_t ROWS_PER_BLOCK = 4u;
+    const uint32_t row_blocks = (out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
+    ds4_cuda_dense_iq2_xxs_pair_matvec_kernel<ROWS_PER_BLOCK><<<
+            dim3(row_blocks, 1, 1),
+            dim3(32u, ROWS_PER_BLOCK, 1),
+            0, g_stream>>>(
         (const ds4_cuda_block_iq2_xxs *)w0_ptr,
         (const ds4_cuda_block_iq2_xxs *)w1_ptr,
         (const ds4_cuda_block_q8_K *)xq_ptr,
