@@ -20504,6 +20504,137 @@ int ds4_engine_cuda_session_prefill_test(ds4_engine *e, const ds4_tokens *prompt
 #endif
 }
 
+#ifdef DS4_USE_CUDA
+/* Phase 6 hot-tier classification + promotion.
+ *
+ * Walks the engine's bound weights tree and pushes every non-routed-expert
+ * tensor range into the CUDA hot-tier registry (cudaMalloc + cudaMemcpyAsync
+ * via ds4_cuda_register_hot_tensor).  Routed experts (ffn_gate_exps,
+ * ffn_up_exps, ffn_down_exps) and the per-token expert-id table
+ * (ffn_gate_tid2eid) are skipped — they remain on the host-mmap path,
+ * since K=4..8 of 256 experts fire per token and the sparse access
+ * pattern doesn't pay the page-migration tax of full promotion.
+ *
+ * Static-split design inspired by mitkox's ds4-cuda port (uniform
+ * cudaMalloc resolver in ds4_cuda_model_range_device); we hybridize on
+ * the dense/routed axis to keep ~72 GB of routed expert weights on
+ * mmap'd pages while the always-hot ~9 GB lives device-resident.
+ *
+ * Returns 1 on success, 0 if any promotion failed (registry full,
+ * out-of-memory, range invalid).  Caller treats failure as fatal. */
+static int cuda_promote_layer_hot(const ds4_model *m,
+                                   const ds4_layer_weights *l,
+                                   uint32_t layer_id) {
+#define HOT_PROMOTE(field, lbl) do { \
+    const ds4_tensor *_t = (l)->field; \
+    if (_t && !ds4_cuda_register_hot_tensor((m)->map, (m)->size, \
+                                              _t->abs_offset, _t->bytes, \
+                                              lbl)) { \
+        fprintf(stderr, "ds4: CUDA hot promote layer %u %s failed\n", \
+                layer_id, lbl); \
+        return 0; \
+    } \
+} while (0)
+
+    HOT_PROMOTE(hc_attn_fn,                "hc_attn_fn");
+    HOT_PROMOTE(hc_attn_scale,             "hc_attn_scale");
+    HOT_PROMOTE(hc_attn_base,              "hc_attn_base");
+    HOT_PROMOTE(attn_norm,                 "attn_norm");
+    HOT_PROMOTE(attn_q_a,                  "attn_q_a");
+    HOT_PROMOTE(attn_q_a_norm,             "attn_q_a_norm");
+    HOT_PROMOTE(attn_q_b,                  "attn_q_b");
+    HOT_PROMOTE(attn_kv,                   "attn_kv");
+    HOT_PROMOTE(attn_kv_a_norm,            "attn_kv_a_norm");
+    HOT_PROMOTE(attn_sinks,                "attn_sinks");
+    HOT_PROMOTE(attn_output_a,             "attn_output_a");
+    HOT_PROMOTE(attn_output_b,             "attn_output_b");
+    HOT_PROMOTE(attn_compressor_ape,       "attn_compressor_ape");
+    HOT_PROMOTE(attn_compressor_kv,        "attn_compressor_kv");
+    HOT_PROMOTE(attn_compressor_gate,      "attn_compressor_gate");
+    HOT_PROMOTE(attn_compressor_norm,      "attn_compressor_norm");
+    HOT_PROMOTE(indexer_attn_q_b,          "indexer_attn_q_b");
+    HOT_PROMOTE(indexer_proj,              "indexer_proj");
+    HOT_PROMOTE(indexer_compressor_ape,    "indexer_compressor_ape");
+    HOT_PROMOTE(indexer_compressor_kv,     "indexer_compressor_kv");
+    HOT_PROMOTE(indexer_compressor_gate,   "indexer_compressor_gate");
+    HOT_PROMOTE(indexer_compressor_norm,   "indexer_compressor_norm");
+    HOT_PROMOTE(hc_ffn_fn,                 "hc_ffn_fn");
+    HOT_PROMOTE(hc_ffn_scale,              "hc_ffn_scale");
+    HOT_PROMOTE(hc_ffn_base,               "hc_ffn_base");
+    HOT_PROMOTE(ffn_norm,                  "ffn_norm");
+    /* SKIP ffn_gate_tid2eid — per-token expert lookup (sparse pattern). */
+    HOT_PROMOTE(ffn_gate_inp,              "ffn_gate_inp");
+    HOT_PROMOTE(ffn_exp_probs_b,           "ffn_exp_probs_b");
+    /* SKIP ffn_gate_exps, ffn_up_exps, ffn_down_exps — routed experts. */
+    HOT_PROMOTE(ffn_gate_shexp,            "ffn_gate_shexp");
+    HOT_PROMOTE(ffn_up_shexp,              "ffn_up_shexp");
+    HOT_PROMOTE(ffn_down_shexp,            "ffn_down_shexp");
+
+#undef HOT_PROMOTE
+    return 1;
+}
+
+static int cuda_promote_engine_hot(ds4_engine *e) {
+    /* DS4_CUDA_DISABLE_HOT_TIER=1 short-circuits Phase 6 promotion entirely;
+     * registry stays empty, ds4_cuda_model_range_ptr falls through to the
+     * pre-Phase-6 host-mmap path.  Used for A/B perf calibration. */
+    const char *disable_env = getenv("DS4_CUDA_DISABLE_HOT_TIER");
+    if (disable_env && disable_env[0] && disable_env[0] != '0') {
+        fprintf(stderr, "ds4: CUDA hot tier DISABLED via DS4_CUDA_DISABLE_HOT_TIER\n");
+        return 1;
+    }
+
+    const ds4_model *m = &e->model;
+
+#define HOT_PROMOTE_TOP(field, lbl) do { \
+    const ds4_tensor *_t = e->weights.field; \
+    if (_t && !ds4_cuda_register_hot_tensor(m->map, m->size, \
+                                              _t->abs_offset, _t->bytes, \
+                                              lbl)) { \
+        fprintf(stderr, "ds4: CUDA hot promote top %s failed\n", lbl); \
+        return 0; \
+    } \
+} while (0)
+
+    HOT_PROMOTE_TOP(token_embd,        "token_embd");
+    HOT_PROMOTE_TOP(output_hc_base,    "output_hc_base");
+    HOT_PROMOTE_TOP(output_hc_fn,      "output_hc_fn");
+    HOT_PROMOTE_TOP(output_hc_scale,   "output_hc_scale");
+    HOT_PROMOTE_TOP(output_norm,       "output_norm");
+    HOT_PROMOTE_TOP(output,            "output");
+#undef HOT_PROMOTE_TOP
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!cuda_promote_layer_hot(m, &e->weights.layer[il], il)) return 0;
+    }
+
+    if (e->mtp_ready) {
+        const ds4_model *mm = &e->mtp_model;
+#define HOT_PROMOTE_MTP(field, lbl) do { \
+    const ds4_tensor *_t = e->mtp_weights.field; \
+    if (_t && !ds4_cuda_register_hot_tensor(mm->map, mm->size, \
+                                              _t->abs_offset, _t->bytes, \
+                                              "mtp/" lbl)) { \
+        fprintf(stderr, "ds4: CUDA hot promote mtp/%s failed\n", lbl); \
+        return 0; \
+    } \
+} while (0)
+        HOT_PROMOTE_MTP(e_proj,         "e_proj");
+        HOT_PROMOTE_MTP(h_proj,         "h_proj");
+        HOT_PROMOTE_MTP(enorm,          "enorm");
+        HOT_PROMOTE_MTP(hnorm,          "hnorm");
+        HOT_PROMOTE_MTP(norm,           "norm");
+        HOT_PROMOTE_MTP(hc_head_base,   "hc_head_base");
+        HOT_PROMOTE_MTP(hc_head_fn,     "hc_head_fn");
+        HOT_PROMOTE_MTP(hc_head_scale,  "hc_head_scale");
+#undef HOT_PROMOTE_MTP
+        if (!cuda_promote_layer_hot(mm, &e->mtp_weights.block, 0xFFFFFFFFu)) return 0;
+    }
+
+    return ds4_cuda_finalize_hot_tier();
+}
+#endif /* DS4_USE_CUDA */
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -20606,6 +20737,18 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         {
             fprintf(stderr,
                     "ds4: CUDA failed to register MTP model views; aborting startup.\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        /* Phase 6: promote dense / shared / output / embed weights to a
+         * GPU-resident hot-tier pool (cudaMalloc + cudaMemcpyAsync) while
+         * routed expert weights stay on the host-mmap path.  Inspired by
+         * mitkox's ds4_cuda_model_range_device pattern, hybridized on the
+         * dense/routed axis. */
+        if (!cuda_promote_engine_hot(e)) {
+            fprintf(stderr,
+                    "ds4: CUDA hot-tier promotion failed; aborting startup.\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;

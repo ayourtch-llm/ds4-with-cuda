@@ -192,6 +192,50 @@ static int ds4_cuda_tensor_range(
     return 1;
 }
 
+/* Phase 6 hot-tier registry: weights promoted to GPU-resident device
+ * memory via cudaMalloc + cudaMemcpyAsync at model-load time.  Replaces
+ * the host-mapped path for hot tensors, eliminating page-migration and
+ * unified-memory TLB tax that scales with context length.  Routed-expert
+ * tensors stay on the host-mapped path (sparse access pattern means few
+ * pages migrate per token, and L2 keeps the few-firing experts warm).
+ *
+ * Pattern inspired by mitkox's ds4-cuda port (see
+ * ~/ayourtch/deepseek4/mitkox/ds4-cuda/ds4_cuda.cu:289 — function
+ * ds4_cuda_model_range_device + g_model_views[4096] view-cache).  The
+ * explicit-cudaMalloc + cudaMemcpyAsync resolver pattern is mitkox's
+ * contribution; their port uses it uniformly for all weights, achieving
+ * 7-14 t/s at 1M context.  We adapt the resolver into a hybrid split:
+ * hot tier (~9 GB dense / shared / output / embed) goes through this
+ * registry; sparse tier (~72 GB routed experts at q2) stays on the
+ * host-mmap path.  Hybrid is forward-compat with future Q4-on-128GB
+ * (sparse tier mmap'd lets OS file cache absorb expert overflow).
+ *
+ * Layout: linear-scan array, populated eagerly by the host (ds4.c walks
+ * the weights tree post-load and calls ds4_cuda_register_hot_tensor for
+ * every non-routed-expert range).  Linear scan is fine — N <= ~1200,
+ * mitkox sustains 7-14 t/s with N <= 4096 entries on the same shape. */
+typedef struct {
+    void       *device_buffer;
+    const void *model_map;
+    uint64_t    model_size;
+    uint64_t    offset;
+    uint64_t    bytes;
+} ds4_cuda_hot_view;
+
+#define DS4_CUDA_MAX_HOT_VIEWS 2048
+static ds4_cuda_hot_view g_hot_views[DS4_CUDA_MAX_HOT_VIEWS];
+static uint32_t g_hot_view_count;
+static uint64_t g_hot_view_total_bytes;
+
+static void ds4_cuda_hot_views_clear(void) {
+    for (uint32_t i = 0; i < g_hot_view_count; i++) {
+        if (g_hot_views[i].device_buffer) cudaFree(g_hot_views[i].device_buffer);
+        memset(&g_hot_views[i], 0, sizeof(g_hot_views[i]));
+    }
+    g_hot_view_count = 0;
+    g_hot_view_total_bytes = 0;
+}
+
 static const void *ds4_cuda_model_range_ptr(
         const void *model_map,
         uint64_t    model_size,
@@ -201,6 +245,22 @@ static const void *ds4_cuda_model_range_ptr(
     if (!model_map || offset > model_size || bytes > model_size - offset) {
         fprintf(stderr, "ds4: CUDA %s model range is outside the mapped model\n", label);
         return NULL;
+    }
+
+    /* Phase 6: hot-tier hit returns device-resident pointer; sparse-tier
+     * (routed experts) falls through to the existing host-mapped path.
+     * Resolver shape inspired by mitkox's ds4_cuda_model_range_device
+     * (linear-scan view-cache); we add classification gating so only
+     * hot-tier tensors enter the registry. */
+    const uint64_t end = offset + bytes;
+    for (uint32_t i = 0; i < g_hot_view_count; i++) {
+        const ds4_cuda_hot_view *view = &g_hot_views[i];
+        if (view->model_map == model_map &&
+            view->model_size == model_size &&
+            offset >= view->offset &&
+            end <= view->offset + view->bytes) {
+            return (const uint8_t *)view->device_buffer + (offset - view->offset);
+        }
     }
 
     const uint8_t *host_ptr = (const uint8_t *)model_map + offset;
@@ -1877,6 +1937,7 @@ void ds4_cuda_cleanup(void) {
     }
     (void)cudaStreamSynchronize(g_stream);
     ds4_cuda_clear_pending_events();
+    ds4_cuda_hot_views_clear();
     ds4_cuda_unregister_model();
     if (g_stream) {
         (void)cudaStreamDestroy(g_stream);
@@ -2183,6 +2244,85 @@ int ds4_cuda_set_model_map_range(const void *model_map, uint64_t model_size, uin
 
 int ds4_cuda_set_model_map(const void *model_map, uint64_t model_size) {
     return ds4_cuda_set_model_map_range(model_map, model_size, 0, model_size);
+}
+
+/* Phase 6: promote a tensor range to the hot-tier device-resident pool.
+ * Allocates a fresh cudaMalloc buffer of `bytes` and issues an async
+ * H2D copy from (model_map + offset).  Subsequent ds4_cuda_model_range_ptr
+ * lookups for any range contained in (offset, bytes) return the device
+ * buffer pointer instead of the host-mapped fallback.
+ *
+ * Idempotent: if a hot view already covers the exact (model_map, offset,
+ * bytes) tuple, returns 1 without re-allocating.  Returns 0 on failure
+ * (out of memory, registry full, range outside model). */
+int ds4_cuda_register_hot_tensor(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    offset,
+        uint64_t    bytes,
+        const char *label) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!model_map || model_size == 0 || bytes == 0) return 0;
+    if (offset > model_size || bytes > model_size - offset) {
+        fprintf(stderr,
+                "ds4: CUDA hot promote %s: range [%" PRIu64 ", +%" PRIu64 ") outside model (size %" PRIu64 ")\n",
+                label ? label : "?", offset, bytes, model_size);
+        return 0;
+    }
+
+    /* Idempotency: identical tuple already registered. */
+    for (uint32_t i = 0; i < g_hot_view_count; i++) {
+        const ds4_cuda_hot_view *v = &g_hot_views[i];
+        if (v->model_map == model_map && v->model_size == model_size &&
+            v->offset == offset && v->bytes == bytes) {
+            return 1;
+        }
+    }
+
+    if (g_hot_view_count >= DS4_CUDA_MAX_HOT_VIEWS) {
+        fprintf(stderr,
+                "ds4: CUDA hot-tier registry full (%u entries) when promoting %s\n",
+                g_hot_view_count, label ? label : "?");
+        return 0;
+    }
+
+    void *buffer = NULL;
+    if (!ds4_cuda_check(cudaMalloc(&buffer, (size_t)bytes), "hot tensor cudaMalloc")) {
+        return 0;
+    }
+    const void *src = (const uint8_t *)model_map + offset;
+    if (!ds4_cuda_check(cudaMemcpyAsync(buffer, src, (size_t)bytes,
+                                         cudaMemcpyHostToDevice, g_stream),
+                        "hot tensor H2D")) {
+        cudaFree(buffer);
+        return 0;
+    }
+
+    ds4_cuda_hot_view *view = &g_hot_views[g_hot_view_count++];
+    view->device_buffer = buffer;
+    view->model_map = model_map;
+    view->model_size = model_size;
+    view->offset = offset;
+    view->bytes = bytes;
+    g_hot_view_total_bytes += bytes;
+    return 1;
+}
+
+/* Phase 6: drain pending H2D copies issued by ds4_cuda_register_hot_tensor.
+ * Call once after the last hot promotion to ensure GPU-side weights are
+ * ready before the first kernel that consumes them launches.  Without
+ * this sync, the first decode token may race against still-in-flight
+ * memcpy operations on g_stream. */
+int ds4_cuda_finalize_hot_tier(void) {
+    if (!g_initialized) return 1;
+    if (g_hot_view_count == 0) return 1;
+    if (!ds4_cuda_check(cudaStreamSynchronize(g_stream), "hot tier finalize sync")) {
+        return 0;
+    }
+    fprintf(stderr,
+            "ds4: CUDA hot tier ready: %u tensors, %.2f MiB device-resident\n",
+            g_hot_view_count, ds4_cuda_mib(g_hot_view_total_bytes));
+    return 1;
 }
 
 void ds4_cuda_set_quality(bool quality) {

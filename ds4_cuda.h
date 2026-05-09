@@ -216,6 +216,24 @@ int ds4_cuda_synchronize(void);
 int ds4_cuda_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_cuda_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
 
+/* Phase 6: hot-tier promotion.  After registering a model via the
+ * functions above, the host walks its weights tree and calls the
+ * promotion API for every tensor that should be GPU-resident (the "hot"
+ * tier — dense attention, compressor, indexer, shared FFN, output head,
+ * embed, all norms; everything except routed-expert tensors).  Each
+ * promotion does cudaMalloc + async H2D from the host-mapped pages.
+ * Routed experts (sparse — K=4-8 fire per token out of 256) skip
+ * promotion and continue to read via the host-mmap path; their per-token
+ * working set is small enough that page-migration tax is amortized.
+ *
+ * Call ds4_cuda_finalize_hot_tier() once after the last promotion to
+ * drain pending memcpys before the first kernel runs.  Idempotent for
+ * identical (model_map, offset, bytes) tuples. */
+int ds4_cuda_register_hot_tensor(const void *model_map, uint64_t model_size,
+                                  uint64_t offset, uint64_t bytes,
+                                  const char *label);
+int ds4_cuda_finalize_hot_tier(void);
+
 void ds4_cuda_set_quality(bool quality);
 void ds4_cuda_print_memory_report(const char *label);
 
