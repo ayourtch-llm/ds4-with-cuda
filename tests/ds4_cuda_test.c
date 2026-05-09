@@ -4233,6 +4233,214 @@ DS4_CUDA_PARITY_TEST(hc_split_weighted_sum_norm,
     .cfg = (void *)&hc_split_sum_norm_cfg_v);
 
 /* ---------------------------------------------------------------------------
+ * Phase 3a — DS4 compressor (5 production-API stub closures).
+ *
+ *  compressor_store_batch: batched (kv, sc, ape) → (state_kv, state_score)
+ *      with ratio-4 destination row math.  CPU oracle composes
+ *      ds4_test_dsv4_compressor_store_one across n_tokens (each token's
+ *      pos = pos0 + t).  CUDA fuses Metal's cpy+add+set_rows multi-dispatch
+ *      into one per-element kernel — bit-identical math (single ADD per
+ *      element).
+ * --------------------------------------------------------------------------- */
+
+struct compressor_store_batch_cfg {
+    uint32_t head_dim;
+    uint32_t ratio;
+    uint32_t pos0;
+    uint32_t n_tokens;
+    uint32_t ape_type;     /* 0 = f32, 1 = f16 */
+};
+
+/* Layout in `in`:
+ *   kv          : n_tokens * width    (width = ratio==4 ? 2*head_dim : head_dim)
+ *   sc          : n_tokens * width
+ *   ape_payload : f32: width * ratio
+ *                 f16: width * ratio / 2 (packed two f16s per f32 slot)
+ *   state_kv0   : state_rows * width   (state_rows = ratio==4 ? 2*ratio : ratio)
+ *   state_score0: state_rows * width
+ * Output: state_kv (state_rows*width) | state_score (state_rows*width). */
+
+/* Re-encode the harness's raw f32 slab as valid f16 bit patterns.  The
+ * harness fills inputs with random f32 in [-1, 1); raw-bit reinterpretation
+ * occasionally hits 0x7Cxx..0x7Fxx in the high half = f16 INF/NaN.  We
+ * round-trip each pair-of-f16-slots' worth of f32 source through
+ * f32_to_f16 so both sides see identically valid finite f16 values. */
+static void compressor_store_batch_shape_ape(const float *src_f32,
+                                             void        *dst_bytes,
+                                             size_t       n_f16) {
+    uint16_t *dst = (uint16_t *)dst_bytes;
+    const float *src = src_f32;
+    /* The harness packs two f16 slots per f32 source slot — but the
+     * source bits aren't valid f16, so we just read each source f32 as
+     * one float, encode it to f16, and emit two copies (one per output
+     * f16 slot per source).  This gives finite values on both sides. */
+    for (size_t i = 0; i < n_f16; i++) {
+        const float v = src[i / 2];
+        dst[i] = test_f32_to_f16(v);
+    }
+}
+
+static int compressor_store_batch_cpu(const float *in, float *out, void *cfg) {
+    const struct compressor_store_batch_cfg *c = cfg;
+    const uint32_t coff = (c->ratio == 4u) ? 2u : 1u;
+    const uint32_t width = coff * c->head_dim;
+    const uint32_t state_rows = coff * c->ratio;
+    const size_t row_n   = (size_t)width;
+    const size_t state_n = (size_t)state_rows * row_n;
+    const size_t kv_n    = (size_t)c->n_tokens * row_n;
+    const size_t ape_floats = (c->ape_type == 1u)
+        ? ((size_t)width * c->ratio / 2u)
+        : ((size_t)width * c->ratio);
+    const size_t ape_bytes_n = (c->ape_type == 1u)
+        ? ((size_t)width * c->ratio * sizeof(uint16_t))
+        : ((size_t)width * c->ratio * sizeof(float));
+
+    const float *kv          = in;
+    const float *sc          = kv + kv_n;
+    const float *ape_src     = sc + kv_n;
+    const float *state_kv0   = ape_src + ape_floats;
+    const float *state_score0 = state_kv0 + state_n;
+
+    /* Build a sanitised APE buffer (f16 path: re-encode source f32s to
+     * valid f16; f32 path: passthrough). */
+    void *ape_buf = malloc(ape_bytes_n);
+    if (!ape_buf) return 0;
+    if (c->ape_type == 1u) {
+        compressor_store_batch_shape_ape(ape_src, ape_buf, (size_t)width * c->ratio);
+    } else {
+        memcpy(ape_buf, ape_src, ape_bytes_n);
+    }
+
+    float *state_kv    = out;
+    float *state_score = out + state_n;
+    memcpy(state_kv,    state_kv0,    state_n * sizeof(float));
+    memcpy(state_score, state_score0, state_n * sizeof(float));
+
+    /* For each token, replay store_one (math-identical to Metal's
+     * cpy+add+set_rows for ape_type's source bytes). */
+    for (uint32_t t = 0; t < c->n_tokens; t++) {
+        ds4_test_dsv4_compressor_store_one(
+            kv + (size_t)t * row_n,
+            sc + (size_t)t * row_n,
+            ape_buf,
+            state_kv, state_score,
+            width, c->ratio, c->pos0 + t, c->ape_type);
+    }
+    free(ape_buf);
+    return 1;
+}
+
+static int compressor_store_batch_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                       size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct compressor_store_batch_cfg *c = cfg;
+    const uint32_t coff = (c->ratio == 4u) ? 2u : 1u;
+    const uint32_t width = coff * c->head_dim;
+    const uint32_t state_rows = coff * c->ratio;
+    const size_t row_n   = (size_t)width;
+    const size_t state_n = (size_t)state_rows * row_n;
+    const size_t kv_n    = (size_t)c->n_tokens * row_n;
+    const size_t ape_floats = (c->ape_type == 1u)
+        ? ((size_t)width * c->ratio / 2u)
+        : ((size_t)width * c->ratio);
+    const size_t ape_bytes = (c->ape_type == 1u)
+        ? ((size_t)width * c->ratio * sizeof(uint16_t))
+        : ((size_t)width * c->ratio * sizeof(float));
+
+    const float *kv          = in;
+    const float *sc          = kv + kv_n;
+    const float *ape_src     = sc + kv_n;
+    const float *state_kv0   = ape_src + ape_floats;
+    const float *state_score0 = state_kv0 + state_n;
+
+    /* Build the sanitised APE buffer the same way the CPU thunk does so
+     * both sides see identical bit patterns. */
+    void *ape_buf = malloc(ape_bytes);
+    if (!ape_buf) return 0;
+    if (c->ape_type == 1u) {
+        compressor_store_batch_shape_ape(ape_src, ape_buf, (size_t)width * c->ratio);
+    } else {
+        memcpy(ape_buf, ape_src, ape_bytes);
+    }
+
+    ds4_cuda_tensor *kv_dev    = ds4_cuda_tensor_alloc((uint64_t)kv_n      * sizeof(float));
+    ds4_cuda_tensor *sc_dev    = ds4_cuda_tensor_alloc((uint64_t)kv_n      * sizeof(float));
+    ds4_cuda_tensor *model_dev = ds4_cuda_tensor_alloc((uint64_t)ape_bytes);
+    ds4_cuda_tensor *st_kv_dev = ds4_cuda_tensor_alloc((uint64_t)state_n   * sizeof(float));
+    ds4_cuda_tensor *st_sc_dev = ds4_cuda_tensor_alloc((uint64_t)state_n   * sizeof(float));
+    if (!kv_dev || !sc_dev || !model_dev || !st_kv_dev || !st_sc_dev) {
+        ds4_cuda_tensor_free(kv_dev);    ds4_cuda_tensor_free(sc_dev);
+        ds4_cuda_tensor_free(model_dev); ds4_cuda_tensor_free(st_kv_dev);
+        ds4_cuda_tensor_free(st_sc_dev); free(ape_buf); return 0;
+    }
+    int ok = ds4_cuda_tensor_write(kv_dev,    0, kv,            (uint64_t)kv_n   * sizeof(float))
+          && ds4_cuda_tensor_write(sc_dev,    0, sc,            (uint64_t)kv_n   * sizeof(float))
+          && ds4_cuda_tensor_write(model_dev, 0, ape_buf,       (uint64_t)ape_bytes)
+          && ds4_cuda_tensor_write(st_kv_dev, 0, state_kv0,     (uint64_t)state_n * sizeof(float))
+          && ds4_cuda_tensor_write(st_sc_dev, 0, state_score0,  (uint64_t)state_n * sizeof(float));
+    free(ape_buf);
+
+    /* Use model_dev's contents as a fake model_map; APE lives at offset 0. */
+    const void *fake_model_map = ds4_cuda_tensor_contents(model_dev);
+    const uint64_t fake_model_size = (uint64_t)ape_bytes;
+
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_compressor_store_batch_tensor(
+                    kv_dev, sc_dev, st_kv_dev, st_sc_dev,
+                    fake_model_map, fake_model_size, /*ape_offset=*/0,
+                    c->ape_type, c->head_dim, c->ratio, c->pos0, c->n_tokens);
+    if (ok) {
+        ok = ds4_cuda_tensor_copy(out_dev, 0,                                  st_kv_dev, 0, (uint64_t)state_n * sizeof(float))
+          && ds4_cuda_tensor_copy(out_dev, (uint64_t)state_n * sizeof(float),  st_sc_dev, 0, (uint64_t)state_n * sizeof(float));
+    }
+    if (ok) ok = ds4_cuda_end_commands();
+
+    ds4_cuda_tensor_free(kv_dev);    ds4_cuda_tensor_free(sc_dev);
+    ds4_cuda_tensor_free(model_dev); ds4_cuda_tensor_free(st_kv_dev);
+    ds4_cuda_tensor_free(st_sc_dev);
+    return ok;
+}
+
+/* Two variants — both pick fixture shapes where each token has a distinct
+ * (pos_mod, dst_row) pair so there are no destination-row collisions
+ * between tokens.  At ratio=R, n_tokens must be ≤ R for each token to land
+ * in its own slot; otherwise pos_mod wraps and later tokens overwrite
+ * earlier ones.  Production callers obey this invariant per the Metal
+ * wrapper's segmentation logic.
+ *
+ *   r4_f32 : ratio=4 + ape_type=0 + n_tokens=3 (pos0=2 → pos_mod cycles
+ *            2,3,0; ratio==4 dst_row branch).
+ *   r4_f16 : ratio=4 + ape_type=1 + n_tokens=4 (pos0=0 → pos_mod cycles
+ *            0,1,2,3; full-cycle distinct slots; f16 APE load). */
+static const struct compressor_store_batch_cfg compressor_store_batch_r4_f32_cfg = {
+    .head_dim = 64, .ratio = 4, .pos0 = 2, .n_tokens = 3, .ape_type = 0,
+};
+static const struct compressor_store_batch_cfg compressor_store_batch_r4_f16_cfg = {
+    .head_dim = 64, .ratio = 4, .pos0 = 0, .n_tokens = 4, .ape_type = 1,
+};
+
+DS4_CUDA_PARITY_TEST(compressor_store_batch_r4_f32,
+    .seed = 0x53B0,
+    /* width=128, state_rows=8, n_tokens=3, ape_floats=128*4=512.
+     *   kv(3*128=384) + sc(3*128=384) + ape(512) + state(2*8*128=2048) = 3328 */
+    .in_elems  = 3328,
+    /* state_kv (8*128) + state_score (8*128) = 2048 */
+    .out_elems = 2048,
+    .ulp_tolerance = 0,
+    .cpu_fn = compressor_store_batch_cpu, .cuda_fn = compressor_store_batch_cuda,
+    .cfg = (void *)&compressor_store_batch_r4_f32_cfg);
+
+DS4_CUDA_PARITY_TEST(compressor_store_batch_r4_f16,
+    .seed = 0x53B1,
+    /* width=128, state_rows=8, n_tokens=4, ape_floats=128*4/2=256.
+     *   kv(4*128=512) + sc(4*128=512) + ape(256) + state(2*8*128=2048) = 3328 */
+    .in_elems  = 3328,
+    .out_elems = 2048,
+    .ulp_tolerance = 0,
+    .cpu_fn = compressor_store_batch_cpu, .cuda_fn = compressor_store_batch_cuda,
+    .cfg = (void *)&compressor_store_batch_r4_f16_cfg);
+
+/* ---------------------------------------------------------------------------
  * Registry — order does not matter; failures are counted globally.
  * --------------------------------------------------------------------------- */
 
@@ -4299,6 +4507,8 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_hc_split_sinkhorn,
     &ds4_cuda_parity_hc_split_weighted_sum,
     &ds4_cuda_parity_hc_split_weighted_sum_norm,
+    &ds4_cuda_parity_compressor_store_batch_r4_f32,
+    &ds4_cuda_parity_compressor_store_batch_r4_f16,
     NULL,
 };
 

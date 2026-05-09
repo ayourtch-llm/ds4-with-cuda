@@ -1857,7 +1857,8 @@ int ds4_cuda_rms_norm_plain_rows_tensor(
 DS4_CUDA_STUB(ds4_cuda_store_raw_kv_batch_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t, uint32_t))
 
 DS4_CUDA_STUB(ds4_cuda_compressor_update_tensor, (const ds4_cuda_tensor *, const ds4_cuda_tensor *, ds4_cuda_tensor *, ds4_cuda_tensor *, ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint32_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, float, float, float, float, float, float))
-DS4_CUDA_STUB(ds4_cuda_compressor_store_batch_tensor, (const ds4_cuda_tensor *, const ds4_cuda_tensor *, ds4_cuda_tensor *, ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))
+/* ds4_cuda_compressor_store_batch_tensor implemented in the Phase 3a
+ * compressor section at the bottom of this file. */
 int ds4_cuda_compressor_prefill_tensor(
         ds4_cuda_tensor       *comp_cache,
         ds4_cuda_tensor       *state_kv,
@@ -5843,6 +5844,131 @@ int ds4_cuda_hc_split_weighted_sum_norm_tensor(
         (const float *)mix_ptr, scale_ptr, base_ptr, (const float *)res_ptr,
         normw_ptr, n_rows, (int)sinkhorn_iters, eps, norm_eps);
     return ds4_cuda_check(cudaGetLastError(), "launch hc_split_weighted_sum_norm");
+}
+
+} /* extern "C" */
+
+/* =========================================================================
+ * Phase 3a — DS4 compressor: 5 production-API stub closures.
+ * =========================================================================
+ *
+ * Spec: metal/dsv4_kv.metal + ds4_metal.m wrappers around lines
+ * 6339-7887.  All DS4-original — no llama.cpp template.  Compressor
+ * lives upstream of the routed-MoE 2-bit path; it works on F32/F16
+ * activations with optional FP8 quantize-on-write for the cache.
+ *
+ * Helper kernels reused (already shipped + parity-green):
+ *   - kernel_dsv4_compressor_store_one_kernel  (Phase 1 m5)
+ *   - kernel_dsv4_ratio4_shift_kernel          (Phase 1 m5)
+ *   - rms_norm_*, rope_tail, kv_fp8_quantize   (Phase 1c/m4/m5)
+ *
+ * --- Trap audit (general for the family) ---------------------------------
+ *
+ *   * Trap #1 (--use_fast_math intrinsics): RoPE path goes through
+ *     ds4_cuda_rope_tail_tensor (already audited).  No additional trig
+ *     in compressor proper.
+ *   * Trap #2 (serial/parallel accumulators): N/A for store_*; relevant
+ *     only for the pool/RMS path which uses double-accumulator on the CPU
+ *     oracle side.
+ *   * Trap #3 (libm-vs-libdevice arg-reduction): N/A.
+ *   * Trap #4 (CPU oracle precision): pool RMS step uses double accumulator
+ *     in the existing rms_norm_no_weight oracle.
+ *   * Trap #5 (MMA fragment layout): N/A — lane-distributed reductions only.
+ * ========================================================================= */
+
+/* compressor_store_batch fused kernel.  For each (token, width-dim) pair:
+ *   pos_mod = (pos0 + t) % ratio
+ *   dst_row = (ratio == 4) ? ratio + pos_mod : pos_mod
+ *   state_kv   [dst_row * width + d] = kv [t * width + d]
+ *   state_score[dst_row * width + d] = sc [t * width + d] + ape[pos_mod * width + d]
+ *
+ * Bit-identical to the Metal multi-dispatch (cpy + add + set_rows) because
+ * the underlying float arithmetic is one ADD per element (CUDA fuses the
+ * 3 metal launches into one kernel for cache locality; the per-element
+ * sum order is identical: sc + ape, single FMA).  ape is read as f16 or
+ * f32 depending on `ape_type`. */
+static __global__ void ds4_cuda_compressor_store_batch_kernel(
+        const float *kv,
+        const float *sc,
+        const void  *ape,
+        float       *state_kv,
+        float       *state_score,
+        uint32_t     width,
+        uint32_t     ratio,
+        uint32_t     pos0,
+        uint32_t     n_tokens,
+        uint32_t     ape_type) {
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (d >= width || t >= n_tokens) return;
+
+    const uint32_t pos_mod = (pos0 + t) % ratio;
+    const uint32_t dst_row = (ratio == 4u) ? (ratio + pos_mod) : pos_mod;
+    const uint64_t dst = (uint64_t)dst_row * width + d;
+    const uint64_t src = (uint64_t)t       * width + d;
+    const uint64_t ape_i = (uint64_t)pos_mod * width + d;
+
+    float ape_v;
+    if (ape_type == 1u) {
+        ape_v = __half2float(((const __half *)ape)[ape_i]);
+    } else {
+        ape_v = ((const float *)ape)[ape_i];
+    }
+
+    state_kv   [dst] = kv[src];
+    state_score[dst] = sc[src] + ape_v;
+}
+
+extern "C" {
+
+int ds4_cuda_compressor_store_batch_tensor(
+        const ds4_cuda_tensor *kv,
+        const ds4_cuda_tensor *sc,
+        ds4_cuda_tensor       *state_kv,
+        ds4_cuda_tensor       *state_score,
+        const void            *model_map,
+        uint64_t               model_size,
+        uint64_t               ape_offset,
+        uint32_t               ape_type,
+        uint32_t               head_dim,
+        uint32_t               ratio,
+        uint32_t               pos0,
+        uint32_t               n_tokens) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (!kv || !sc || !state_kv || !state_score || !model_map ||
+        head_dim == 0u || ratio == 0u || n_tokens == 0u ||
+        (ape_type != 0u && ape_type != 1u)) return 0;
+
+    const uint32_t coff = (ratio == 4u) ? 2u : 1u;
+    const uint32_t width = coff * head_dim;
+    const uint32_t state_rows = coff * ratio;
+    const uint64_t kv_bytes    = (uint64_t)n_tokens * width * sizeof(float);
+    const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
+    const uint64_t elem_ape    = (ape_type == 1u) ? 2u : 4u;
+    const uint64_t ape_bytes   = (uint64_t)width * ratio * elem_ape;
+
+    if (ape_offset > model_size || ape_bytes > model_size - ape_offset) {
+        fprintf(stderr, "ds4: CUDA compressor_store_batch APE range outside mapped model\n");
+        return 0;
+    }
+
+    void *kv_ptr = NULL, *sc_ptr = NULL, *st_kv_ptr = NULL, *st_sc_ptr = NULL;
+    if (!ds4_cuda_tensor_range(kv,          kv_bytes,    "store_batch kv",          &kv_ptr))    return 0;
+    if (!ds4_cuda_tensor_range(sc,          kv_bytes,    "store_batch sc",          &sc_ptr))    return 0;
+    if (!ds4_cuda_tensor_range(state_kv,    state_bytes, "store_batch state_kv",    &st_kv_ptr)) return 0;
+    if (!ds4_cuda_tensor_range(state_score, state_bytes, "store_batch state_score", &st_sc_ptr)) return 0;
+
+    const void *ape_ptr = (const uint8_t *)model_map + ape_offset;
+
+    constexpr uint32_t block_x = 256u;
+    dim3 block(block_x, 1u, 1u);
+    dim3 grid((width + block_x - 1u) / block_x, n_tokens, 1u);
+    ds4_cuda_compressor_store_batch_kernel<<<grid, block, 0, g_stream>>>(
+        (const float *)kv_ptr, (const float *)sc_ptr, ape_ptr,
+        (float *)st_kv_ptr, (float *)st_sc_ptr,
+        width, ratio, pos0, n_tokens, ape_type);
+    return ds4_cuda_check(cudaGetLastError(), "launch compressor_store_batch");
 }
 
 } /* extern "C" */
