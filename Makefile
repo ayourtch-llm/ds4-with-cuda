@@ -71,6 +71,9 @@ ds4_cuda_load_sanity: ds4_cuda_load_sanity.o ds4_cuda.o
 
 ds4_cuda_test: ds4_cuda_test.o ds4_cuda_parity.o ds4_cuda.o ds4_native.o
 	$(NVCC) $(CUDAFLAGS) -o $@ ds4_cuda_test.o ds4_cuda_parity.o ds4_cuda.o ds4_native.o $(CUDA_LDLIBS)
+
+ds4_cuda_payload_test: ds4_cuda_payload_test.o $(CUDA_CORE_OBJS)
+	$(NVCC) $(CUDAFLAGS) -o $@ ds4_cuda_payload_test.o $(CUDA_CORE_OBJS) $(CUDA_LDLIBS)
 else
 ds4-cuda:
 	@echo "ds4-cuda requires CUDA nvcc; set NVCC=/path/to/nvcc or install CUDA." >&2
@@ -86,6 +89,10 @@ ds4_cuda_load_sanity:
 
 ds4_cuda_test:
 	@echo "ds4_cuda_test requires CUDA nvcc; set NVCC=/path/to/nvcc or install CUDA." >&2
+	@exit 1
+
+ds4_cuda_payload_test:
+	@echo "ds4_cuda_payload_test requires CUDA nvcc; set NVCC=/path/to/nvcc or install CUDA." >&2
 	@exit 1
 endif
 endif
@@ -132,6 +139,9 @@ ds4_cuda_parity.o: tests/ds4_cuda_parity.c tests/ds4_cuda_parity.h ds4_cuda.h
 ds4_cuda_test.o: tests/ds4_cuda_test.c tests/ds4_cuda_parity.h ds4_cuda.h
 	$(CC) $(CFLAGS) -DDS4_NO_METAL -DDS4_USE_CUDA -c -o $@ tests/ds4_cuda_test.c
 
+ds4_cuda_payload_test.o: tests/ds4_cuda_payload_test.c ds4.h
+	$(CC) $(CFLAGS) -DDS4_NO_METAL -DDS4_USE_CUDA -c -o $@ tests/ds4_cuda_payload_test.c
+
 ds4_metal.o: ds4_metal.m ds4_metal.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
@@ -142,4 +152,4 @@ test: ds4_test
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-cuda ds4-server-cuda ds4_cuda_load_sanity ds4_cuda_test ds4_native ds4_server_test ds4_test *.o
+	rm -f ds4 ds4-server ds4-cuda ds4-server-cuda ds4_cuda_load_sanity ds4_cuda_test ds4_cuda_payload_test ds4_native ds4_server_test ds4_test *.o
