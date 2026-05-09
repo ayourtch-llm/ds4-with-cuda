@@ -29,7 +29,7 @@ That said, a few important things about this project:
 * This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
 * This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache It is actually a first class disk citizen**.
 * Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. This inference engine only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is just alpha quality code, so probably we are not still there.
-* The production path is **Metal**.  An **alpha CUDA backend** for Linux + NVIDIA (Phase 2) ports the per-kernel math one kernel at a time and is end-to-end correctness-validated to the top-K agreement level on a single-token forward (see "CUDA backend (alpha, Linux + NVIDIA)" below) but is *not yet a session-level peer of Metal* — full prefill+decode requires kernels that are still stubs. The CPU path is only for correctness check, but **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. I was not possible to fix the CPU inference to avoid crashing, since each time there is to restart the computer, which is not funny. Help us, if you have the guts.
+* The production path is **Metal**.  An **alpha CUDA backend** for Linux + NVIDIA (Phase 3c) is now session-functional: `./ds4-cuda -p "<prompt>"` produces token streams via per-token-loop prefill on top of the same per-kernel math the parity harness validates. Phase 3b (batched-attention prefill kernels for perf) and CUDA MTP/speculative decode are deferred. See "CUDA backend (alpha, Linux + NVIDIA)" below. The CPU path is only for correctness check, but **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. I was not possible to fix the CPU inference to avoid crashing, since each time there is to restart the computer, which is not funny. Help us, if you have the guts.
 
 ## Acknowledgements to llama.cpp and GGML
 
@@ -501,42 +501,48 @@ unified-memory addressing (`cudaMallocManaged` plus `cudaHostRegister` for the
 mmap'd GGUF). The `compute_120` SM is targeted via the `sm_100` build with PTX
 JIT for now; a native `sm_120` recompile is a small Makefile change.
 
-**What works in this alpha** (Phase 2, as of `eaede3d` plus the 2.1d driver):
+**What works in this alpha** (Phase 3c session backend, on top of Phase 2 and Phase 3a):
 
-- 60+ per-kernel parity tests under `./ds4_cuda_test`, all passing within the
-  documented ULP tolerances against the CPU oracle.
+- 67+ per-kernel parity tests under `./ds4_cuda_test`, all passing within the
+  documented ULP tolerances against the CPU oracle (now including the five
+  compressor kernels from Phase 3a).
+- `./ds4-cuda -p "<prompt>"` greedy generation: session-level prefill via
+  `ds4_session_create` + `ds4_session_sync` + `ds4_session_eval` produces a
+  token stream. Phase 3b batched-attention is deferred, so prefill loops the
+  single-token decode kernel (slow-but-correct).
 - Engine-level diagnostic `--cuda-single-layer-test "<prompt>"`: full
   `embed → 43 layers → output head → vocab logits` forward on a real GGUF,
   per-token argmax and top-K agreement reported against the CPU oracle.
   Multi-token result on a 13-token prompt: **92.3% top-1, 97.1% top-8 overlap**
   versus `forward_first_token_cpu`, with ~1.6e-3 relative error at the post-
   layer-43 hidden state — within the cumulative-Q8 drift envelope.
-- Engine-level diagnostic `--cuda-test-vectors [PATH]`: drives the same
-  fresh-cache forward on every prompt in `tests/test-vectors/official.vec`
-  and compares argmax + top-K against the recorded API step-0. Informational;
-  see "What's deferred" for why it doesn't validate end-to-end yet.
+- `--cuda-session-test`, `--cuda-session-eval-test`,
+  `--cuda-session-prefill-test "<prompt>"`,
+  `--cuda-session-test-vectors [PATH]`: Phase 3c smoke + parity drivers
+  exercising session lifecycle, single-token decode, multi-token prefill, and
+  per-case API ground-truth comparison against `tests/test-vectors/official.vec`.
+- `--cuda-test-vectors [PATH]`: legacy fresh-cache (Phase 2.1d) test-vector
+  driver, kept as a regression baseline.
 
-**What's deferred** (Phase 1.5c-compressor + Phase 2 follow-ups):
+**What's deferred** (Phase 3b + CUDA MTP follow-ups):
 
-- Five compressor stubs (`compressor_update_tensor`, `compressor_prefill_tensor`,
-  `compressor_prefill_ratio4_replay_tensor`, `compressor_prefill_state_ratio4_tensor`,
-  `compressor_store_batch_tensor`) — required for compressed-layer (`il=2..42`)
-  prefill at `pos>0`.
-- Four batched-attention stubs (`attention_decode_raw_batch_heads_tensor`,
+- Four batched-attention prefill kernels (`attention_decode_raw_batch_heads_tensor`,
   `attention_decode_mixed_batch_heads_tensor`,
   `attention_prefill_static_mixed_heads_tensor`,
-  `attention_prefill_masked_mixed_heads_tensor`) for production-perf prefill.
-- The CUDA equivalent of the `metal_graph_*` orchestrator (~64 entry points)
-  and the corresponding wireup of `ds4_session_*` (`ds4.c:17582` gates on
-  `e->backend == DS4_BACKEND_METAL`). Until this lands, `ds4-cuda --dump-logprobs`
-  and `ds4_test --logprob-vectors --cuda` are not available.
+  `attention_prefill_masked_mixed_heads_tensor`) — Phase 3b. Until they land,
+  `cuda_graph_prefill_chunked` per-token-loops the single-token decode kernel
+  (correct but linear-time; Metal's batched prefill is materially faster).
+- CUDA MTP / speculative decode is gated off in the CLI; `ds4_session_eval_speculative_argmax`
+  and `ds4_session_eval_mtp_draft` are Metal-only for now. Greedy / sampled
+  decode works without them.
+- HTTP server (`ds4-server-cuda`) wireup for the disk KV cache payload,
+  `--dump-logprobs`, and the speculative-decode REPL fast path.
 
-See `tmp/PHASE-2.1c-PLAN.md` and `tmp/PHASE-2.1d-PLAN.md` for the full
-sub-checkpoint breakdown and the Option A path forward. **This is not yet a
-production-ready CUDA backend** — it is end-to-end correctness validated to
-top-K agreement on single-token forwards, not full-API parity. Do not use
-`ds4-cuda` for anything that requires multi-token generation, KV cache
-reuse, or the HTTP server today.
+**This is an alpha CUDA backend** — it produces correct tokens via the
+session API (validated against the recorded DeepSeek API step-0 row on
+several `tests/test-vectors/official.vec` cases) but the prefill loop is not
+optimized; long-context prefill is materially slower than Metal until
+Phase 3b lands.
 
 ## Test Vectors
 

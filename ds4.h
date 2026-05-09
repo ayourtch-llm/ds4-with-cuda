@@ -118,6 +118,13 @@ int ds4_engine_cuda_single_layer_test(ds4_engine *e, const ds4_tokens *prompt);
  * session APIs (Option A path).  Informational; does not gate. */
 int ds4_engine_cuda_test_vectors_test(ds4_engine *e, const char *vec_path);
 
+/* Phase 3c-4 (session test-vector validation): same .vec parser as
+ * ds4_engine_cuda_test_vectors_test but drives each case through
+ * ds4_session_create + ds4_session_sync (full prefill via Phase 3c-3) and
+ * compares the post-prefill last-token argmax/top-K against the recorded
+ * API step-0 row.  Acceptance: top-1 >= 75% across the cases. */
+int ds4_engine_cuda_session_test_vectors_test(ds4_engine *e, const char *vec_path);
+
 /* Phase 3c-1 (session lifecycle skeleton): create + free a CUDA session for
  * the given context size and report cudaMallocManaged live bytes before /
  * during / after.  No forward pass; this just exercises the new graph

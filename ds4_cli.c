@@ -46,6 +46,8 @@ typedef struct {
     bool cuda_session_test;
     bool cuda_session_eval_test;
     bool cuda_session_prefill_test;
+    const char *cuda_session_test_vectors_path;
+    bool cuda_session_test_vectors;
 } cli_generation_options;
 
 typedef struct {
@@ -436,7 +438,8 @@ static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, 
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
-        fprintf(stderr, "ds4: sampled CLI generation requires the Metal session backend\n");
+        fprintf(stderr, "ds4: sampled CLI generation: ds4_session_create failed "
+                        "(backend not initialized?)\n");
         return 1;
     }
 
@@ -476,14 +479,22 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
     const double t_decode0 = cli_now_sec();
+    /* MTP / speculative decode is Metal-only for now (Phase 3c-5 first-light
+     * scope; CUDA MTP is a deferred follow-up).  Disable the speculative
+     * branch for the CUDA backend so greedy decode stays on the verified
+     * eval kernel. */
+    const bool spec_eligible =
+        cfg->engine.backend != DS4_BACKEND_CUDA &&
+        cfg->gen.temperature <= 0.0f &&
+        ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        getenv("DS4_MTP_SPEC_DISABLE") == NULL;
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = ds4_session_sample(session, cfg->gen.temperature, 0, cfg->gen.top_p, 0.0f, &rng);
         if (token == ds4_token_eos(engine)) break;
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+        if (spec_eligible) {
             ntok = ds4_session_eval_speculative_argmax(session,
                                                        token,
                                                        max_tokens - generated,
@@ -609,7 +620,8 @@ static void json_write_token(FILE *fp, ds4_engine *engine, int token) {
 static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
-        fprintf(stderr, "ds4: --dump-logprobs requires the Metal session backend\n");
+        fprintf(stderr, "ds4: --dump-logprobs: ds4_session_create failed "
+                        "(backend not initialized?)\n");
         return 1;
     }
 
@@ -860,7 +872,8 @@ static void repl_chat_apply_max_prefix(ds4_engine *engine, repl_chat *chat, bool
 static int repl_chat_create_session(ds4_engine *engine, repl_chat *chat, int ctx_size) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, ctx_size) != 0) {
-        fprintf(stderr, "ds4: interactive chat KV cache requires the Metal backend\n");
+        fprintf(stderr, "ds4: interactive chat: ds4_session_create failed "
+                        "(backend not initialized?)\n");
         return 1;
     }
     if (chat->session) ds4_session_free(chat->session);
@@ -962,7 +975,9 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        /* MTP / speculative decode is Metal-only (Phase 3c-5 scope). */
+        if (cfg->engine.backend != DS4_BACKEND_CUDA &&
+            cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             ntok = ds4_session_eval_speculative_argmax(chat->session,
                                                        token,
@@ -1267,6 +1282,12 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--cuda-session-prefill-test")) {
             c.gen.cuda_session_prefill_test = true;
             c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--cuda-session-test-vectors")) {
+            c.gen.cuda_session_test_vectors = true;
+            c.engine.backend = DS4_BACKEND_CUDA;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                c.gen.cuda_session_test_vectors_path = argv[++i];
+            }
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logprobs")) {
@@ -1332,6 +1353,9 @@ int main(int argc, char **argv) {
         rc = ds4_engine_cuda_session_test(engine, cfg.gen.ctx_size);
     } else if (cfg.gen.cuda_session_eval_test) {
         rc = ds4_engine_cuda_session_eval_test(engine, cfg.gen.ctx_size);
+    } else if (cfg.gen.cuda_session_test_vectors) {
+        rc = ds4_engine_cuda_session_test_vectors_test(engine,
+                cfg.gen.cuda_session_test_vectors_path);
     } else if (cfg.gen.prompt == NULL) {
         rc = run_repl(engine, &cfg);
     } else {

@@ -14644,33 +14644,36 @@ static bool cuda_graph_eval_token_raw_swa(
         ds4_cuda_tensor *tmp = cur; cur = nxt; nxt = tmp;
     }
 
-    /* Output head: HC reduce -> rms -> vocab matmul. */
-    int oh_ok = ds4_cuda_begin_commands();
-    if (oh_ok) oh_ok = ds4_cuda_rms_norm_plain_tensor(g->output_flat, cur,
-                                                       (uint32_t)hc_dim, DS4_RMS_EPS);
-    if (oh_ok) oh_ok = ds4_cuda_matmul_f16_tensor(g->output_pre, model->map, model->size,
-                                                   weights->output_hc_fn->abs_offset,
-                                                   hc_dim, DS4_N_HC, g->output_flat, 1u);
-    if (oh_ok) oh_ok = ds4_cuda_output_hc_weights_tensor(
-                        g->output_weights, g->output_pre, model->map, model->size,
-                        weights->output_hc_scale->abs_offset,
-                        weights->output_hc_base->abs_offset,
-                        DS4_N_HC, DS4_HC_EPS);
-    if (oh_ok) oh_ok = ds4_cuda_hc_weighted_sum_tensor(g->output_embd, cur,
-                                                       g->output_weights,
-                                                       DS4_N_EMBD, DS4_N_HC);
-    if (oh_ok) oh_ok = ds4_cuda_rms_norm_weight_tensor(g->output_norm, g->output_embd,
-                                                       model->map, model->size,
-                                                       weights->output_norm->abs_offset,
-                                                       DS4_N_EMBD, DS4_RMS_EPS);
-    if (oh_ok) oh_ok = ds4_cuda_matmul_q8_0_tensor(g->logits, model->map, model->size,
-                                                    weights->output->abs_offset,
-                                                    DS4_N_EMBD, DS4_N_VOCAB,
-                                                    g->output_norm, 1u);
-    if (oh_ok) oh_ok = ds4_cuda_end_commands();
-    if (!oh_ok) return false;
-
+    /* Output head: HC reduce -> rms -> vocab matmul.  Skipped entirely when
+     * logits_out is NULL — prefill calls into eval many times and only the
+     * last token needs the output head; the matmul over DS4_N_VOCAB=129280 is
+     * the most expensive single step per token. */
     if (logits_out) {
+        int oh_ok = ds4_cuda_begin_commands();
+        if (oh_ok) oh_ok = ds4_cuda_rms_norm_plain_tensor(g->output_flat, cur,
+                                                           (uint32_t)hc_dim, DS4_RMS_EPS);
+        if (oh_ok) oh_ok = ds4_cuda_matmul_f16_tensor(g->output_pre, model->map, model->size,
+                                                       weights->output_hc_fn->abs_offset,
+                                                       hc_dim, DS4_N_HC, g->output_flat, 1u);
+        if (oh_ok) oh_ok = ds4_cuda_output_hc_weights_tensor(
+                            g->output_weights, g->output_pre, model->map, model->size,
+                            weights->output_hc_scale->abs_offset,
+                            weights->output_hc_base->abs_offset,
+                            DS4_N_HC, DS4_HC_EPS);
+        if (oh_ok) oh_ok = ds4_cuda_hc_weighted_sum_tensor(g->output_embd, cur,
+                                                           g->output_weights,
+                                                           DS4_N_EMBD, DS4_N_HC);
+        if (oh_ok) oh_ok = ds4_cuda_rms_norm_weight_tensor(g->output_norm, g->output_embd,
+                                                           model->map, model->size,
+                                                           weights->output_norm->abs_offset,
+                                                           DS4_N_EMBD, DS4_RMS_EPS);
+        if (oh_ok) oh_ok = ds4_cuda_matmul_q8_0_tensor(g->logits, model->map, model->size,
+                                                        weights->output->abs_offset,
+                                                        DS4_N_EMBD, DS4_N_VOCAB,
+                                                        g->output_norm, 1u);
+        if (oh_ok) oh_ok = ds4_cuda_end_commands();
+        if (!oh_ok) return false;
+
         if (!ds4_cuda_tensor_read(g->logits, 0, logits_out,
                                   (size_t)DS4_N_VOCAB * sizeof(float))) {
             return false;
@@ -14699,12 +14702,11 @@ static bool cuda_graph_prefill_chunked(
     if (n_tokens <= 0 || n_tokens > prompt->len) return false;
     for (int t = 0; t < n_tokens; t++) {
         const bool last = (t == n_tokens - 1);
+        /* eval skips the entire output head when logits_out is NULL (vocab
+         * matmul is the most expensive single step per token). */
         float *out_ptr = last ? logits : NULL;
         /* TODO 3b: collapse this per-token loop into a batched-attention
-         * prefill orchestrator.  Until then the eval kernel still runs the
-         * full output-head matmul on every token; non-last logits are simply
-         * not read back.  Batched prefill skips the head except on the
-         * output row. */
+         * prefill orchestrator (layer-major schedule, one logits readback). */
         if (!cuda_graph_eval_token_raw_swa(g, model, weights,
                                            (uint32_t)prompt->v[t],
                                            (uint32_t)t,
@@ -18845,6 +18847,263 @@ int ds4_engine_cuda_test_vectors_test(ds4_engine *e, const char *vec_path) {
             topk_total > 0 ? 100.0 * (double)topk_overlap_sum / (double)topk_total : 0.0);
 
     return 0;  /* informational; no gate (fresh-cache mode is degenerate by design). */
+#endif
+}
+
+/* Phase 3c-4: drive each official.vec case through the new CUDA session
+ * (ds4_session_create + ds4_session_sync = real prefill via 3c-3) and
+ * compare the post-prefill last-token logits' top-K against the recorded
+ * API step-0 row.  Mirrors ds4_engine_cuda_test_vectors_test (2.1d-B
+ * fresh-cache) but uses the session graph for full-context prefill. */
+int ds4_engine_cuda_session_test_vectors_test(ds4_engine *e, const char *vec_path) {
+#ifndef DS4_USE_CUDA
+    (void)e; (void)vec_path;
+    fprintf(stderr, "ds4: cuda_session_test_vectors requires a build with DS4_USE_CUDA\n");
+    return 1;
+#else
+    if (!e->cuda_ready) {
+        fprintf(stderr, "ds4: cuda_session_test_vectors requires the CUDA backend\n");
+        return 1;
+    }
+    if (!vec_path || !vec_path[0]) vec_path = "tests/test-vectors/official.vec";
+
+    FILE *fp = fopen(vec_path, "rb");
+    if (!fp) {
+        fprintf(stderr, "ds4: cuda_session_test_vectors cannot open '%s'\n", vec_path);
+        return 1;
+    }
+
+    fprintf(stderr,
+            "ds4: 3c-4 session-test-vectors — vec=%s\n"
+            "ds4: NOTE: drives each case through ds4_session_create + sync (full\n"
+            "ds4:       prefill); compares last-token argmax against API step-0.\n",
+            vec_path);
+
+    int total_cases     = 0;
+    int top1_match      = 0;
+    int topk_overlap_sum = 0;
+    int topk_total      = 0;
+
+    char line[2048];
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (!*p || *p == '#') continue;
+
+        char id[96];
+        int  ctx_unused = 0;
+        int  nsteps = 0;
+        char prompt_path[512];
+        if (sscanf(p, "case %95s %d %d %511s", id, &ctx_unused, &nsteps, prompt_path) != 4) {
+            continue;
+        }
+        (void)ctx_unused; (void)nsteps;
+
+        char *prompt_text = cuda_2_1d_read_file(prompt_path);
+        if (!prompt_text) {
+            fprintf(stderr, "ds4: 3c-4 case %s — cannot read prompt '%s', skipping\n",
+                    id, prompt_path);
+            continue;
+        }
+
+        ds4_tokens prompt = {0};
+        ds4_encode_chat_prompt(e, "", prompt_text, DS4_THINK_NONE, &prompt);
+        free(prompt_text);
+        if (prompt.len <= 0) {
+            fprintf(stderr, "ds4: 3c-4 case %s — empty prompt after encoding\n", id);
+            ds4_tokens_free(&prompt);
+            continue;
+        }
+
+        /* Pick a ctx_size large enough for the prompt + a small headroom; the
+         * session's raw_cap is min(N_SWA + prefill_cap, ctx) rounded to 256.
+         * The vec records prompts up to ~few-thousand tokens; 8192 is enough
+         * for the 5 official cases. */
+        int session_ctx = prompt.len + 256;
+        if (session_ctx < 4096) session_ctx = 4096;
+
+        ds4_session *s = NULL;
+        if (ds4_session_create(&s, e, session_ctx) != 0) {
+            fprintf(stderr, "ds4: 3c-4 case %s — session_create failed\n", id);
+            ds4_tokens_free(&prompt);
+            continue;
+        }
+
+        char sync_err[256] = {0};
+        if (ds4_session_sync(s, &prompt, sync_err, sizeof(sync_err)) != 0) {
+            fprintf(stderr, "ds4: 3c-4 case %s — session_sync failed: %s\n",
+                    id, sync_err);
+            ds4_session_free(s);
+            ds4_tokens_free(&prompt);
+            continue;
+        }
+
+        const float *logits = s->logits;
+
+        /* Top-K (top 20) by IDs and logits, then logprobs via logsumexp. */
+        const int K = 20;
+        int   top_id[20];
+        float top_logit[20];
+        for (int k = 0; k < K; k++) { top_id[k] = -1; top_logit[k] = -INFINITY; }
+        for (int v = 0; v < (int)DS4_N_VOCAB; v++) {
+            const float lv = logits[v];
+            for (int k = 0; k < K; k++) {
+                if (top_id[k] < 0 || lv > top_logit[k]) {
+                    for (int j = K - 1; j > k; j--) {
+                        top_id[j] = top_id[j - 1];
+                        top_logit[j] = top_logit[j - 1];
+                    }
+                    top_id[k] = v;
+                    top_logit[k] = lv;
+                    break;
+                }
+            }
+        }
+        float lmax = top_logit[0];
+        double lse = 0.0;
+        for (int v = 0; v < (int)DS4_N_VOCAB; v++) {
+            lse += exp((double)logits[v] - (double)lmax);
+        }
+        const float log_z = lmax + (float)log(lse);
+        float top_logprob[20];
+        for (int k = 0; k < K; k++) top_logprob[k] = top_logit[k] - log_z;
+
+        /* Read step rows for this case; capture step 0 expected. */
+        unsigned char selected_bytes[128];
+        int           selected_len = 0;
+        int           official_ntop = 0;
+        struct {
+            unsigned char bytes[128];
+            int           len;
+            float         logprob;
+        } official_top[32];
+
+        bool got_step0 = false;
+        int step_idx = -1;
+        int top_idx_in_step = 0;
+
+        while (fgets(line, sizeof(line), fp)) {
+            char *q1 = line;
+            while (*q1 && isspace((unsigned char)*q1)) q1++;
+            size_t qlen = strlen(q1);
+            while (qlen && isspace((unsigned char)q1[qlen - 1])) q1[--qlen] = '\0';
+            if (!q1[0] || q1[0] == '#') continue;
+            if (!strcmp(q1, "end")) break;
+
+            if (!strncmp(q1, "step ", 5)) {
+                int idx = -1, ntop = 0;
+                char hex[300] = {0};
+                if (sscanf(q1, "step %d %255s %d", &idx, hex, &ntop) != 3) continue;
+                step_idx = idx;
+                if (idx == 0) {
+                    if (!cuda_2_1d_hex_to_bytes(hex, selected_bytes, 128, &selected_len)) {
+                        selected_len = 0;
+                    }
+                    if (ntop < 0) ntop = 0;
+                    if (ntop > 32) ntop = 32;
+                    official_ntop = ntop;
+                    top_idx_in_step = 0;
+                }
+            } else if (!strncmp(q1, "top ", 4)) {
+                if (step_idx == 0 && top_idx_in_step < official_ntop) {
+                    char hex[300] = {0};
+                    float lp = 0.0f;
+                    if (sscanf(q1, "top %255s %f", hex, &lp) == 2) {
+                        int len = 0;
+                        if (cuda_2_1d_hex_to_bytes(hex, official_top[top_idx_in_step].bytes,
+                                                   128, &len)) {
+                            official_top[top_idx_in_step].len = len;
+                            official_top[top_idx_in_step].logprob = lp;
+                            top_idx_in_step++;
+                            if (top_idx_in_step == official_ntop) got_step0 = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!got_step0) {
+            fprintf(stderr, "ds4: 3c-4 case %s — no step 0 found, skipping\n", id);
+            ds4_session_free(s);
+            ds4_tokens_free(&prompt);
+            continue;
+        }
+
+        total_cases++;
+
+        size_t cuda_top1_len = 0;
+        char *cuda_top1_text = ds4_token_text(e, top_id[0], &cuda_top1_len);
+        bool t1_match = (cuda_top1_text &&
+                         (size_t)selected_len == cuda_top1_len &&
+                         memcmp(cuda_top1_text, selected_bytes, selected_len) == 0);
+        if (t1_match) top1_match++;
+
+        int overlap = 0;
+        for (int i = 0; i < official_ntop; i++) {
+            for (int j = 0; j < K; j++) {
+                size_t cl = 0;
+                char *ct = ds4_token_text(e, top_id[j], &cl);
+                bool eq = (ct && cl == (size_t)official_top[i].len &&
+                           memcmp(ct, official_top[i].bytes, cl) == 0);
+                free(ct);
+                if (eq) { overlap++; break; }
+            }
+        }
+        topk_overlap_sum += overlap;
+        topk_total += official_ntop;
+
+        char sel_repr[256], cuda_repr[256];
+        size_t sr = 0, cr = 0;
+        for (int i = 0; i < selected_len && sr + 4 < sizeof(sel_repr); i++) {
+            unsigned char c = selected_bytes[i];
+            if (c >= 0x20 && c < 0x7f && c != '\\' && c != '"') sel_repr[sr++] = (char)c;
+            else { sr += (size_t)snprintf(&sel_repr[sr], sizeof(sel_repr) - sr, "\\x%02x", c); }
+        }
+        sel_repr[sr] = '\0';
+        for (size_t i = 0; i < cuda_top1_len && cr + 4 < sizeof(cuda_repr); i++) {
+            unsigned char c = (unsigned char)cuda_top1_text[i];
+            if (c >= 0x20 && c < 0x7f && c != '\\' && c != '"') cuda_repr[cr++] = (char)c;
+            else { cr += (size_t)snprintf(&cuda_repr[cr], sizeof(cuda_repr) - cr, "\\x%02x", c); }
+        }
+        cuda_repr[cr] = '\0';
+
+        fprintf(stderr,
+                "ds4: 3c-4 case %s prompt_len=%d:  "
+                "official_step0=\"%s\" (logprob=%.4f, ntop=%d)  "
+                "cuda_top1=\"%s\" id=%d logit=%.4f logprob=%.4f  "
+                "top1_match=%d  topK_overlap=%d/%d\n",
+                id, prompt.len,
+                sel_repr, official_top[0].logprob, official_ntop,
+                cuda_repr, top_id[0], top_logit[0], top_logprob[0],
+                t1_match ? 1 : 0, overlap, official_ntop);
+
+        free(cuda_top1_text);
+        ds4_session_free(s);
+        ds4_tokens_free(&prompt);
+    }
+
+    fclose(fp);
+
+    const double top1_pct = total_cases > 0
+        ? 100.0 * (double)top1_match / (double)total_cases
+        : 0.0;
+    const double topk_pct = topk_total > 0
+        ? 100.0 * (double)topk_overlap_sum / (double)topk_total
+        : 0.0;
+    fprintf(stderr,
+            "ds4: 3c-4 session-test-vectors aggregate: %d cases — "
+            "top1 %d/%d (%.1f%%), topK overlap %d/%d (%.1f%%)\n",
+            total_cases, top1_match, total_cases, top1_pct,
+            topk_overlap_sum, topk_total, topk_pct);
+
+    /* Acceptance gate from the 3c brief: top-1 >= 75% (matches 2.1c-5 gate;
+     * tightenable once full-prefill semantics prove out).  Pass also requires
+     * at least one case actually ran. */
+    const bool pass = (total_cases > 0) && (top1_match * 4 >= total_cases * 3);
+    fprintf(stderr,
+            "ds4: 3c-4 %s (top1>=75%% gate)\n",
+            pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
 #endif
 }
 

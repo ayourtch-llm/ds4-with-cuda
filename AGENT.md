@@ -7,12 +7,14 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
 ## Goals
 
 - Keep the production path as whole-model Metal graph inference.  An alpha
-  CUDA backend (Phase 2, Linux + NVIDIA GB10) is now a peer kernel target;
-  the per-kernel parity harness and engine-level diagnostics live alongside
-  the Metal path.  CUDA is not yet at session-level parity with Metal —
-  several compressor and batched-attention kernels are still stubs and the
-  `metal_graph_*` orchestrator has no CUDA equivalent yet.  See
-  `tmp/PHASE-2.1c-PLAN.md` and `tmp/PHASE-2.1d-PLAN.md` for the gap.
+  CUDA backend (Linux + NVIDIA GB10) now ships as a session-functional peer:
+  the per-kernel parity harness, engine-level diagnostics, and the Phase 3c
+  CUDA `ds4_cuda_graph` + session orchestrator (`cuda_graph_eval_token_raw_swa`,
+  `cuda_graph_prefill_chunked`) all live alongside the Metal path. Per-token
+  decode uses the validated single-token CUDA kernels in a loop; batched-
+  attention prefill (`attention_*_batch_*`) is intentionally deferred to
+  Phase 3b for a measured perf baseline.  MTP / speculative decode is
+  Metal-only for now; greedy + sampled decode work on CUDA.
 - Keep model loading mmap-backed; do not eagerly copy the full GGUF.  CUDA
   registers the same mmap range via `cudaHostRegister` rather than copying.
 - Keep the CPU backend CPU-only and use it only as reference/debug code.
@@ -45,7 +47,12 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
 
 - `ds4.c`: model loading, tokenizer, CPU reference code, Metal graph scheduling,
   sessions, disk-cache payload serialization.  Also hosts the CUDA engine-level
-  diagnostics (`ds4_engine_cuda_single_layer_test`, `ds4_engine_cuda_test_vectors_test`).
+  diagnostics (`ds4_engine_cuda_single_layer_test`, `ds4_engine_cuda_test_vectors_test`,
+  `ds4_engine_cuda_session_test`, `ds4_engine_cuda_session_eval_test`,
+  `ds4_engine_cuda_session_prefill_test`, `ds4_engine_cuda_session_test_vectors_test`)
+  and the CUDA session graph (`ds4_cuda_graph` struct, `cuda_graph_alloc_raw_cap`,
+  `cuda_graph_free`, `cuda_graph_eval_token_raw_swa`, `cuda_graph_prefill_chunked`)
+  + the `ds4_session_*` CUDA dispatch branches.
 - `ds4_cli.c`: command line, linenoise REPL, interactive transcript handling.
 - `ds4_server.c`: OpenAI/Anthropic compatible HTTP API, worker queue, streaming,
   tool-call mapping, disk KV cache policy.
@@ -66,18 +73,40 @@ model and Metal are available. Use live server tests only when intentionally
 testing the API surface.
 
 For the CUDA backend, the per-kernel parity harness is `./ds4_cuda_test` and
-should pass `60+ ok 0 fail` against a tolerance table maintained in
+should pass `67+ ok 0 fail` against a tolerance table maintained in
 `tmp/tolerances.md`.  Engine-level diagnostics:
 
+- `./ds4-cuda -p "<prompt>"` — first-light greedy generation through the
+  CUDA session API (Phase 3c).  Drives `ds4_session_create` +
+  `ds4_session_sync` + `ds4_session_eval` end-to-end on top of the validated
+  per-kernel CUDA math.  Use this to confirm the session-level pipeline
+  produces tokens; expect markedly slower prefill than Metal until Phase 3b
+  ports the batched-attention kernels.
 - `./ds4-cuda --cuda-single-layer-test "<prompt>"` — multi-token fresh-cache
   forward through the full engine (embed → 43 layers → output head → vocab),
   per-token argmax + top-K agreement vs CPU oracle.  Current pass criterion is
   top-1 ≥75% AND top-8 overlap ≥75% across the prompt; observed result on the
   reference 13-token prompt is 92% top-1 / 97% top-8.
-- `./ds4-cuda --cuda-test-vectors [PATH]` — same fresh-cache forward applied
-  to each `tests/test-vectors/official.vec` case.  Informational only because
-  fresh-cache without prior context cannot match the API's post-prefill step-0
-  predictions; useful as a deferral breadcrumb.
+- `./ds4-cuda --cuda-session-test [--ctx N]` — Phase 3c-1 lifecycle smoke.
+  Creates and frees a CUDA session, reports cudaMallocManaged live bytes
+  before / after.  No forward pass.
+- `./ds4-cuda --cuda-session-eval-test [--ctx N]` — Phase 3c-2 single-token
+  decode through `ds4_session_eval`.  Validates against
+  `forward_first_token_cpu(token=0)` + `output_logits_one`.  Gate: top-1
+  match, top-8 overlap ≥6/8, top-1 logit relative error ≤1e-2.
+- `./ds4-cuda --cuda-session-prefill-test -p "<prompt>"` — Phase 3c-3
+  multi-token prefill via `ds4_session_sync`.  CPU oracle is
+  `forward_token_raw_swa_cpu` looped over the same prompt.  Gate: top-1
+  match, top-8 overlap ≥4/8, top-1 logit relative error ≤5e-2 (cumulative
+  Q8/FP8 drift envelope across the prefill positions).
+- `./ds4-cuda --cuda-session-test-vectors [PATH]` — Phase 3c-4 ground-truth
+  validation against the recorded API step-0 in
+  `tests/test-vectors/official.vec`.  Each case runs through the new CUDA
+  session (full prefill); compares argmax + top-K against the API selection.
+  Acceptance: top-1 ≥75% across the cases that complete.
+- `./ds4-cuda --cuda-test-vectors [PATH]` — legacy Phase 2.1d fresh-cache
+  driver, kept as a regression baseline.  Informational only (fresh-cache
+  without prior context cannot match post-prefill API step-0).
 
 ## CUDA backend notes (Phase 2 standing knowledge)
 
