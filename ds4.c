@@ -13957,6 +13957,48 @@ typedef struct {
     ds4_cuda_tensor *output_norm;
     ds4_cuda_tensor *logits;
 
+    /* Phase 7 batched-prefill scratch.  Mirrors Metal's batch_* family at
+     * ds4.c:8376-8414 — sized prefill_cap × per-token-row.  Allocated when
+     * prefill_cap > 1; sub-1 prefill_cap leaves these NULL.  Stage A wires
+     * them into the graph; the layer-major orchestrator that consumes them
+     * lands in Stage C/D (cuda_graph_encode_layer_attention_batch +
+     * cuda_graph_encode_layer_ffn_batch + cuda_graph_prefill_chunked body
+     * swap). */
+    ds4_cuda_tensor *prefill_tokens;
+    ds4_cuda_tensor *batch_cur_hc;
+    ds4_cuda_tensor *batch_next_hc;
+    ds4_cuda_tensor *batch_flat_hc;
+    ds4_cuda_tensor *batch_hc_mix;
+    ds4_cuda_tensor *batch_hc_split;
+    ds4_cuda_tensor *batch_qr;
+    ds4_cuda_tensor *batch_qr_norm;
+    ds4_cuda_tensor *batch_q;
+    ds4_cuda_tensor *batch_kv_raw;
+    ds4_cuda_tensor *batch_kv;
+    ds4_cuda_tensor *batch_indexer_q;
+    ds4_cuda_tensor *batch_indexer_weights;
+    ds4_cuda_tensor *batch_heads;
+    ds4_cuda_tensor *batch_attn_low;
+    ds4_cuda_tensor *batch_attn_out;
+    ds4_cuda_tensor *batch_group_tmp;
+    ds4_cuda_tensor *batch_low_tmp;
+    ds4_cuda_tensor *batch_after_attn_hc;
+    ds4_cuda_tensor *batch_ffn_cur;
+    ds4_cuda_tensor *batch_ffn_norm;
+    ds4_cuda_tensor *batch_shared_gate;
+    ds4_cuda_tensor *batch_shared_up;
+    ds4_cuda_tensor *batch_shared_mid;
+    ds4_cuda_tensor *batch_shared_out;
+    ds4_cuda_tensor *batch_router_logits;
+    ds4_cuda_tensor *batch_router_probs;
+    ds4_cuda_tensor *batch_router_selected;
+    ds4_cuda_tensor *batch_router_weights;
+    ds4_cuda_tensor *batch_routed_gate;
+    ds4_cuda_tensor *batch_routed_up;
+    ds4_cuda_tensor *batch_routed_mid;
+    ds4_cuda_tensor *batch_routed_down;
+    ds4_cuda_tensor *batch_routed_out;
+
     /* Phase 4 Step 3: optional MTP draft model state.  Allocated only when
      * the engine has loaded an MTP weights blob (e->mtp_ready); otherwise
      * all tensors stay NULL.  The drafter has its own raw cache because it
@@ -14038,6 +14080,42 @@ static void cuda_graph_free(ds4_cuda_graph *g) {
     ds4_cuda_tensor_free(g->mtp_eproj);
     ds4_cuda_tensor_free(g->mtp_enorm);
     ds4_cuda_tensor_free(g->mtp_embed);
+
+    /* Phase 7 batch_* frees (reverse of alloc order). */
+    ds4_cuda_tensor_free(g->batch_routed_out);
+    ds4_cuda_tensor_free(g->batch_routed_down);
+    ds4_cuda_tensor_free(g->batch_routed_mid);
+    ds4_cuda_tensor_free(g->batch_routed_up);
+    ds4_cuda_tensor_free(g->batch_routed_gate);
+    ds4_cuda_tensor_free(g->batch_router_weights);
+    ds4_cuda_tensor_free(g->batch_router_selected);
+    ds4_cuda_tensor_free(g->batch_router_probs);
+    ds4_cuda_tensor_free(g->batch_router_logits);
+    ds4_cuda_tensor_free(g->batch_shared_out);
+    ds4_cuda_tensor_free(g->batch_shared_mid);
+    ds4_cuda_tensor_free(g->batch_shared_up);
+    ds4_cuda_tensor_free(g->batch_shared_gate);
+    ds4_cuda_tensor_free(g->batch_ffn_norm);
+    ds4_cuda_tensor_free(g->batch_ffn_cur);
+    ds4_cuda_tensor_free(g->batch_after_attn_hc);
+    ds4_cuda_tensor_free(g->batch_low_tmp);
+    ds4_cuda_tensor_free(g->batch_group_tmp);
+    ds4_cuda_tensor_free(g->batch_attn_out);
+    ds4_cuda_tensor_free(g->batch_attn_low);
+    ds4_cuda_tensor_free(g->batch_heads);
+    ds4_cuda_tensor_free(g->batch_indexer_weights);
+    ds4_cuda_tensor_free(g->batch_indexer_q);
+    ds4_cuda_tensor_free(g->batch_kv);
+    ds4_cuda_tensor_free(g->batch_kv_raw);
+    ds4_cuda_tensor_free(g->batch_q);
+    ds4_cuda_tensor_free(g->batch_qr_norm);
+    ds4_cuda_tensor_free(g->batch_qr);
+    ds4_cuda_tensor_free(g->batch_hc_split);
+    ds4_cuda_tensor_free(g->batch_hc_mix);
+    ds4_cuda_tensor_free(g->batch_flat_hc);
+    ds4_cuda_tensor_free(g->batch_next_hc);
+    ds4_cuda_tensor_free(g->batch_cur_hc);
+    ds4_cuda_tensor_free(g->prefill_tokens);
 
     ds4_cuda_tensor_free(g->logits);
     ds4_cuda_tensor_free(g->output_norm);
@@ -14276,6 +14354,67 @@ static bool cuda_graph_alloc_raw_cap(
     g->output_norm = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->logits = ds4_cuda_tensor_alloc(vocab_dim * sizeof(float));
 
+    /* Phase 7 batch_* scratch.  Mirrors Metal's batch_* alloc at ds4.c:8839-8876.
+     * Sizing factor `pc = prefill_cap` rows × per-token-row dims.  When
+     * prefill_cap == 1 (decode-only / per-token-loop sessions) the alloc is
+     * still small (one row each) — keeps the graph_alloc shape uniform and
+     * avoids special-casing the validation chain. */
+    bool batch_alloc_ok = true;
+    {
+        const uint64_t pc_u64 = (uint64_t)pc;
+        g->prefill_tokens         = ds4_cuda_tensor_alloc(pc_u64 * sizeof(int32_t));
+        g->batch_cur_hc           = ds4_cuda_tensor_alloc(pc_u64 * hc_dim * sizeof(float));
+        g->batch_next_hc          = ds4_cuda_tensor_alloc(pc_u64 * hc_dim * sizeof(float));
+        g->batch_flat_hc          = ds4_cuda_tensor_alloc(pc_u64 * hc_dim * sizeof(float));
+        g->batch_hc_mix           = ds4_cuda_tensor_alloc(pc_u64 * mix_hc * sizeof(float));
+        g->batch_hc_split         = ds4_cuda_tensor_alloc(pc_u64 * mix_hc * sizeof(float));
+        g->batch_qr               = ds4_cuda_tensor_alloc(pc_u64 * q_rank * sizeof(float));
+        g->batch_qr_norm          = ds4_cuda_tensor_alloc(pc_u64 * q_rank * sizeof(float));
+        g->batch_q                = ds4_cuda_tensor_alloc(pc_u64 * q_dim * sizeof(float));
+        g->batch_kv_raw           = ds4_cuda_tensor_alloc(pc_u64 * DS4_N_HEAD_DIM * sizeof(float));
+        g->batch_kv               = ds4_cuda_tensor_alloc(pc_u64 * DS4_N_HEAD_DIM * sizeof(float));
+        g->batch_indexer_q        = ds4_cuda_tensor_alloc(pc_u64 * indexer_q_dim * sizeof(float));
+        g->batch_indexer_weights  = ds4_cuda_tensor_alloc(pc_u64 * DS4_N_INDEXER_HEAD * sizeof(float));
+        g->batch_heads            = ds4_cuda_tensor_alloc(pc_u64 * q_dim * sizeof(float));
+        g->batch_attn_low         = ds4_cuda_tensor_alloc(pc_u64 * low_dim * sizeof(float));
+        g->batch_attn_out         = ds4_cuda_tensor_alloc(pc_u64 * DS4_N_EMBD * sizeof(float));
+        g->batch_group_tmp        = ds4_cuda_tensor_alloc(pc_u64 * group_dim * sizeof(float));
+        g->batch_low_tmp          = ds4_cuda_tensor_alloc(pc_u64 * DS4_N_LORA_O * sizeof(float));
+        g->batch_after_attn_hc    = ds4_cuda_tensor_alloc(pc_u64 * hc_dim * sizeof(float));
+        g->batch_ffn_cur          = ds4_cuda_tensor_alloc(pc_u64 * DS4_N_EMBD * sizeof(float));
+        g->batch_ffn_norm         = ds4_cuda_tensor_alloc(pc_u64 * DS4_N_EMBD * sizeof(float));
+        g->batch_shared_gate      = ds4_cuda_tensor_alloc(pc_u64 * shared_dim * sizeof(float));
+        g->batch_shared_up        = ds4_cuda_tensor_alloc(pc_u64 * shared_dim * sizeof(float));
+        g->batch_shared_mid       = ds4_cuda_tensor_alloc(pc_u64 * shared_dim * sizeof(float));
+        g->batch_shared_out       = ds4_cuda_tensor_alloc(pc_u64 * DS4_N_EMBD * sizeof(float));
+        g->batch_router_logits    = ds4_cuda_tensor_alloc(pc_u64 * DS4_N_EXPERT * sizeof(float));
+        g->batch_router_probs     = ds4_cuda_tensor_alloc(pc_u64 * DS4_N_EXPERT * sizeof(float));
+        g->batch_router_selected  = ds4_cuda_tensor_alloc(pc_u64 * DS4_N_EXPERT_USED * sizeof(int));
+        g->batch_router_weights   = ds4_cuda_tensor_alloc(pc_u64 * DS4_N_EXPERT_USED * sizeof(float));
+        g->batch_routed_gate      = ds4_cuda_tensor_alloc(pc_u64 * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+        g->batch_routed_up        = ds4_cuda_tensor_alloc(pc_u64 * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+        g->batch_routed_mid       = ds4_cuda_tensor_alloc(pc_u64 * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+        g->batch_routed_down      = ds4_cuda_tensor_alloc(pc_u64 * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
+        g->batch_routed_out       = ds4_cuda_tensor_alloc(pc_u64 * DS4_N_EMBD * sizeof(float));
+
+        batch_alloc_ok = g->prefill_tokens && g->batch_cur_hc && g->batch_next_hc &&
+                         g->batch_flat_hc && g->batch_hc_mix && g->batch_hc_split &&
+                         g->batch_qr && g->batch_qr_norm &&
+                         g->batch_q && g->batch_kv_raw && g->batch_kv &&
+                         g->batch_indexer_q && g->batch_indexer_weights &&
+                         g->batch_heads && g->batch_attn_low && g->batch_attn_out &&
+                         g->batch_group_tmp && g->batch_low_tmp &&
+                         g->batch_after_attn_hc &&
+                         g->batch_ffn_cur && g->batch_ffn_norm &&
+                         g->batch_shared_gate && g->batch_shared_up &&
+                         g->batch_shared_mid && g->batch_shared_out &&
+                         g->batch_router_logits && g->batch_router_probs &&
+                         g->batch_router_selected && g->batch_router_weights &&
+                         g->batch_routed_gate && g->batch_routed_up &&
+                         g->batch_routed_mid && g->batch_routed_down &&
+                         g->batch_routed_out;
+    }
+
     /* Phase 4 Step 3: optional MTP draft scratch + speculative frontier.
      * Skipped entirely when mtp_ready is false; pointers stay NULL and the
      * `ok` validation below short-circuits the MTP-tagged checks via the
@@ -14356,6 +14495,7 @@ static bool cuda_graph_alloc_raw_cap(
     }
 
     const bool ok = state_init_ok && layer_cache_ok && mtp_alloc_ok &&
+                    batch_alloc_ok &&
                     g->cur_hc && g->next_hc && g->flat_hc &&
                     g->hc_mix && g->hc_split &&
                     g->hc_pre && g->hc_post && g->hc_comb &&
