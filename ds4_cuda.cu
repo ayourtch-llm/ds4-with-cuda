@@ -93,10 +93,6 @@ static uint64_t g_model_register_bytes;
 static uint64_t g_kernel_stub_calls;
 static int g_kernel_stub_warned;
 
-static ds4_cuda_block_q8_K *g_scratch_routed_moe_xq;
-static size_t               g_scratch_routed_moe_xq_bytes;
-static ds4_cuda_block_q8_K *g_scratch_routed_moe_midq;
-static size_t               g_scratch_routed_moe_midq_bytes;
 
 static int ds4_cuda_check(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
@@ -116,25 +112,6 @@ static int ds4_cuda_get_device_attr(cudaDeviceAttr attr) {
 
 static double ds4_cuda_mib(uint64_t bytes) {
     return (double)bytes / (1024.0 * 1024.0);
-}
-
-static int ds4_cuda_scratch_reserve(void **ptr, size_t *cap, size_t bytes, const char *label) {
-    if (bytes <= *cap) return 1;
-    if (*ptr) {
-        if (!ds4_cuda_check(cudaStreamSynchronize(g_stream), label)) return 0;
-        (void)cudaFree(*ptr);
-        *ptr = NULL;
-        *cap = 0;
-    }
-    if (!ds4_cuda_check(cudaMallocManaged(ptr, bytes), label)) return 0;
-    *cap = bytes;
-    return 1;
-}
-
-static void ds4_cuda_scratch_free(void **ptr, size_t *cap) {
-    if (*ptr) (void)cudaFree(*ptr);
-    *ptr = NULL;
-    *cap = 0;
 }
 
 static int ds4_cuda_trace_allocs(void) {
@@ -384,20 +361,9 @@ static __device__ __forceinline__ float ds4_cuda_f16_to_f32(uint16_t h) {
     return __half2float(__ushort_as_half(h));
 }
 
-static __device__ int32_t ds4_cuda_dot_q2_16(
-        const uint8_t *q2,
-        const int8_t  *q8,
-        int            shift) {
-    int32_t sum = 0;
-    for (uint32_t i = 0; i < 16; i++) {
-        sum += (int32_t)q8[i] * (int32_t)((q2[i] >> shift) & 3);
-    }
-    return sum;
-}
-
-/* Phase 3b-3 retile companion to ds4_cuda_vec_dot_q2_K_q8_K below.
+/* Phase 3b-3 warp helper for Q2_K dot against Q8_K activations.
  *
- * Same math, but the per-outer-block work is parallelised across the 32 lanes
+ * Per-outer-block work is parallelised across the 32 lanes
  * of the calling warp:
  *   1. `summs` (16 i16×i4 products): lanes 0..15 each compute one product;
  *      5-step __shfl_xor_sync int-tree reduces to a bit-exact int32.
@@ -485,108 +451,7 @@ static __device__ __forceinline__ float ds4_cuda_warp_vec_dot_q2_K_q8_K(
     return sumf;
 }
 
-static __device__ float ds4_cuda_vec_dot_q2_K_q8_K(
-        const ds4_cuda_block_q2_K *x,
-        const ds4_cuda_block_q8_K *y,
-        uint32_t                   nb) {
-    float sumf = 0.0f;
-
-    for (uint32_t i = 0; i < nb; i++) {
-        const uint8_t *q2 = x[i].qs;
-        const int8_t *q8 = y[i].qs;
-        const uint8_t *sc = x[i].scales;
-
-        int summs = 0;
-        for (int j = 0; j < 16; j++) {
-            summs += (int)y[i].bsums[j] * (int)(sc[j] >> 4);
-        }
-
-        /* Match ds4.c's ARM NEON path exactly: the min-offset contribution is
-         * accumulated before the scaled q2 dot, each as its own FMA.  Grouping
-         * them as `d*isum - dmin*summs` is mathematically equivalent but moved
-         * dense_q2_k from bit-exact to ~23 ULP on GB10. */
-        const float d = y[i].d * ds4_cuda_f16_to_f32(x[i].d);
-        const float dmin = -y[i].d * ds4_cuda_f16_to_f32(x[i].dmin);
-        sumf = fmaf(dmin, (float)summs, sumf);
-
-        int isum = 0;
-        int is = 0;
-        for (int k = 0; k < 2; k++) {
-            int shift = 0;
-            for (int j = 0; j < 4; j++) {
-                int d = sc[is++] & 0x0f;
-                isum += d * ds4_cuda_dot_q2_16(q2, q8, shift);
-
-                d = sc[is++] & 0x0f;
-                isum += d * ds4_cuda_dot_q2_16(q2 + 16, q8 + 16, shift);
-
-                shift += 2;
-                q8 += 32;
-            }
-            q2 += 32;
-        }
-        sumf = fmaf(d, (float)isum, sumf);
-    }
-    return sumf;
-}
-
-static __device__ int32_t ds4_cuda_dot_iq2_pair_16(
-        uint8_t       grid0_idx,
-        uint8_t       sign0_idx,
-        uint8_t       grid1_idx,
-        uint8_t       sign1_idx,
-        const int8_t *q8) {
-    const uint8_t *grid0 = (const uint8_t *)(iq2xxs_grid + grid0_idx);
-    const uint8_t *grid1 = (const uint8_t *)(iq2xxs_grid + grid1_idx);
-    const uint8_t signs0 = ksigns_iq2xs[sign0_idx & 127u];
-    const uint8_t signs1 = ksigns_iq2xs[sign1_idx & 127u];
-    int32_t sum = 0;
-    for (uint32_t i = 0; i < 8; i++) {
-        const int32_t v = (signs0 & kmask_iq2xs[i]) ? -(int32_t)grid0[i] : (int32_t)grid0[i];
-        sum += v * (int32_t)q8[i];
-    }
-    for (uint32_t i = 0; i < 8; i++) {
-        const int32_t v = (signs1 & kmask_iq2xs[i]) ? -(int32_t)grid1[i] : (int32_t)grid1[i];
-        sum += v * (int32_t)q8[8 + i];
-    }
-    return sum;
-}
-
-static __device__ float ds4_cuda_vec_dot_iq2_xxs_q8_K(
-        const ds4_cuda_block_iq2_xxs *x,
-        const ds4_cuda_block_q8_K    *y,
-        uint32_t                      nb) {
-    float sumf = 0.0f;
-    for (uint32_t i = 0; i < nb; i++) {
-        const float d = ds4_cuda_f16_to_f32(x[i].d) * y[i].d;
-        const uint16_t *q2 = x[i].qs;
-        const int8_t *q8 = y[i].qs;
-        int32_t bsum = 0;
-
-        for (int ib32 = 0; ib32 < 8; ib32++) {
-            uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
-            uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
-            const uint8_t *aux8 = (const uint8_t *)&aux0;
-            q2 += 4;
-
-            const uint32_t ls = 2u * (aux1 >> 28) + 1u;
-            int32_t sumi = 0;
-            for (int l = 0; l < 4; l += 2) {
-                const uint32_t sign_idx0 = (aux1 >> (7 * l)) & 127u;
-                const uint32_t sign_idx1 = (aux1 >> (7 * (l + 1))) & 127u;
-                sumi += ds4_cuda_dot_iq2_pair_16(aux8[l], (uint8_t)sign_idx0,
-                                                 aux8[l + 1], (uint8_t)sign_idx1,
-                                                 q8);
-                q8 += 16;
-            }
-            bsum += sumi * (int32_t)ls;
-        }
-        sumf += d * (float)bsum;
-    }
-    return 0.125f * sumf;
-}
-
-/* Phase 3b-2 retile companion to ds4_cuda_vec_dot_iq2_xxs_q8_K.
+/* Phase 3b-2 warp helper for IQ2_XXS dot against Q8_K activations.
  *
  * Same math, but the 256-element-per-block integer dot is parallelised across
  * the 32 lanes of the calling warp (each lane handles one of the 32 elements
@@ -1469,58 +1334,6 @@ static __global__ void ds4_cuda_dense_iq2_xxs_pair_matvec_kernel(
     }
 }
 
-static __device__ void ds4_cuda_quantize_row_q8_K_device(
-        const float           *x,
-        ds4_cuda_block_q8_K   *y,
-        uint32_t               blocks) {
-    for (uint32_t b = 0; b < blocks; b++) {
-        float max = 0.0f;
-        float amax = 0.0f;
-        const float *xb = x + (uint64_t)b * 256u;
-        for (uint32_t j = 0; j < 256u; j++) {
-            const float ax = fabsf(xb[j]);
-            if (ax > amax) {
-                amax = ax;
-                max = xb[j];
-            }
-        }
-
-        if (amax == 0.0f) {
-            y[b].d = 0.0f;
-            for (uint32_t j = 0; j < 256u; j++) y[b].qs[j] = 0;
-            for (uint32_t j = 0; j < 16u; j++) y[b].bsums[j] = 0;
-            continue;
-        }
-
-        const float iscale = -127.0f / max;
-        for (uint32_t j = 0; j < 256u; j++) {
-            int v = (int)lrintf(iscale * xb[j]);
-            if (v > 127) v = 127;
-            if (v < -128) v = -128;
-            y[b].qs[j] = (int8_t)v;
-        }
-        for (uint32_t j = 0; j < 16u; j++) {
-            int sum = 0;
-            for (uint32_t i = 0; i < 16u; i++) sum += y[b].qs[j * 16u + i];
-            y[b].bsums[j] = (int16_t)sum;
-        }
-        y[b].d = 1.0f / iscale;
-    }
-}
-
-static __global__ void ds4_cuda_quantize_rows_q8_K_kernel(
-        const float         *x,
-        ds4_cuda_block_q8_K *xq,
-        uint32_t             row_width,
-        uint32_t             rows) {
-    const uint32_t row = blockIdx.x;
-    if (row >= rows || threadIdx.x != 0) return;
-    const uint32_t blocks = row_width / 256u;
-    ds4_cuda_quantize_row_q8_K_device(x + (uint64_t)row * row_width,
-                                      xq + (uint64_t)row * blocks,
-                                      blocks);
-}
-
 /* Phase 3b-2 retile: one warp per output mid-row.
  *
  * Inherits the 3b-1 idiom — integer dot parallelised across the warp via
@@ -1807,10 +1620,6 @@ void ds4_cuda_cleanup(void) {
     (void)cudaStreamSynchronize(g_stream);
     ds4_cuda_clear_pending_events();
     ds4_cuda_unregister_model();
-    ds4_cuda_scratch_free((void **)&g_scratch_routed_moe_midq,
-                          &g_scratch_routed_moe_midq_bytes);
-    ds4_cuda_scratch_free((void **)&g_scratch_routed_moe_xq,
-                          &g_scratch_routed_moe_xq_bytes);
     if (g_stream) {
         (void)cudaStreamDestroy(g_stream);
         g_stream = NULL;
@@ -3012,11 +2821,9 @@ static int ds4_cuda_routed_moe_impl(
         return 0;
     }
 
-    /* Phase 3b-10: both Q8_K activation quantizations (input + mid) are now
-     * fused inside the consumer warp kernels.  The pre-launch
-     * quantize_rows_q8_K_kernel calls and the g_scratch_routed_moe_xq /
-     * g_scratch_routed_moe_midq scratch buffers are no longer used on this
-     * call path. */
+    /* Phase 3b-10: both Q8_K activation quantizations (input + mid) are
+     * fused inside the consumer warp kernels — see
+     * ds4_cuda_warp_quantize_q8_K_block. */
 
     const ds4_cuda_block_iq2_xxs *gate_w =
         (const ds4_cuda_block_iq2_xxs *)((const uint8_t *)model_map + gate_offset);
