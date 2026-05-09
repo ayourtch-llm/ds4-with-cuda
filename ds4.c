@@ -14317,13 +14317,15 @@ static bool cuda_graph_eval_token_raw_swa(
     if (n_raw > g->raw_cap)    n_raw = g->raw_cap;
     const uint32_t raw_start = ((pos + 1u) - n_raw) % g->raw_cap;
 
-    /* Embed token into cur_hc. */
+    /* Embed token into cur_hc.  Phase 3b-11: end batch without syncing —
+     * the per-layer loop below queues kernels onto the same stream, which
+     * serializes execution; host doesn't read embed output. */
     int ok = ds4_cuda_begin_commands();
     if (ok) ok = ds4_cuda_embed_token_hc_tensor(
                     g->cur_hc, model->map, model->size,
                     weights->token_embd->abs_offset,
                     DS4_N_VOCAB, token, DS4_N_EMBD, DS4_N_HC);
-    if (ok) ok = ds4_cuda_end_commands();
+    if (ok) ok = ds4_cuda_end_commands_async();
     if (!ok) return false;
 
     /* HC ping-pong references; alternate between g->cur_hc and g->next_hc
@@ -14638,7 +14640,13 @@ static bool cuda_graph_eval_token_raw_swa(
                         shared_dim_g, DS4_N_EMBD,
                         g->shared_mid, g->routed_out, g->after_attn_hc,
                         g->ffn_split, DS4_N_EMBD, DS4_N_HC);
-        if (ok) ok = ds4_cuda_end_commands();
+        /* Phase 3b-11: end batch without syncing — the next layer's
+         * begin/launches queue onto the same stream behind this layer's
+         * GPU work; only the host-side cur/nxt pointer ping-pong runs
+         * before re-entering the loop, and that doesn't depend on GPU
+         * output.  This pipelines host-side kernel issuance with prior-
+         * layer GPU execution (was 43 host-blocking syncs/token). */
+        if (ok) ok = ds4_cuda_end_commands_async();
         if (!ok) return false;
 
         ds4_cuda_tensor *tmp = cur; cur = nxt; nxt = tmp;
@@ -14671,7 +14679,10 @@ static bool cuda_graph_eval_token_raw_swa(
                                                         weights->output->abs_offset,
                                                         DS4_N_EMBD, DS4_N_VOCAB,
                                                         g->output_norm, 1u);
-        if (oh_ok) oh_ok = ds4_cuda_end_commands();
+        /* Phase 3b-11: end async — the immediately-following ds4_cuda_tensor_read
+         * does its own cudaStreamSynchronize via sync_for_host_access, so
+         * the load-bearing sync before host memcpy is preserved. */
+        if (oh_ok) oh_ok = ds4_cuda_end_commands_async();
         if (!oh_ok) return false;
 
         if (!ds4_cuda_tensor_read(g->logits, 0, logits_out,

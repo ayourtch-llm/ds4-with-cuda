@@ -1958,6 +1958,26 @@ int ds4_cuda_end_commands(void) {
     return 1;
 }
 
+/* Phase 3b-11: same contract as ds4_cuda_end_commands except no
+ * cudaStreamSynchronize — the host returns immediately while submitted GPU
+ * work continues asynchronously on g_stream.  Subsequent kernels submitted
+ * via a later begin_commands batch queue behind the prior batch on the same
+ * stream, preserving execution ordering for kernels that depend on prior
+ * outputs.  Host-readable accesses (ds4_cuda_tensor_read /
+ * ds4_cuda_synchronize) still call cudaStreamSynchronize internally, so
+ * ordering for host-side reads is preserved.
+ *
+ * The pending-events ring is destroyed unconditionally — the events never
+ * carry waits in this codebase (cuda_flush_commands is declared but never
+ * called; cudaStreamWaitEvent is never invoked), so destroying potentially-
+ * unsignaled events is safe. */
+int ds4_cuda_end_commands_async(void) {
+    if (!g_batch_open) return 0;
+    ds4_cuda_clear_pending_events();
+    g_batch_open = 0;
+    return 1;
+}
+
 int ds4_cuda_synchronize(void) {
     if (!g_initialized && !ds4_cuda_init()) return 0;
     if (g_batch_open) return ds4_cuda_end_commands();

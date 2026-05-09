@@ -201,6 +201,13 @@ int ds4_cuda_tensor_copy(ds4_cuda_tensor *dst, uint64_t dst_offset,
 int ds4_cuda_begin_commands(void);
 int ds4_cuda_flush_commands(void);
 int ds4_cuda_end_commands(void);
+/* Phase 3b-11: close the open batch WITHOUT cudaStreamSynchronize.  Use this
+ * when subsequent host code does not depend on GPU output and the next batch
+ * (or a deferred host-readable access via ds4_cuda_tensor_read /
+ * ds4_cuda_synchronize) will provide ordering.  Allows host-side issuance of
+ * later commands to overlap with prior layers' GPU execution.  Bit-equivalent
+ * to ds4_cuda_end_commands; only the host-blocking semantics differ. */
+int ds4_cuda_end_commands_async(void);
 int ds4_cuda_synchronize(void);
 
 /* Register the GGUF mmap range with the CUDA driver so kernels can read
