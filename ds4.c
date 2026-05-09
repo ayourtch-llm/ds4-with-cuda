@@ -16328,6 +16328,84 @@ static int payload_read_tensor_span(FILE *fp, ds4_metal_tensor *tensor,
 }
 #endif
 
+#ifdef DS4_USE_CUDA
+/* CUDA equivalents of the Metal payload helpers above.  Same chunked-buffer
+ * pattern; CUDA tensors live in cudaMallocManaged regions on GB10 so
+ * ds4_cuda_tensor_read/write fence against the primary stream and memcpy
+ * through the host-mapped pointer (no DMA needed on this unified-memory
+ * platform). */
+static uint32_t session_raw_live_rows_cuda(const ds4_cuda_graph *g, uint32_t checkpoint_len) {
+    uint32_t rows = g->raw_window ? g->raw_window : DS4_N_SWA;
+    if (rows > g->raw_cap) rows = g->raw_cap;
+    if (rows > checkpoint_len) rows = checkpoint_len;
+    return rows;
+}
+
+static uint64_t session_payload_live_tensor_bytes_cuda(const ds4_cuda_graph *g, uint32_t checkpoint_len) {
+    uint64_t bytes = 0;
+    const uint32_t raw_live = session_raw_live_rows_cuda(g, checkpoint_len);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        bytes += (uint64_t)raw_live * DS4_N_HEAD_DIM * sizeof(float);
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        bytes += (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM * sizeof(float);
+        bytes += layer_attn_state_bytes(ratio);
+        bytes += layer_attn_state_bytes(ratio);
+        if (ratio == 4) {
+            bytes += (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            bytes += layer_index_state_bytes(ratio);
+            bytes += layer_index_state_bytes(ratio);
+        }
+    }
+    return bytes;
+}
+
+static int payload_write_cuda_tensor_span(FILE *fp, const ds4_cuda_tensor *tensor,
+                                          uint64_t offset, uint64_t bytes,
+                                          uint8_t *buf, size_t cap, char *err, size_t errlen) {
+    if (!tensor || offset > ds4_cuda_tensor_bytes(tensor) ||
+        bytes > ds4_cuda_tensor_bytes(tensor) - offset)
+    {
+        payload_set_err(err, errlen, "session tensor is smaller than the payload");
+        return 1;
+    }
+    uint64_t done = 0;
+    while (done < bytes) {
+        const size_t n = bytes - done > (uint64_t)cap ? cap : (size_t)(bytes - done);
+        if (ds4_cuda_tensor_read(tensor, offset + done, buf, n) == 0) {
+            payload_set_err(err, errlen, "failed to read CUDA session tensor");
+            return 1;
+        }
+        if (payload_write_bytes(fp, buf, n, err, errlen) != 0) return 1;
+        done += n;
+    }
+    return 0;
+}
+
+static int payload_read_cuda_tensor_span(FILE *fp, ds4_cuda_tensor *tensor,
+                                         uint64_t offset, uint64_t bytes,
+                                         uint8_t *buf, size_t cap, uint64_t *remaining,
+                                         char *err, size_t errlen) {
+    if (!tensor || offset > ds4_cuda_tensor_bytes(tensor) ||
+        bytes > ds4_cuda_tensor_bytes(tensor) - offset)
+    {
+        payload_set_err(err, errlen, "session tensor is smaller than the payload");
+        return 1;
+    }
+    uint64_t done = 0;
+    while (done < bytes) {
+        const size_t n = bytes - done > (uint64_t)cap ? cap : (size_t)(bytes - done);
+        if (payload_read_bytes(fp, buf, n, remaining, err, errlen) != 0) return 1;
+        if (ds4_cuda_tensor_write(tensor, offset + done, buf, n) == 0) {
+            payload_set_err(err, errlen, "failed to restore CUDA session tensor");
+            return 1;
+        }
+        done += n;
+    }
+    return 0;
+}
+#endif
+
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
     const ds4_tensor *gate = e->weights.layer[0].ffn_gate_exps;
@@ -16456,11 +16534,22 @@ static bool spec_frontier_commit_prefix1(ds4_session *s) {
 #endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
+    if (!s || !s->checkpoint_valid) return 0;
+#ifdef DS4_USE_CUDA
+    if (s->engine && s->engine->backend == DS4_BACKEND_CUDA) {
+        const ds4_cuda_graph *g = &s->cuda_graph;
+        uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
+        bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
+        bytes += (uint64_t)DS4_N_VOCAB * sizeof(float);
+        bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
+        bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
+        bytes += session_payload_live_tensor_bytes_cuda(g, (uint32_t)s->checkpoint.len);
+        return bytes;
+    }
+#endif
 #ifdef DS4_NO_METAL
-    (void)s;
     return 0;
 #else
-    if (!s || !s->checkpoint_valid) return 0;
     const ds4_metal_graph *g = &s->graph;
     uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
     bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
@@ -16473,6 +16562,89 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
 }
 
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+#ifdef DS4_USE_CUDA
+    if (s && s->engine && s->engine->backend == DS4_BACKEND_CUDA) {
+        if (!fp || !s->checkpoint_valid) {
+            payload_set_err(err, errlen, "session has no valid checkpoint to save");
+            return 1;
+        }
+        if (ds4_cuda_synchronize() == 0) {
+            payload_set_err(err, errlen, "failed to synchronize CUDA before snapshot");
+            return 1;
+        }
+        ds4_cuda_graph *g = &s->cuda_graph;
+        const uint32_t raw_live = session_raw_live_rows_cuda(g, (uint32_t)s->checkpoint.len);
+        uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
+            DS4_SESSION_PAYLOAD_MAGIC,
+            DS4_SESSION_PAYLOAD_VERSION,
+            (uint32_t)s->ctx_size,
+            s->prefill_cap,
+            g->raw_cap,
+            g->raw_window,
+            g->comp_cap,
+            (uint32_t)s->checkpoint.len,
+            DS4_N_LAYER,
+            DS4_N_HEAD_DIM,
+            DS4_N_INDEXER_HEAD_DIM,
+            DS4_N_VOCAB,
+            raw_live,
+        };
+        for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
+            if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
+        }
+        for (int i = 0; i < s->checkpoint.len; i++) {
+            if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) return 1;
+        }
+        if (payload_write_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), err, errlen) != 0) return 1;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (payload_write_u32(fp, g->layer_n_comp[il], err, errlen) != 0) return 1;
+        }
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (payload_write_u32(fp, g->layer_n_index_comp[il], err, errlen) != 0) return 1;
+        }
+
+        uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+        int rc = 0;
+        for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+            const uint32_t raw_first = (uint32_t)s->checkpoint.len - raw_live;
+            for (uint32_t r = 0; rc == 0 && r < raw_live; r++) {
+                const uint32_t pos = raw_first + r;
+                const uint32_t phys = pos % g->raw_cap;
+                rc = payload_write_cuda_tensor_span(fp,
+                                                    g->layer_raw_cache[il],
+                                                    (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
+                                                    (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                                                    buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            }
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            if (rc != 0 || ratio == 0) continue;
+            rc = payload_write_cuda_tensor_span(fp,
+                                                g->layer_attn_comp_cache[il],
+                                                0,
+                                                (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM * sizeof(float),
+                                                buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            if (rc == 0) rc = payload_write_cuda_tensor_span(fp, g->layer_attn_state_kv[il],
+                                                             0, layer_attn_state_bytes(ratio),
+                                                             buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            if (rc == 0) rc = payload_write_cuda_tensor_span(fp, g->layer_attn_state_score[il],
+                                                             0, layer_attn_state_bytes(ratio),
+                                                             buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            if (rc == 0 && ratio == 4) {
+                rc = payload_write_cuda_tensor_span(fp, g->layer_index_comp_cache[il],
+                                                    0, (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                                                    buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                if (rc == 0) rc = payload_write_cuda_tensor_span(fp, g->layer_index_state_kv[il],
+                                                                 0, layer_index_state_bytes(ratio),
+                                                                 buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                if (rc == 0) rc = payload_write_cuda_tensor_span(fp, g->layer_index_state_score[il],
+                                                                 0, layer_index_state_bytes(ratio),
+                                                                 buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            }
+        }
+        free(buf);
+        return rc;
+    }
+#endif
 #ifdef DS4_NO_METAL
     (void)s; (void)fp;
     payload_set_err(err, errlen, "Metal support is not compiled in");
@@ -16604,6 +16776,151 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 }
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+#ifdef DS4_USE_CUDA
+    if (s && s->engine && s->engine->backend == DS4_BACKEND_CUDA) {
+        if (!fp) {
+            payload_set_err(err, errlen, "invalid session payload load");
+            return 1;
+        }
+        uint64_t remaining = payload_bytes;
+        uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
+        for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
+            if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0) return 1;
+        }
+        if (h[0] != DS4_SESSION_PAYLOAD_MAGIC || h[1] != DS4_SESSION_PAYLOAD_VERSION) {
+            payload_set_err(err, errlen, "unsupported session payload version");
+            return 1;
+        }
+        ds4_cuda_graph *g = &s->cuda_graph;
+        const uint32_t saved_ctx = h[2];
+        const uint32_t saved_prefill_cap = h[3];
+        const uint32_t saved_raw_cap = h[4];
+        const uint32_t saved_raw_window = h[5];
+        const uint32_t saved_comp_cap = h[6];
+        const uint32_t saved_tokens = h[7];
+        const uint32_t saved_raw_live = h[12];
+        if (saved_ctx > (uint32_t)s->ctx_size || saved_tokens >= (uint32_t)s->ctx_size) {
+            payload_set_err(err, errlen, "KV checkpoint does not fit current context");
+            return 1;
+        }
+        if (h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM ||
+            h[10] != DS4_N_INDEXER_HEAD_DIM || h[11] != DS4_N_VOCAB)
+        {
+            payload_set_err(err, errlen, "KV checkpoint was written for a different DS4 layout");
+            return 1;
+        }
+        if (saved_prefill_cap != s->prefill_cap || saved_raw_window != g->raw_window) {
+            payload_set_err(err, errlen, "KV checkpoint graph chunk layout does not match current runtime");
+            return 1;
+        }
+        const uint32_t expected_raw_live = saved_tokens < saved_raw_window ? saved_tokens : saved_raw_window;
+        if (saved_raw_cap == 0 || saved_raw_live != expected_raw_live ||
+            saved_raw_live > saved_raw_cap || saved_raw_live > g->raw_cap)
+        {
+            payload_set_err(err, errlen, "KV checkpoint raw ring layout does not match current context");
+            return 1;
+        }
+        if (saved_comp_cap > g->comp_cap) {
+            payload_set_err(err, errlen, "KV checkpoint compressed cache is larger than current context");
+            return 1;
+        }
+
+        token_vec new_checkpoint = {0};
+        for (uint32_t i = 0; i < saved_tokens; i++) {
+            uint32_t tok = 0;
+            if (payload_read_u32(fp, &tok, &remaining, err, errlen) != 0) {
+                token_vec_free(&new_checkpoint);
+                return 1;
+            }
+            token_vec_push(&new_checkpoint, (int)tok);
+        }
+        if (payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float),
+                               &remaining, err, errlen) != 0)
+        {
+            token_vec_free(&new_checkpoint);
+            return 1;
+        }
+        uint32_t n_comp[DS4_N_LAYER];
+        uint32_t n_index_comp[DS4_N_LAYER];
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (payload_read_u32(fp, &n_comp[il], &remaining, err, errlen) != 0) {
+                token_vec_free(&new_checkpoint);
+                return 1;
+            }
+            if (n_comp[il] > saved_comp_cap || n_comp[il] > g->comp_cap) {
+                token_vec_free(&new_checkpoint);
+                payload_set_err(err, errlen, "KV checkpoint has invalid compressed row count");
+                return 1;
+            }
+        }
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (payload_read_u32(fp, &n_index_comp[il], &remaining, err, errlen) != 0) {
+                token_vec_free(&new_checkpoint);
+                return 1;
+            }
+            if (n_index_comp[il] > saved_comp_cap || n_index_comp[il] > g->comp_cap) {
+                token_vec_free(&new_checkpoint);
+                payload_set_err(err, errlen, "KV checkpoint has invalid indexer row count");
+                return 1;
+            }
+        }
+
+        uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+        int rc = 0;
+        for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+            const uint32_t raw_first = saved_tokens - saved_raw_live;
+            for (uint32_t r = 0; rc == 0 && r < saved_raw_live; r++) {
+                const uint32_t pos = raw_first + r;
+                const uint32_t phys = pos % g->raw_cap;
+                rc = payload_read_cuda_tensor_span(fp, g->layer_raw_cache[il],
+                                                   (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
+                                                   (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                                                   buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+            }
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            if (rc != 0 || ratio == 0) continue;
+            rc = payload_read_cuda_tensor_span(fp, g->layer_attn_comp_cache[il],
+                                               0, (uint64_t)n_comp[il] * DS4_N_HEAD_DIM * sizeof(float),
+                                               buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+            if (rc == 0) rc = payload_read_cuda_tensor_span(fp, g->layer_attn_state_kv[il],
+                                                            0, layer_attn_state_bytes(ratio),
+                                                            buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+            if (rc == 0) rc = payload_read_cuda_tensor_span(fp, g->layer_attn_state_score[il],
+                                                            0, layer_attn_state_bytes(ratio),
+                                                            buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+            if (rc == 0 && ratio == 4) {
+                rc = payload_read_cuda_tensor_span(fp, g->layer_index_comp_cache[il],
+                                                   0, (uint64_t)n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                                                   buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+                if (rc == 0) rc = payload_read_cuda_tensor_span(fp, g->layer_index_state_kv[il],
+                                                                0, layer_index_state_bytes(ratio),
+                                                                buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+                if (rc == 0) rc = payload_read_cuda_tensor_span(fp, g->layer_index_state_score[il],
+                                                                0, layer_index_state_bytes(ratio),
+                                                                buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+            }
+        }
+        free(buf);
+        if (rc != 0) {
+            token_vec_free(&new_checkpoint);
+            return 1;
+        }
+        if (remaining != 0) {
+            token_vec_free(&new_checkpoint);
+            payload_set_err(err, errlen, "KV checkpoint has trailing payload bytes");
+            return 1;
+        }
+
+        token_vec_free(&s->checkpoint);
+        s->checkpoint = new_checkpoint;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            g->layer_n_comp[il] = n_comp[il];
+            g->layer_n_index_comp[il] = n_index_comp[il];
+        }
+        s->checkpoint_valid = true;
+        return 0;
+    }
+#endif
 #ifdef DS4_NO_METAL
     (void)s; (void)fp; (void)payload_bytes;
     payload_set_err(err, errlen, "Metal support is not compiled in");

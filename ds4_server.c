@@ -6213,7 +6213,6 @@ static void usage(FILE *fp) {
         "  --backend NAME\n"
         "      Select backend explicitly: metal or cuda.\n"
         "      MTP / speculative-decode is currently Metal-only; --mtp* options are rejected on CUDA.\n"
-        "      Disk KV cache (--kv-disk-*) is currently Metal-only and is silently disabled on CUDA.\n"
         "\n"
         "Notes:\n"
         "  Use /v1/chat/completions, /v1/completions, or /v1/messages.\n"
@@ -6336,22 +6335,16 @@ static server_config parse_options(int argc, char **argv) {
     }
 #endif
 
-    /* CUDA backend feature gates: MTP / speculative-decode and disk KV cache are
-     * Metal-only today.  Reject --mtp* loudly (server's spec branch would call
+    /* CUDA backend feature gates: MTP / speculative-decode is Metal-only today.
+     * Reject --mtp* loudly (server's spec branch would call
      * ds4_session_eval_speculative_argmax which returns -1 on CUDA → generation
-     * error).  Quietly disable KV disk cache (silent payload-bytes=0
-     * short-circuit already exists, but a one-time notice is friendlier). */
+     * error).  Disk KV cache (--kv-disk-*) is supported on both backends as of
+     * Phase 4b. */
     if (c.engine.backend == DS4_BACKEND_CUDA) {
         if (c.engine.mtp_path) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: --mtp is currently Metal-only; CUDA MTP/speculative-decode wire-up is in flight");
             exit(2);
-        }
-        if (c.kv_disk_dir) {
-            server_log(DS4_LOG_WARNING,
-                       "ds4-server: --kv-disk-dir is currently Metal-only; disabling KV disk cache for this CUDA session");
-            c.kv_disk_dir = NULL;
-            c.kv_disk_space_mb = 0;
         }
     }
 
