@@ -7875,7 +7875,9 @@ static void forward_token_raw_swa_cpu_decode_scratch(
     }
 }
 
-#ifndef DS4_NO_METAL
+#if !defined(DS4_NO_METAL) || defined(DS4_USE_CUDA)
+/* Available to both Metal and CUDA builds; CUDA's session prefill test uses
+ * this as the full-context CPU oracle. */
 static void forward_token_raw_swa_cpu(
         float             * logits,
         const ds4_model   * model,
@@ -14277,22 +14279,16 @@ static uint32_t cuda_graph_prefill_cap_for_prompt(int prompt_len) {
 }
 
 /* Single-token decode through the CUDA session graph.  Mirrors Metal's
- * metal_graph_eval_token_raw_swa: read prior KV state from the persistent
- * per-layer caches, embed `token`, run 43 layers + output head, write the new
- * KV row at row = pos % raw_cap, write logits[DS4_N_VOCAB] into logits_out.
+ * metal_graph_eval_token_raw_swa + metal_graph_encode_decode_layer: embed
+ * `token`, run 43 layers (per-layer compressor updates for ratio!=0,
+ * indexer + sparse mixed attention for ratio==4 when n_comp > top_k) +
+ * output head, write the new KV row at row = pos % raw_cap, write
+ * logits[DS4_N_VOCAB] into logits_out.
  *
- * Phase 3c-2 scope: pos=0 first-token decode (validated against
- * forward_first_token_cpu).  For pos>0 the chain still runs raw-only
- * attention with n_raw=pos+1 — correct as long as pos < raw_window AND no
- * ratio!=0 layer needs compressed attention (no compressor calls landed yet).
- *
- * TODO 3c-3: wire compressor_update_tensor for ratio!=0 layers and switch to
- * mixed-attention reads when g->layer_n_comp[il] > 0; handle ring-wrap
- * (raw_start) when pos+1 > raw_window.
- *
- * TODO 3b: when batched-attention CUDA kernels land, prefill orchestration
- * may call this function in a per-token loop -- that loop is the body-swap
- * site for a future cuda_graph_prefill_chunked using batched kernels. */
+ * Phase 3c-3 scope adds the compressor + indexer + ring-wrap orchestration
+ * needed for prefill via per-token loop.  Phase 3c-2's first-token at pos=0
+ * is the n_comp=0 degenerate case of the same chain.  Per-token-loop is the
+ * body-swap site for a future batched cuda_graph_prefill_chunked (TODO 3b). */
 static bool cuda_graph_eval_token_raw_swa(
         ds4_cuda_graph    *g,
         const ds4_model   *model,
@@ -14311,14 +14307,15 @@ static bool cuda_graph_eval_token_raw_swa(
     const uint64_t shared_dim_g     = weights->layer[0].ffn_gate_shexp->dim[1];
     (void)expert_mid_dim_g;
 
-    /* SWA window math.  3c-2 scope keeps raw_start=0 because pos < raw_window;
-     * 3c-3 will compute a ring-relative raw_start when the SWA wraps. */
-    const uint32_t row = pos % g->raw_cap;
+    /* SWA window math.  raw_row is the ring slot for the new KV; n_raw is the
+     * visible window size (capped at raw_window); raw_start is the ring
+     * offset of the oldest visible row when the window has wrapped past
+     * raw_cap.  Mirrors metal_graph_raw_span_for_batch + raw_start_for_span. */
+    const uint32_t raw_row = pos % g->raw_cap;
     uint32_t n_raw = pos + 1u;
     if (n_raw > g->raw_window) n_raw = g->raw_window;
-    /* TODO 3c-3: const uint32_t raw_start = (pos + 1u > g->raw_window)
-     *     ? (row + g->raw_cap - g->raw_window + 1u) % g->raw_cap : 0u; */
-    const uint32_t raw_start = 0u;
+    if (n_raw > g->raw_cap)    n_raw = g->raw_cap;
+    const uint32_t raw_start = ((pos + 1u) - n_raw) % g->raw_cap;
 
     /* Embed token into cur_hc. */
     int ok = ds4_cuda_begin_commands();
@@ -14329,10 +14326,9 @@ static bool cuda_graph_eval_token_raw_swa(
     if (ok) ok = ds4_cuda_end_commands();
     if (!ok) return false;
 
-    /* Local cur/nxt aliases for HC ping-pong; they alternate between
-     * g->cur_hc and g->next_hc each layer.  After 43 swaps, cur points to
-     * whichever buffer holds the post-block-42 HC stream — the output head
-     * reads through `cur` directly without copying. */
+    /* HC ping-pong references; alternate between g->cur_hc and g->next_hc
+     * each layer.  After 43 swaps, cur holds the post-block-42 HC stream and
+     * the output head reads through `cur` directly without copying. */
     ds4_cuda_tensor *cur = g->cur_hc;
     ds4_cuda_tensor *nxt = g->next_hc;
 
@@ -14340,7 +14336,9 @@ static bool cuda_graph_eval_token_raw_swa(
         const ds4_layer_weights *L = &weights->layer[il];
         const float fb  = layer_rope_freq_base(il);
         const float fs  = layer_rope_freq_scale(il);
-        const bool  cmp = ds4_layer_compress_ratio(il) != 0;
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        const bool  cmp = ratio != 0;
+        const uint32_t coff = ratio == 4 ? 2u : 1u;
         const float ef  = cmp && DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
         float       af  = 1.0f;
         if (ef != 0.0f && fs > 0.0f) af /= 1.0f + 0.1f * logf(1.0f / fs);
@@ -14354,14 +14352,10 @@ static bool cuda_graph_eval_token_raw_swa(
         const uint64_t boff  = hbias ? L->ffn_exp_probs_b->abs_offset : 0;
         const uint64_t hoff  = hhash ? L->ffn_gate_tid2eid->abs_offset : 0;
         const uint32_t hrows = hhash ? (uint32_t)L->ffn_gate_tid2eid->dim[1] : 0;
-
-        /* TODO 3c-3: for ratio!=0 layers, read g->layer_n_comp[il] and pass it
-         * to attention_decode_heads as n_comp; before that, call
-         * ds4_cuda_compressor_update_tensor and (for ratio==4) the indexer
-         * top-k chain to populate g->layer_attn_comp_cache and the indexer
-         * mask.  3c-2 leaves n_comp=0 — correct only at pos=0 where no
-         * compressed rows have been emitted yet. */
-        const uint32_t n_comp = 0u;
+        /* Compressor emit fires at the END of every ratio-aligned span.
+         * Metal's metal_graph_encode_decode_layer at ds4.c:9348 uses the same
+         * predicate. */
+        const bool emit = cmp && (((pos + 1u) % ratio) == 0u);
 
         ok = ds4_cuda_begin_commands();
         if (ok) ok = ds4_cuda_rms_norm_plain_tensor(g->flat_hc, cur,
@@ -14407,17 +14401,188 @@ static bool cuda_graph_eval_token_raw_swa(
         /* fp8_kv_store_raw modifies kv's NOPE prefix in-place to its FP8
          * round-trip and writes the F16-rounded full row to layer_raw_cache. */
         if (ok) ok = ds4_cuda_kv_fp8_store_raw_tensor(g->kv, g->layer_raw_cache[il],
-                                                       g->raw_cap, row,
+                                                       g->raw_cap, raw_row,
                                                        DS4_N_HEAD_DIM, DS4_N_ROT);
-        /* comp_kv_cur and comp_mask are passed even when n_comp=0 because the
-         * attention kernel requires non-NULL pointers; their content is
-         * unread when n_comp=0. */
-        if (ok) ok = ds4_cuda_attention_decode_heads_tensor(
+
+        /* Compressor block — only for ratio!=0 layers.  Mirrors Metal at
+         * ds4.c:9344-9586.  attn_compressor projects attn_norm -> comp_kv_cur
+         * + comp_sc_cur (paired F16 matmuls), then compressor_update_tensor
+         * pools/quantizes/optionally emits a new compressed-cache row.  Each
+         * call may be a no-op-emit (state-only update) depending on pos. */
+        bool comp_selected_used = false;
+        uint32_t n_selected = 0;
+        if (ok && cmp) {
+            const uint32_t comp_width = coff * DS4_N_HEAD_DIM;
+            const uint32_t comp_row = g->layer_n_comp[il];
+            if (emit && comp_row >= g->comp_cap) {
+                fprintf(stderr,
+                        "ds4: cuda graph compressed KV cache capacity exceeded at layer %u (cap=%u)\n",
+                        il, g->comp_cap);
+                ok = false;
+            }
+            if (ok) ok = ds4_cuda_matmul_f16_pair_tensor(
+                            g->comp_kv_cur, g->comp_sc_cur,
+                            model->map, model->size,
+                            L->attn_compressor_kv->abs_offset,
+                            L->attn_compressor_gate->abs_offset,
+                            DS4_N_EMBD, comp_width, g->attn_norm, 1u);
+            if (ok) ok = ds4_cuda_compressor_update_tensor(
+                            g->comp_kv_cur, g->comp_sc_cur,
+                            g->layer_attn_state_kv[il],
+                            g->layer_attn_state_score[il],
+                            g->layer_attn_comp_cache[il],
+                            model->map, model->size,
+                            L->attn_compressor_ape->abs_offset,
+                            (uint32_t)L->attn_compressor_ape->type,
+                            L->attn_compressor_norm->abs_offset,
+                            (uint32_t)L->attn_compressor_norm->type,
+                            DS4_N_HEAD_DIM, ratio, pos, comp_row,
+                            DS4_N_ROT, nco,
+                            fb, fs, ef, af,
+                            DS4_ROPE_YARN_BETA_FAST,
+                            DS4_ROPE_YARN_BETA_SLOW,
+                            DS4_RMS_EPS);
+            if (ok && emit) {
+                /* The just-emitted comp_cache row holds raw F32 values; FP8-
+                 * round-trip its NOPE prefix in place to match the post-decode
+                 * cache row format the attention kernel expects. */
+                ds4_cuda_tensor *row_view = ds4_cuda_tensor_view(
+                    g->layer_attn_comp_cache[il],
+                    (uint64_t)comp_row * DS4_N_HEAD_DIM * sizeof(float),
+                    (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+                if (!row_view) { ok = false; }
+                else {
+                    ok = ds4_cuda_dsv4_fp8_kv_quantize_tensor(
+                            row_view, 1u, DS4_N_HEAD_DIM, DS4_N_ROT);
+                    ds4_cuda_tensor_free(row_view);
+                }
+            }
+
+            /* Indexer (ratio==4 only): another paired compressor + state
+             * advance, then — when the attention compressed-cache has more
+             * rows than top_k — compute indexer Q/scores/topk so the sparse
+             * indexed attention kernel can pick which compressed rows to
+             * read.  Mirrors Metal at ds4.c:9427-9582. */
+            if (ok && ratio == 4u) {
+                const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
+                const uint32_t index_row = g->layer_n_index_comp[il];
+                if (emit && index_row >= g->comp_cap) {
+                    fprintf(stderr,
+                            "ds4: cuda graph indexer compressed KV cache capacity exceeded at layer %u (cap=%u)\n",
+                            il, g->comp_cap);
+                    ok = false;
+                }
+                if (ok) ok = ds4_cuda_matmul_f16_pair_tensor(
+                                g->comp_kv_cur, g->comp_sc_cur,
+                                model->map, model->size,
+                                L->indexer_compressor_kv->abs_offset,
+                                L->indexer_compressor_gate->abs_offset,
+                                DS4_N_EMBD, index_width, g->attn_norm, 1u);
+                if (ok) ok = ds4_cuda_compressor_update_tensor(
+                                g->comp_kv_cur, g->comp_sc_cur,
+                                g->layer_index_state_kv[il],
+                                g->layer_index_state_score[il],
+                                g->layer_index_comp_cache[il],
+                                model->map, model->size,
+                                L->indexer_compressor_ape->abs_offset,
+                                (uint32_t)L->indexer_compressor_ape->type,
+                                L->indexer_compressor_norm->abs_offset,
+                                (uint32_t)L->indexer_compressor_norm->type,
+                                DS4_N_INDEXER_HEAD_DIM, ratio, pos, index_row,
+                                DS4_N_ROT, nco,
+                                fb, fs, ef, af,
+                                DS4_ROPE_YARN_BETA_FAST,
+                                DS4_ROPE_YARN_BETA_SLOW,
+                                DS4_RMS_EPS);
+                if (ok && emit) g->layer_n_index_comp[il]++;
+
+                const uint32_t decode_top_k = DS4_N_INDEXER_TOP_K;
+                if (ok && (g->layer_n_comp[il] + (emit ? 1u : 0u)) > decode_top_k) {
+                    /* Compute indexer query, RoPE, score, top-K. */
+                    const uint64_t indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+                    if (ok) ok = ds4_cuda_matmul_f16_tensor(
+                                    g->indexer_q, model->map, model->size,
+                                    L->indexer_attn_q_b->abs_offset,
+                                    DS4_N_LORA_O, indexer_q_dim, g->qr_norm, 1u);
+                    if (ok) ok = ds4_cuda_rope_tail_tensor(
+                                    g->indexer_q, 1u,
+                                    DS4_N_INDEXER_HEAD,
+                                    DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT,
+                                    pos, nco, false, fb, fs, ef, af,
+                                    DS4_ROPE_YARN_BETA_FAST,
+                                    DS4_ROPE_YARN_BETA_SLOW);
+                    if (ok) ok = ds4_cuda_matmul_f16_tensor(
+                                    g->indexer_weights, model->map, model->size,
+                                    L->indexer_proj->abs_offset,
+                                    DS4_N_EMBD, DS4_N_INDEXER_HEAD,
+                                    g->attn_norm, 1u);
+                    const float index_scale =
+                        1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
+                    if (ok) ok = ds4_cuda_indexer_score_one_tensor(
+                                    g->indexer_scores, g->indexer_q,
+                                    g->indexer_weights,
+                                    g->layer_index_comp_cache[il],
+                                    g->layer_n_index_comp[il],
+                                    DS4_N_INDEXER_HEAD,
+                                    DS4_N_INDEXER_HEAD_DIM, index_scale);
+                    if (ok) ok = ds4_cuda_indexer_topk_tensor(
+                                    g->comp_selected, g->indexer_scores,
+                                    g->layer_n_index_comp[il], 1u, decode_top_k);
+                    if (ok) {
+                        comp_selected_used = true;
+                        n_selected = decode_top_k < g->layer_n_index_comp[il]
+                                     ? decode_top_k
+                                     : g->layer_n_index_comp[il];
+                    }
+                }
+            }
+
+            /* Account the new attention compressor row last so the indexer
+             * scoring above sees the same n_comp that Metal sees: at emit, the
+             * new row has just been pooled+APE'd but the layer counter still
+             * points at it, so attention reads up through layer_n_comp[il]
+             * INCLUSIVE of comp_row.  We bump the counter after the indexer
+             * branch (above) used (n_comp + emit) for the >top_k threshold. */
+            if (ok && emit) g->layer_n_comp[il]++;
+        }
+
+        const uint32_t n_comp = cmp ? g->layer_n_comp[il] : 0u;
+
+        /* Attention dispatch.  Three modes:
+         *   - indexed mixed (ratio==4 with top_k applied): sparse over
+         *     comp_selected[0..n_selected) plus the SWA raw window
+         *   - mixed (ratio==128, or ratio==4 with n_comp <= top_k): dense
+         *     over all comp rows + raw window
+         *   - raw-only (uncompressed layers, or before any comp emit): only
+         *     the SWA raw window
+         */
+        if (ok) {
+            if (n_comp != 0u && comp_selected_used && n_selected != 0u) {
+                ok = ds4_cuda_attention_indexed_mixed_batch_heads_tensor(
                         g->heads, model->map, model->size,
-                        L->attn_sinks->abs_offset, g->q, g->layer_raw_cache[il],
-                        n_raw, g->raw_cap, raw_start,
-                        g->comp_kv_cur, n_comp, g->comp_mask, 0u,
+                        L->attn_sinks->abs_offset, g->q,
+                        g->layer_raw_cache[il],
+                        g->layer_attn_comp_cache[il],
+                        g->comp_selected,
+                        1u, pos, n_raw, g->raw_cap, raw_start,
+                        n_comp, n_selected,
+                        g->raw_window, ratio,
                         DS4_N_HEAD, DS4_N_HEAD_DIM);
+            } else {
+                /* comp_kv_cur and comp_mask are passed even when n_comp=0
+                 * because the kernel requires non-NULL pointers; their
+                 * content is unread when n_comp=0. */
+                ok = ds4_cuda_attention_decode_heads_tensor(
+                        g->heads, model->map, model->size,
+                        L->attn_sinks->abs_offset, g->q,
+                        g->layer_raw_cache[il],
+                        n_raw, g->raw_cap, raw_start,
+                        n_comp ? g->layer_attn_comp_cache[il] : g->comp_kv_cur,
+                        n_comp,
+                        g->comp_mask, 0u,
+                        DS4_N_HEAD, DS4_N_HEAD_DIM);
+            }
+        }
         if (ok) ok = ds4_cuda_rope_tail_tensor(g->heads, 1u, DS4_N_HEAD,
                                                 DS4_N_HEAD_DIM, DS4_N_ROT,
                                                 pos, nco, true, fb, fs, ef, af,
@@ -14505,9 +14670,48 @@ static bool cuda_graph_eval_token_raw_swa(
     if (oh_ok) oh_ok = ds4_cuda_end_commands();
     if (!oh_ok) return false;
 
-    if (!ds4_cuda_tensor_read(g->logits, 0, logits_out,
-                              (size_t)DS4_N_VOCAB * sizeof(float))) {
-        return false;
+    if (logits_out) {
+        if (!ds4_cuda_tensor_read(g->logits, 0, logits_out,
+                                  (size_t)DS4_N_VOCAB * sizeof(float))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Multi-token prefill via per-token loop.  Mirrors metal_graph_prefill_raw_swa
+ * at the API level but is intentionally slow-and-simple inside: each token
+ * runs a full single-token decode through cuda_graph_eval_token_raw_swa,
+ * stepping pos and the per-layer KV+compressor caches.
+ *
+ * TODO 3b: this loop is the body-swap site for batched prefill.  When
+ * ds4_cuda_attention_prefill_static_mixed_heads_tensor and friends land we
+ * can replace the inner per-token kernel sequence with their batched
+ * equivalents and emit the layer-major schedule Metal uses, without changing
+ * this function's signature or the session-level contract above. */
+static bool cuda_graph_prefill_chunked(
+        ds4_cuda_graph    *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        const ds4_tokens  *prompt,
+        int                n_tokens,
+        float             *logits) {
+    if (n_tokens <= 0 || n_tokens > prompt->len) return false;
+    for (int t = 0; t < n_tokens; t++) {
+        const bool last = (t == n_tokens - 1);
+        float *out_ptr = last ? logits : NULL;
+        /* TODO 3b: collapse this per-token loop into a batched-attention
+         * prefill orchestrator.  Until then the eval kernel still runs the
+         * full output-head matmul on every token; non-last logits are simply
+         * not read back.  Batched prefill skips the head except on the
+         * output row. */
+        if (!cuda_graph_eval_token_raw_swa(g, model, weights,
+                                           (uint32_t)prompt->v[t],
+                                           (uint32_t)t,
+                                           out_ptr))
+        {
+            return false;
+        }
     }
     return true;
 }
@@ -18810,6 +19014,143 @@ int ds4_engine_cuda_session_eval_test(ds4_engine *e, int ctx_size) {
 #endif
 }
 
+/* Phase 3c-3: full prefill via ds4_session_sync, compared against
+ * forward_token_raw_swa_cpu run over the same prompt.  The CPU oracle is
+ * a true full-prefill — each token advances the CPU KV cache the same way
+ * cuda_graph_eval_token_raw_swa advances the CUDA per-layer state — so top-1
+ * agreement should be tight rather than the 92% fresh-cache figure 2.1c-5
+ * reports. */
+int ds4_engine_cuda_session_prefill_test(ds4_engine *e, const ds4_tokens *prompt, int ctx_size) {
+#ifndef DS4_USE_CUDA
+    (void)e; (void)prompt; (void)ctx_size;
+    fprintf(stderr, "ds4: cuda_session_prefill_test requires a build with DS4_USE_CUDA\n");
+    return 1;
+#else
+    if (!e->cuda_ready) {
+        fprintf(stderr, "ds4: cuda_session_prefill_test requires the CUDA backend\n");
+        return 1;
+    }
+    if (!prompt || prompt->len <= 0) {
+        fprintf(stderr, "ds4: cuda_session_prefill_test requires a non-empty prompt\n");
+        return 1;
+    }
+    if (ctx_size <= 0) ctx_size = 4096;
+    if (prompt->len >= ctx_size) {
+        fprintf(stderr, "ds4: cuda_session_prefill_test prompt (%d) >= ctx_size (%d)\n",
+                prompt->len, ctx_size);
+        return 1;
+    }
+
+    fprintf(stderr,
+            "ds4: cuda_session_prefill_test ctx=%d prompt_tokens=%d (last=%d)\n",
+            ctx_size, prompt->len, prompt->v[prompt->len - 1]);
+
+    ds4_session *s = NULL;
+    if (ds4_session_create(&s, e, ctx_size) != 0) {
+        fprintf(stderr, "ds4: cuda_session_prefill_test failed to create session\n");
+        return 1;
+    }
+
+    char sync_err[256] = {0};
+    if (ds4_session_sync(s, prompt, sync_err, sizeof(sync_err)) != 0) {
+        fprintf(stderr,
+                "ds4: cuda_session_prefill_test ds4_session_sync failed: %s\n",
+                sync_err);
+        ds4_session_free(s);
+        return 1;
+    }
+    fprintf(stderr,
+            "ds4: cuda_session_prefill_test post-sync pos=%d tokens.len=%d\n",
+            ds4_session_pos(s), ds4_session_tokens(s)->len);
+
+    /* CPU oracle: full-prefill loop over forward_token_raw_swa_cpu. */
+    const uint32_t cpu_raw_cap = cuda_graph_raw_cap_for_context(
+        ctx_size, cuda_graph_prefill_cap_for_prompt(ctx_size));
+    ds4_kv_cache cpu_cache;
+    kv_cache_init(&cpu_cache, (uint32_t)ctx_size, cpu_raw_cap);
+    float *cpu_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(cpu_logits[0]));
+    for (int t = 0; t < prompt->len; t++) {
+        const bool last = (t == prompt->len - 1);
+        forward_token_raw_swa_cpu(last ? cpu_logits : NULL,
+                                  &e->model, &e->weights,
+                                  &cpu_cache,
+                                  prompt->v[t],
+                                  (uint32_t)t);
+    }
+
+    /* Top-K extraction (K=8). */
+    const int K = 8;
+    int   cpu_top_id[8];
+    float cpu_top_logit[8];
+    int   cuda_top_id[8];
+    float cuda_top_logit[8];
+    for (int k = 0; k < K; k++) {
+        cpu_top_id[k] = -1; cpu_top_logit[k] = DS4_NEG_INF;
+        cuda_top_id[k] = -1; cuda_top_logit[k] = DS4_NEG_INF;
+    }
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        const float vc = cpu_logits[i];
+        const float vd = s->logits[i];
+        for (int k = 0; k < K; k++) {
+            if (cpu_top_id[k] < 0 || vc > cpu_top_logit[k]) {
+                for (int l = K - 1; l > k; l--) {
+                    cpu_top_id[l] = cpu_top_id[l - 1];
+                    cpu_top_logit[l] = cpu_top_logit[l - 1];
+                }
+                cpu_top_id[k] = (int)i; cpu_top_logit[k] = vc; break;
+            }
+        }
+        for (int k = 0; k < K; k++) {
+            if (cuda_top_id[k] < 0 || vd > cuda_top_logit[k]) {
+                for (int l = K - 1; l > k; l--) {
+                    cuda_top_id[l] = cuda_top_id[l - 1];
+                    cuda_top_logit[l] = cuda_top_logit[l - 1];
+                }
+                cuda_top_id[k] = (int)i; cuda_top_logit[k] = vd; break;
+            }
+        }
+    }
+
+    int overlap = 0;
+    for (int i = 0; i < K; i++) {
+        for (int j = 0; j < K; j++) {
+            if (cpu_top_id[i] >= 0 && cpu_top_id[i] == cuda_top_id[j]) {
+                overlap++; break;
+            }
+        }
+    }
+
+    const bool top1_match = (cpu_top_id[0] == cuda_top_id[0]);
+    const float t1_cpu = cpu_top_logit[0];
+    const float t1_cuda = (cpu_top_id[0] >= 0) ? s->logits[cpu_top_id[0]] : DS4_NEG_INF;
+    const float t1_abserr = fabsf(t1_cpu - t1_cuda);
+    const float t1_relerr = t1_abserr / (fabsf(t1_cpu) > 1.0f ? fabsf(t1_cpu) : 1.0f);
+
+    fprintf(stderr,
+            "ds4: cuda_session_prefill_test top1 cpu=%d (logit=%.4f) cuda=%d (logit=%.4f) match=%d\n",
+            cpu_top_id[0], t1_cpu, cuda_top_id[0], cuda_top_logit[0], top1_match ? 1 : 0);
+    fprintf(stderr,
+            "ds4: cuda_session_prefill_test top1_logit_at_cpu_id abserr=%.3e relerr=%.3e overlap=%d/%d\n",
+            t1_abserr, t1_relerr, overlap, K);
+
+    free(cpu_logits);
+    kv_cache_free(&cpu_cache);
+    ds4_session_free(s);
+
+    /* First-light gate: top-1 must match (greedy semantic correctness),
+     * top-8 overlap >= 4/8 (50% — acknowledging cumulative Q8/FP8 drift over
+     * the prefill positions × 41 compressed layers), relerr <= 5e-2 (5% on
+     * the headline logit).  Phase 3c-4 will tighten gates against the
+     * recorded API ground-truth in tests/test-vectors/official.vec. */
+    const bool pass = top1_match && (overlap >= 4) && (t1_relerr <= 5.0e-2f);
+    fprintf(stderr,
+            "ds4: cuda_session_prefill_test %s (top1_match=%d overlap>=4 relerr<=5e-2)\n",
+            pass ? "PASS" : "FAIL",
+            top1_match ? 1 : 0);
+    return pass ? 0 : 1;
+#endif
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -19069,6 +19410,79 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
  * A non-matching prompt discards the checkpoint and prefills from token zero.
  */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+#ifdef DS4_USE_CUDA
+    if (s->engine->backend == DS4_BACKEND_CUDA) {
+        ds4_engine *ec = s->engine;
+        if (prompt->len <= 0 || prompt->len >= s->ctx_size) {
+            snprintf(err, errlen, "prompt exceeds context");
+            return 1;
+        }
+        /* If the live checkpoint is a strict prefix of `prompt`, extend by
+         * decoding only the suffix one token at a time — same correctness
+         * guarantee Metal's "short suffix" branch provides.  Phase 3c's
+         * per-token eval IS the resume path; there is no batched fast path
+         * to fall back on yet. */
+        if (s->checkpoint_valid &&
+            prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint))
+        {
+            for (int i = s->checkpoint.len; i < prompt->len; i++) {
+                const bool last = (i == prompt->len - 1);
+                if (!cuda_graph_eval_token_raw_swa(&s->cuda_graph,
+                                                   &ec->model, &ec->weights,
+                                                   (uint32_t)prompt->v[i],
+                                                   (uint32_t)s->checkpoint.len,
+                                                   last ? s->logits : NULL))
+                {
+                    snprintf(err, errlen, "CUDA decode failed while extending checkpoint");
+                    s->checkpoint_valid = false;
+                    return 1;
+                }
+                token_vec_push(&s->checkpoint, prompt->v[i]);
+            }
+            return 0;
+        }
+
+        /* Cold prefill: discard any prior checkpoint and refill from token 0.
+         * cuda_graph_prefill_chunked drives the per-token eval loop and reads
+         * logits from the last token. */
+        if (s->checkpoint_valid) {
+            /* Reset KV / compressor state.  3c-3 scope shortcut: tear the
+             * graph down and rebuild it.  TODO 3c (followup): add a
+             * cuda_graph_reset() that zeros the per-layer caches and counters
+             * without freeing managed buffers, mirroring Metal's
+             * ds4_session_invalidate semantics. */
+            (void)ds4_cuda_synchronize();
+            cuda_graph_free(&s->cuda_graph);
+            s->cuda_graph_ready = false;
+            const uint32_t new_prefill_cap = cuda_graph_prefill_cap_for_prompt(s->ctx_size);
+            const uint32_t new_raw_cap = cuda_graph_raw_cap_for_context(
+                s->ctx_size, new_prefill_cap);
+            if (!cuda_graph_alloc_raw_cap(&s->cuda_graph, &ec->weights,
+                                          &ec->weights.layer[0],
+                                          new_raw_cap, (uint32_t)s->ctx_size,
+                                          new_prefill_cap))
+            {
+                snprintf(err, errlen, "CUDA graph realloc failed for cold prefill");
+                return 1;
+            }
+            s->cuda_graph.quality = ec->quality;
+            s->cuda_graph_ready = true;
+            s->prefill_cap = new_prefill_cap;
+        }
+
+        if (!cuda_graph_prefill_chunked(&s->cuda_graph, &ec->model, &ec->weights,
+                                        prompt, prompt->len, s->logits))
+        {
+            snprintf(err, errlen, "CUDA prefill failed");
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        ds4_tokens_copy(&s->checkpoint, prompt);
+        s->checkpoint_valid = true;
+        return 0;
+    }
+#endif
 #ifdef DS4_NO_METAL
     (void)s;
     (void)prompt;

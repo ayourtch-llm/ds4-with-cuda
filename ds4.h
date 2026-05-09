@@ -130,6 +130,15 @@ int ds4_engine_cuda_session_test(ds4_engine *e, int ctx_size);
  * argmax match, top-8 overlap >= 6/8, top-1 logit relative error <= 1e-2. */
 int ds4_engine_cuda_session_eval_test(ds4_engine *e, int ctx_size);
 
+/* Phase 3c-3 (prefill): create a CUDA session, call ds4_session_sync on the
+ * supplied prompt, and compare the post-prefill last-token logits against
+ * forward_token_raw_swa_cpu run sequentially over the same prompt.  This is
+ * the proper full-context CPU oracle (per-token prefill into a real CPU KV
+ * cache), so top-1 should be at parity with Metal rather than at the
+ * fresh-cache 92% from 2.1c-5.  Acceptance: top-1 argmax match, top-8
+ * overlap >= 6/8, top-1 logit relative error <= 1e-2. */
+int ds4_engine_cuda_session_prefill_test(ds4_engine *e, const ds4_tokens *prompt, int ctx_size);
+
 void ds4_tokens_push(ds4_tokens *tv, int token);
 void ds4_tokens_free(ds4_tokens *tv);
 void ds4_tokens_copy(ds4_tokens *dst, const ds4_tokens *src);

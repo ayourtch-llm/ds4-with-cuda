@@ -45,6 +45,7 @@ typedef struct {
     bool cuda_test_vectors;
     bool cuda_session_test;
     bool cuda_session_eval_test;
+    bool cuda_session_prefill_test;
 } cli_generation_options;
 
 typedef struct {
@@ -711,6 +712,11 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
         ds4_tokens_free(&prompt);
         return rc;
     }
+    if (cfg->gen.cuda_session_prefill_test) {
+        rc = ds4_engine_cuda_session_prefill_test(engine, &prompt, cfg->gen.ctx_size);
+        ds4_tokens_free(&prompt);
+        return rc;
+    }
     if (cfg->gen.cuda_test_vectors) {
         ds4_tokens_free(&prompt);
         return ds4_engine_cuda_test_vectors_test(engine, cfg->gen.cuda_test_vectors_path);
@@ -1257,6 +1263,9 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--cuda-session-eval-test")) {
             c.gen.cuda_session_eval_test = true;
+            c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--cuda-session-prefill-test")) {
+            c.gen.cuda_session_prefill_test = true;
             c.engine.backend = DS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
