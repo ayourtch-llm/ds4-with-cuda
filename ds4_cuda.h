@@ -442,6 +442,29 @@ int ds4_cuda_rope_tail_tensor(
         float            beta_fast,
         float            beta_slow);
 
+/* Phase 3b-12: paired rope_tail.  Fuses the two back-to-back q-rope and
+ * kv-rope launches the decode loop fires per layer (identical pos / n_rot /
+ * inverse / freq_* / yarn params; only the buffer and n_head differ) into
+ * one launch.  Math is bit-identical to the unfused pair; the kernel
+ * dispatches q vs kv per blockIdx.y. */
+int ds4_cuda_rope_tail_pair_tensor(
+        ds4_cuda_tensor *x_q,
+        ds4_cuda_tensor *x_kv,
+        uint32_t         n_tok,
+        uint32_t         n_head_q,
+        uint32_t         n_head_kv,
+        uint32_t         head_dim,
+        uint32_t         n_rot,
+        uint32_t         pos0,
+        uint32_t         n_ctx_orig,
+        bool             inverse,
+        float            freq_base,
+        float            freq_scale,
+        float            ext_factor,
+        float            attn_factor,
+        float            beta_fast,
+        float            beta_slow);
+
 /* Release decode fused KV finalizer: after the standalone RoPE kernel, this
  * performs DS4's FP8 non-RoPE KV round trip and writes the F16-rounded raw
  * attention cache row in one launch. */

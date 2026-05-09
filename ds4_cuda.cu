@@ -3824,6 +3824,107 @@ static __global__ void ds4_cuda_dsv4_rope_tail_kernel(
     }
 }
 
+/* Phase 3b-12 paired rope_tail (algo lever A8): the decode loop fires q-rope
+ * and kv-rope back-to-back per layer with identical parameters (pos, n_rot,
+ * inverse=false, freq_base, freq_scale, ext_factor, attn_factor, beta_*) —
+ * only the buffer pointer and n_head differ.  Folding the two launches into
+ * one halves the rope_tail launch count on the q+kv path (was 2 of the ~3.24
+ * rope_tail launches per layer per token).  Math is bit-identical: each
+ * (tok, h) block runs the SAME body as the single-buffer kernel; the
+ * dispatch on blockIdx.y picks which buffer/n_head to use.
+ *
+ * Grid layout: (n_tok, n_head_q + n_head_kv).  Blocks with blockIdx.y in
+ * [0, n_head_q) operate on x_q with h = blockIdx.y; blocks with blockIdx.y
+ * in [n_head_q, n_head_q + n_head_kv) operate on x_kv with h = blockIdx.y -
+ * n_head_q.  All shared trig/yarn computations are recomputed per block but
+ * all blocks land on the same values (no shmem needed; matches the existing
+ * single-buffer kernel's pattern).
+ *
+ * The heads-inverse rope (post-attention, inverse=true) and the indexer
+ * rope (conditional ratio==4) keep using the original single-buffer kernel
+ * — they fire at different points in the decode flow and don't share
+ * parameters with q/kv. */
+static __global__ void ds4_cuda_dsv4_rope_tail_pair_kernel(
+        float       *x_q,
+        float       *x_kv,
+        uint32_t     n_tok,
+        uint32_t     n_head_q,
+        uint32_t     n_head_kv,
+        uint32_t     head_dim,
+        uint32_t     n_rot,
+        uint32_t     pos0,
+        uint32_t     n_ctx_orig,
+        int          inverse,
+        float        freq_base,
+        float        freq_scale,
+        float        ext_factor,
+        float        attn_factor_arg,
+        float        beta_fast,
+        float        beta_slow) {
+    const uint32_t tok = blockIdx.x;
+    const uint32_t h_g = blockIdx.y;
+    if (tok >= n_tok || h_g >= n_head_q + n_head_kv) return;
+
+    float    *x;
+    uint32_t  n_head;
+    uint32_t  h;
+    if (h_g < n_head_q) {
+        x      = x_q;
+        n_head = n_head_q;
+        h      = h_g;
+    } else {
+        x      = x_kv;
+        n_head = n_head_kv;
+        h      = h_g - n_head_q;
+    }
+
+    const uint32_t n_nope = head_dim - n_rot;
+    const float pos = (float)(pos0 + tok);
+    const float sin_sign = inverse ? -1.0f : 1.0f;
+    const float two_pi = 2.0f * (float)M_PI;
+
+    float corr_low = 0.0f;
+    float corr_high = (float)(n_rot - 1u);
+    if (ext_factor != 0.0f) {
+        const float two_log_base = 2.0f * logf(freq_base);
+        const float corr_low_raw  = (float)n_rot * logf((float)n_ctx_orig / (beta_fast * two_pi)) / two_log_base;
+        const float corr_high_raw = (float)n_rot * logf((float)n_ctx_orig / (beta_slow * two_pi)) / two_log_base;
+        corr_low  = fmaxf(0.0f, floorf(corr_low_raw));
+        corr_high = fminf((float)(n_rot - 1u), ceilf(corr_high_raw));
+    }
+
+    float *tail = x + ((uint64_t)tok * n_head + h) * head_dim + n_nope;
+
+    const float theta_scale = (float)pow((double)freq_base, -2.0 / (double)n_rot);
+    const float yarn_log = (ext_factor != 0.0f)
+        ? (float)log(1.0 / (double)freq_scale)
+        : 0.0f;
+
+    for (uint32_t i = threadIdx.x * 2u; i < n_rot; i += blockDim.x * 2u) {
+        float theta_extrap = pos;
+        for (uint32_t s = 0; s < i / 2u; s++) {
+            theta_extrap *= theta_scale;
+        }
+        const float theta_interp = freq_scale * theta_extrap;
+        float theta = theta_interp;
+        float mscale = attn_factor_arg;
+        if (ext_factor != 0.0f) {
+            const float y = ((float)(i / 2u) - corr_low) / fmaxf(0.001f, corr_high - corr_low);
+            const float ramp = 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+            const float ramp_mix = ramp * ext_factor;
+            theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+            mscale *= 1.0f + 0.1f * yarn_log;
+        }
+
+        const float c = (float)cos((double)theta) * mscale;
+        const float s_v = sin_sign * (float)sin((double)theta) * mscale;
+        const float x0 = tail[i + 0u];
+        const float x1 = tail[i + 1u];
+        tail[i + 0u] = x0 * c - x1 * s_v;
+        tail[i + 1u] = x0 * s_v + x1 * c;
+    }
+}
+
 extern "C" {
 
 int ds4_cuda_rope_tail_tensor(
@@ -3858,6 +3959,46 @@ int ds4_cuda_rope_tail_tensor(
         pos0, n_ctx_orig, inverse ? 1 : 0,
         freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
     return ds4_cuda_check(cudaGetLastError(), "launch dsv4_rope_tail");
+}
+
+int ds4_cuda_rope_tail_pair_tensor(
+        ds4_cuda_tensor *x_q,
+        ds4_cuda_tensor *x_kv,
+        uint32_t         n_tok,
+        uint32_t         n_head_q,
+        uint32_t         n_head_kv,
+        uint32_t         head_dim,
+        uint32_t         n_rot,
+        uint32_t         pos0,
+        uint32_t         n_ctx_orig,
+        bool             inverse,
+        float            freq_base,
+        float            freq_scale,
+        float            ext_factor,
+        float            attn_factor,
+        float            beta_fast,
+        float            beta_slow) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (n_tok == 0u || n_head_q == 0u || n_head_kv == 0u || head_dim == 0u) return 0;
+    if (n_rot == 0u || n_rot > head_dim || (n_rot & 1u) != 0u) return 0;
+    if (n_head_q > UINT32_MAX - n_head_kv) return 0;
+
+    const uint64_t q_bytes  = (uint64_t)n_tok * n_head_q  * head_dim * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)n_tok * n_head_kv * head_dim * sizeof(float);
+    void *xq_ptr = NULL, *xkv_ptr = NULL;
+    if (!ds4_cuda_tensor_range(x_q,  q_bytes,  "dsv4_rope_tail_pair q",  &xq_ptr))  return 0;
+    if (!ds4_cuda_tensor_range(x_kv, kv_bytes, "dsv4_rope_tail_pair kv", &xkv_ptr)) return 0;
+
+    constexpr int block_size = 256;
+    dim3 grid(n_tok, n_head_q + n_head_kv, 1u);
+    dim3 block((uint32_t)block_size, 1u, 1u);
+    ds4_cuda_dsv4_rope_tail_pair_kernel<<<grid, block, 0, g_stream>>>(
+        (float *)xq_ptr, (float *)xkv_ptr,
+        n_tok, n_head_q, n_head_kv, head_dim, n_rot,
+        pos0, n_ctx_orig, inverse ? 1 : 0,
+        freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    return ds4_cuda_check(cudaGetLastError(), "launch dsv4_rope_tail_pair");
 }
 
 } /* extern "C" */

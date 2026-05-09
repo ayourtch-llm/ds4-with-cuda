@@ -14390,16 +14390,16 @@ static bool cuda_graph_eval_token_raw_swa(
                                                      model->map, model->size,
                                                      L->attn_kv_a_norm->abs_offset,
                                                      (uint32_t)kv_dim, DS4_RMS_EPS);
-        if (ok) ok = ds4_cuda_rope_tail_tensor(g->q, 1u, DS4_N_HEAD,
-                                                DS4_N_HEAD_DIM, DS4_N_ROT,
-                                                pos, nco, false, fb, fs, ef, af,
-                                                DS4_ROPE_YARN_BETA_FAST,
-                                                DS4_ROPE_YARN_BETA_SLOW);
-        if (ok) ok = ds4_cuda_rope_tail_tensor(g->kv, 1u, DS4_N_HEAD_KV,
-                                                DS4_N_HEAD_DIM, DS4_N_ROT,
-                                                pos, nco, false, fb, fs, ef, af,
-                                                DS4_ROPE_YARN_BETA_FAST,
-                                                DS4_ROPE_YARN_BETA_SLOW);
+        /* Phase 3b-12: paired q+kv rope_tail (algo lever A8) — back-to-back
+         * launches with identical params except buffer/n_head folded into a
+         * single kernel launch.  Math bit-identical. */
+        if (ok) ok = ds4_cuda_rope_tail_pair_tensor(
+                        g->q, g->kv, 1u,
+                        DS4_N_HEAD, DS4_N_HEAD_KV,
+                        DS4_N_HEAD_DIM, DS4_N_ROT,
+                        pos, nco, false, fb, fs, ef, af,
+                        DS4_ROPE_YARN_BETA_FAST,
+                        DS4_ROPE_YARN_BETA_SLOW);
         /* fp8_kv_store_raw modifies kv's NOPE prefix in-place to its FP8
          * round-trip and writes the F16-rounded full row to layer_raw_cache. */
         if (ok) ok = ds4_cuda_kv_fp8_store_raw_tensor(g->kv, g->layer_raw_cache[il],
