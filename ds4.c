@@ -15587,6 +15587,46 @@ static bool cuda_graph_eval_token_raw_swa(
  *   - store_raw_kv_batch                        (Phase 7 C1, NEW)
  * ========================================================================= */
 
+/* Phase 7b Stage 1.1: per-layer attention-path counter (env-gated by
+ * DS4_CUDA_LAYER_PATH_LOG=1).  Confirms by measurement which dispatch
+ * fires per layer on a long-prompt run — Stage 3 lever choice depends
+ * on whether attention or matmul/MoE/HC dominates the per-layer cost.
+ *
+ * Buckets: 0=raw_heads (ratio=0), 1=static_mixed (ratio>0, n_comp<=top_k),
+ *          2=topk_tail (ratio=4, n_comp>top_k, per-token loop),
+ *          3=raw_heads_fallback (ratio>0, n_comp==0). */
+static int g_cuda_layer_path_counts[4] = {0, 0, 0, 0};
+static const char *g_cuda_layer_path_names[4] = {
+    "ratio0_raw_heads", "static_mixed", "topk_tail_loop", "n_comp_zero_raw"
+};
+
+static bool cuda_layer_path_log_enabled(void) {
+    const char *env = getenv("DS4_CUDA_LAYER_PATH_LOG");
+    return env && env[0] == '1';
+}
+
+static void cuda_layer_path_count(int bucket, uint32_t il) {
+    if (!cuda_layer_path_log_enabled()) return;
+    if (bucket < 0 || bucket >= 4) return;
+    g_cuda_layer_path_counts[bucket]++;
+    fprintf(stderr, "ds4: cuda layer-path il=%u bucket=%s\n",
+            il, g_cuda_layer_path_names[bucket]);
+}
+
+static void cuda_layer_path_summary(void) {
+    if (!cuda_layer_path_log_enabled()) return;
+    int total = 0;
+    for (int i = 0; i < 4; i++) total += g_cuda_layer_path_counts[i];
+    fprintf(stderr,
+            "ds4: cuda layer-path summary  raw_heads=%d  static_mixed=%d  "
+            "topk_tail=%d  n_comp_zero_raw=%d  total=%d\n",
+            g_cuda_layer_path_counts[0], g_cuda_layer_path_counts[1],
+            g_cuda_layer_path_counts[2], g_cuda_layer_path_counts[3],
+            total);
+    /* Reset for the next prefill chunk. */
+    for (int i = 0; i < 4; i++) g_cuda_layer_path_counts[i] = 0;
+}
+
 /* Inline analog of metal_graph_tensor_row_view: a non-owning view at a
  * specific row offset within a contiguous batched tensor.  Caller frees. */
 static ds4_cuda_tensor *cuda_graph_tensor_row_view(
@@ -15784,7 +15824,10 @@ static bool cuda_graph_encode_layer_attention_batch(
                 g->batch_q, g->batch_kv,
                 n_tokens, g->raw_window,
                 DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
-        if (ok) batch_attention_done = true;
+        if (ok) {
+            batch_attention_done = true;
+            cuda_layer_path_count(0, il);
+        }
     }
 
     /* ---- ratio>0: compressor + indexer + dispatch attention path. ---- */
@@ -16003,7 +16046,10 @@ static bool cuda_graph_encode_layer_attention_batch(
                 ds4_cuda_tensor_free(heads_view);
                 ds4_cuda_tensor_free(q_view);
             }
-            if (ok) batch_attention_done = true;
+            if (ok) {
+                batch_attention_done = true;
+                cuda_layer_path_count(2, il);
+            }
         } else if (ok && n_comp != 0) {
             ok = ds4_cuda_attention_prefill_static_mixed_heads_tensor(
                     g->batch_heads, model->map, model->size,
@@ -16013,7 +16059,10 @@ static bool cuda_graph_encode_layer_attention_batch(
                     n_tokens, n_comp,
                     g->raw_window, ratio,
                     DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
-            if (ok) batch_attention_done = true;
+            if (ok) {
+                batch_attention_done = true;
+                cuda_layer_path_count(1, il);
+            }
         } else if (ok) {
             /* n_comp == 0 path (very short prompt, ratio>0): all tokens
              * see only raw — same kernel as ratio==0. */
@@ -16023,7 +16072,10 @@ static bool cuda_graph_encode_layer_attention_batch(
                     g->batch_q, g->batch_kv,
                     n_tokens, g->raw_window,
                     DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
-            if (ok) batch_attention_done = true;
+            if (ok) {
+                batch_attention_done = true;
+                cuda_layer_path_count(3, il);
+            }
         }
     }
 
@@ -16220,6 +16272,12 @@ static bool cuda_graph_prefill_layer_major(
     if (n_tokens <= 0 || n_tokens > prompt->len ||
         (uint32_t)n_tokens > g->prefill_cap) return false;
 
+    if (cuda_layer_path_log_enabled()) {
+        fprintf(stderr,
+                "ds4: cuda prefill_layer_major n_tokens=%d prefill_cap=%u\n",
+                n_tokens, g->prefill_cap);
+    }
+
     /* Upload token IDs to prefill_tokens (int32 device buffer). */
     if (!ds4_cuda_tensor_write(g->prefill_tokens, 0, prompt->v,
                                (uint64_t)n_tokens * sizeof(int32_t))) {
@@ -16304,6 +16362,7 @@ static bool cuda_graph_prefill_layer_major(
             return false;
         }
     }
+    cuda_layer_path_summary();
     return true;
 }
 
