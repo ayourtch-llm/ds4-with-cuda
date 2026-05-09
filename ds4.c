@@ -16657,6 +16657,190 @@ int ds4_engine_cuda_single_layer_test(ds4_engine *e, const ds4_tokens *prompt) {
      * single-token 2.1b result was abs_err ~5e-7 at this stage. */
     if (worst_after_abserr > 1.0e-3) rc = 1;
 
+    /* ============================================================
+     * 2.1c-2: FFN orchestration on the last prompt token.  Uses the
+     * after_attn state from the final iteration above (still resident
+     * in the after_attn device tensor and cpu_after_attn host buffer).
+     * Chains: rms_norm_plain → matmul_f16(hc_ffn_fn) →
+     * hc_split_weighted_sum_norm → matmul_f16(ffn_gate_inp) →
+     * router_select_one → routed_moe_one + shared_gate_up_swiglu_q8_0
+     * → shared_down_hc_expand_q8_0 (fused down + add + HC expand).
+     * Output after_ffn_hc compared element-wise to layer_ffn_one
+     * called on cpu_after_attn.
+     * ============================================================ */
+    if (rc == 0 && n_tok > 0) {
+        const int      last_token       = prompt->v[n_tok - 1];
+        const uint64_t expert_in_dim    = layer->ffn_gate_exps->dim[0];
+        const uint64_t expert_mid_dim   = layer->ffn_gate_exps->dim[1];
+        const uint64_t down_in_dim      = layer->ffn_down_exps->dim[0];
+        const uint64_t routed_out_dim   = layer->ffn_down_exps->dim[1];
+        const uint64_t shared_dim       = layer->ffn_gate_shexp->dim[1];
+        const uint64_t gate_row_bytes    = routed_expert_row_bytes(layer->ffn_gate_exps);
+        const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
+        const uint64_t down_row_bytes    = routed_expert_row_bytes(layer->ffn_down_exps);
+        const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+        const uint64_t pair_rows = DS4_N_EXPERT_USED;  /* n_tokens=1 × n_expert_used */
+
+        float *cpu_after_ffn_hc = xmalloc(hc_dim * sizeof(float));
+        layer_ffn_one(cpu_after_ffn_hc, model, layer, cpu_after_attn,
+                      il, last_token, /*trace=*/false);
+
+        ds4_cuda_tensor *flat_ffn_dev    = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+        ds4_cuda_tensor *mix_ffn_dev     = ds4_cuda_tensor_alloc(mix_dim * sizeof(float));
+        ds4_cuda_tensor *ffn_cur_dev     = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        ds4_cuda_tensor *ffn_norm_dev    = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        ds4_cuda_tensor *split_ffn_dev   = ds4_cuda_tensor_alloc(mix_dim * sizeof(float));
+        ds4_cuda_tensor *router_logits_dev = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+        ds4_cuda_tensor *router_selected_dev = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+        ds4_cuda_tensor *router_weights_dev  = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+        ds4_cuda_tensor *router_probs_dev    = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+        ds4_cuda_tensor *routed_out_dev      = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        ds4_cuda_tensor *routed_gate_dev     = ds4_cuda_tensor_alloc(pair_rows * down_in_dim * sizeof(float));
+        ds4_cuda_tensor *routed_up_dev       = ds4_cuda_tensor_alloc(pair_rows * down_in_dim * sizeof(float));
+        ds4_cuda_tensor *routed_mid_dev      = ds4_cuda_tensor_alloc(pair_rows * down_in_dim * sizeof(float));
+        ds4_cuda_tensor *routed_experts_dev  = ds4_cuda_tensor_alloc(pair_rows * routed_out_dim * sizeof(float));
+        ds4_cuda_tensor *shared_gate_dev     = ds4_cuda_tensor_alloc(shared_dim * sizeof(float));
+        ds4_cuda_tensor *shared_up_dev       = ds4_cuda_tensor_alloc(shared_dim * sizeof(float));
+        ds4_cuda_tensor *shared_mid_dev      = ds4_cuda_tensor_alloc(shared_dim * sizeof(float));
+        ds4_cuda_tensor *shared_out_dev      = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        ds4_cuda_tensor *after_ffn_hc_dev    = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+
+        if (!flat_ffn_dev || !mix_ffn_dev || !ffn_cur_dev || !ffn_norm_dev ||
+            !split_ffn_dev || !router_logits_dev || !router_selected_dev ||
+            !router_weights_dev || !router_probs_dev || !routed_out_dev ||
+            !routed_gate_dev || !routed_up_dev || !routed_mid_dev ||
+            !routed_experts_dev || !shared_gate_dev || !shared_up_dev ||
+            !shared_mid_dev || !shared_out_dev || !after_ffn_hc_dev) {
+            fprintf(stderr, "ds4: cuda_single_layer_test 2.1c-2 alloc failed\n");
+            rc = 1;
+            goto cleanup_2_1c_2;
+        }
+
+        const bool     has_router_bias  = layer->ffn_exp_probs_b != NULL;
+        const bool     router_hash_mode = layer->ffn_gate_tid2eid != NULL;
+        const uint64_t bias_offset = has_router_bias ? layer->ffn_exp_probs_b->abs_offset : 0;
+        const uint64_t hash_offset = router_hash_mode ? layer->ffn_gate_tid2eid->abs_offset : 0;
+        const uint32_t hash_rows   = router_hash_mode ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0;
+        (void)expert_in_dim;  /* used inside routed_moe_one_tensor via gate_row_bytes derivation */
+
+        int ok_ffn = ds4_cuda_begin_commands();
+        if (ok_ffn) ok_ffn = ds4_cuda_rms_norm_plain_tensor(flat_ffn_dev, after_attn,
+                                                             (uint32_t)hc_dim, DS4_RMS_EPS);
+        if (ok_ffn) ok_ffn = ds4_cuda_matmul_f16_tensor(mix_ffn_dev,
+                                                         e->model.map, e->model.size,
+                                                         layer->hc_ffn_fn->abs_offset,
+                                                         hc_dim, mix_dim,
+                                                         flat_ffn_dev, 1u);
+        if (ok_ffn) ok_ffn = ds4_cuda_hc_split_weighted_sum_norm_tensor(
+                        ffn_cur_dev, ffn_norm_dev, split_ffn_dev,
+                        mix_ffn_dev, after_attn, e->model.map, e->model.size,
+                        layer->hc_ffn_scale->abs_offset,
+                        layer->hc_ffn_base->abs_offset,
+                        layer->ffn_norm->abs_offset,
+                        DS4_N_EMBD, DS4_N_HC,
+                        DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS);
+        if (ok_ffn) ok_ffn = ds4_cuda_matmul_f16_tensor(router_logits_dev,
+                                                         e->model.map, e->model.size,
+                                                         layer->ffn_gate_inp->abs_offset,
+                                                         DS4_N_EMBD, DS4_N_EXPERT,
+                                                         ffn_norm_dev, 1u);
+        if (ok_ffn) ok_ffn = ds4_cuda_router_select_tensor(
+                        router_selected_dev, router_weights_dev, router_probs_dev,
+                        e->model.map, e->model.size,
+                        bias_offset, hash_offset, hash_rows,
+                        (uint32_t)last_token,
+                        /*n_expert_groups=*/0u, /*n_group_used=*/0u,
+                        has_router_bias, router_hash_mode,
+                        router_logits_dev);
+        if (ok_ffn) ok_ffn = ds4_cuda_routed_moe_one_tensor(
+                        routed_out_dev, routed_gate_dev, routed_up_dev,
+                        routed_mid_dev, routed_experts_dev,
+                        e->model.map, e->model.size,
+                        layer->ffn_gate_exps->abs_offset,
+                        layer->ffn_up_exps->abs_offset,
+                        layer->ffn_down_exps->abs_offset,
+                        layer->ffn_gate_exps->type,
+                        layer->ffn_down_exps->type,
+                        gate_expert_bytes, gate_row_bytes,
+                        down_expert_bytes, down_row_bytes,
+                        (uint32_t)expert_in_dim,
+                        (uint32_t)down_in_dim,
+                        (uint32_t)routed_out_dim,
+                        router_selected_dev, router_weights_dev,
+                        DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP,
+                        ffn_norm_dev);
+        if (ok_ffn) ok_ffn = ds4_cuda_shared_gate_up_swiglu_q8_0_tensor(
+                        shared_gate_dev, shared_up_dev, shared_mid_dev,
+                        e->model.map, e->model.size,
+                        layer->ffn_gate_shexp->abs_offset,
+                        layer->ffn_up_shexp->abs_offset,
+                        DS4_N_EMBD, shared_dim,
+                        ffn_norm_dev);
+        if (ok_ffn) ok_ffn = ds4_cuda_shared_down_hc_expand_q8_0_tensor(
+                        after_ffn_hc_dev, shared_out_dev,
+                        e->model.map, e->model.size,
+                        layer->ffn_down_shexp->abs_offset,
+                        shared_dim, DS4_N_EMBD,
+                        shared_mid_dev, routed_out_dev,
+                        after_attn, split_ffn_dev,
+                        DS4_N_EMBD, DS4_N_HC);
+        if (ok_ffn) ok_ffn = ds4_cuda_end_commands();
+        if (!ok_ffn) {
+            fprintf(stderr, "ds4: cuda_single_layer_test 2.1c-2 chain failed\n");
+            rc = 1;
+            goto cleanup_2_1c_2;
+        }
+
+        float *cuda_after_ffn_hc = xmalloc(hc_dim * sizeof(float));
+        if (!ds4_cuda_tensor_read(after_ffn_hc_dev, 0, cuda_after_ffn_hc, hc_dim * sizeof(float))) {
+            fprintf(stderr, "ds4: cuda_single_layer_test 2.1c-2 read failed\n");
+            free(cuda_after_ffn_hc);
+            rc = 1;
+            goto cleanup_2_1c_2;
+        }
+
+        int      worst_ffn_ulp = 0;
+        uint64_t worst_ffn_idx = 0;
+        double   ffn_max_abserr = 0.0;
+        double   ffn_max_absmag = 0.0;
+        for (uint64_t i = 0; i < hc_dim; i++) {
+            const float c = cpu_after_ffn_hc[i];
+            const float g = cuda_after_ffn_hc[i];
+            union { float f; int32_t i; } ua, ub; ua.f = c; ub.f = g;
+            int32_t d = (c == g) ? 0 :
+                        ((ua.i < 0) != (ub.i < 0)) ? INT32_MAX :
+                        (ua.i > ub.i ? ua.i - ub.i : ub.i - ua.i);
+            if (d > worst_ffn_ulp) { worst_ffn_ulp = d; worst_ffn_idx = i; }
+            const double e1 = fabs((double)c - (double)g);
+            const double m1 = fmax(fabs((double)c), fabs((double)g));
+            if (e1 > ffn_max_abserr) { ffn_max_abserr = e1; ffn_max_absmag = m1; }
+        }
+
+        fprintf(stderr,
+                "ds4: cuda_single_layer_test 2.1c-2 FFN tok=%d after_ffn_hc worst_ulp=%d at idx=%llu  "
+                "cpu/cuda=%.6e/%.6e  max_abserr=%.3e at_absmag=%.3e\n",
+                last_token, worst_ffn_ulp, (unsigned long long)worst_ffn_idx,
+                (double)cpu_after_ffn_hc[worst_ffn_idx], (double)cuda_after_ffn_hc[worst_ffn_idx],
+                ffn_max_abserr, ffn_max_absmag);
+
+        if (ffn_max_abserr > 1.0e-3) rc = 1;
+        free(cuda_after_ffn_hc);
+
+cleanup_2_1c_2:
+        ds4_cuda_tensor_free(after_ffn_hc_dev);
+        ds4_cuda_tensor_free(shared_out_dev); ds4_cuda_tensor_free(shared_mid_dev);
+        ds4_cuda_tensor_free(shared_up_dev); ds4_cuda_tensor_free(shared_gate_dev);
+        ds4_cuda_tensor_free(routed_experts_dev); ds4_cuda_tensor_free(routed_mid_dev);
+        ds4_cuda_tensor_free(routed_up_dev); ds4_cuda_tensor_free(routed_gate_dev);
+        ds4_cuda_tensor_free(routed_out_dev);
+        ds4_cuda_tensor_free(router_probs_dev); ds4_cuda_tensor_free(router_weights_dev);
+        ds4_cuda_tensor_free(router_selected_dev); ds4_cuda_tensor_free(router_logits_dev);
+        ds4_cuda_tensor_free(split_ffn_dev); ds4_cuda_tensor_free(ffn_norm_dev);
+        ds4_cuda_tensor_free(ffn_cur_dev); ds4_cuda_tensor_free(mix_ffn_dev);
+        ds4_cuda_tensor_free(flat_ffn_dev);
+        free(cpu_after_ffn_hc);
+    }
+
 cuda_test_cleanup_2_1c:
     ds4_cuda_tensor_free(post_view); ds4_cuda_tensor_free(comb_view);
     ds4_cuda_tensor_free(comp_kv_dummy); ds4_cuda_tensor_free(comp_mask_dummy);
