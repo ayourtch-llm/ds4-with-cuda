@@ -14289,6 +14289,365 @@ static uint32_t cuda_graph_prefill_cap_for_prompt(int prompt_len) {
  * needed for prefill via per-token loop.  Phase 3c-2's first-token at pos=0
  * is the n_comp=0 degenerate case of the same chain.  Per-token-loop is the
  * body-swap site for a future batched cuda_graph_prefill_chunked (TODO 3b). */
+/* Phase 4 Step 2: per-layer decode body extracted from
+ * cuda_graph_eval_token_raw_swa as a reusable helper.  Math is unchanged —
+ * this is a pure refactor.  The helper signature mirrors the Metal peer
+ * (metal_graph_encode_decode_layer at ds4.c:9157) by taking `raw_cache`
+ * explicitly so future MTP draft code can pass `g->mtp_raw_cache` instead
+ * of `g->layer_raw_cache[il]`.  Unlike Metal, this CUDA helper takes the
+ * HC ping-pong tensors as explicit parameters (cur_hc read, after_ffn_hc
+ * written) rather than mutating g->cur_hc / g->after_ffn_hc — the per-token
+ * loop owns the swap; the per-layer body is pure read-cur/write-after.
+ *
+ * raw_row, n_raw, raw_start are constant per token (computed by the caller
+ * from pos + g->raw_cap + g->raw_window) and passed in to keep the helper
+ * stateless on the SWA window math.  Per-layer compressor / indexer caches
+ * (g->layer_attn_state_*[il], g->layer_attn_comp_cache[il],
+ * g->layer_index_*[il], counters g->layer_n_comp[il] /
+ * g->layer_n_index_comp[il]) remain indexed by `il` from `g`. */
+static bool cuda_graph_encode_one_layer(
+        ds4_cuda_graph          *g,
+        const ds4_model         *model,
+        const ds4_layer_weights *layer,
+        uint32_t                 il,
+        uint32_t                 pos,
+        ds4_cuda_tensor         *raw_cache,
+        uint32_t                 raw_cap,
+        uint32_t                 raw_row,
+        uint32_t                 n_raw,
+        uint32_t                 raw_start,
+        int                      token,
+        ds4_cuda_tensor         *cur_hc,
+        ds4_cuda_tensor         *after_ffn_hc) {
+    const uint64_t hc_dim  = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+    const uint64_t q_dim   = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim  = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    /* Per-block dimensions derived from this layer's weights — the existing
+     * code derived them from weights->layer[0] under the assumption that
+     * all layers share the same shape.  Reading from `layer` directly works
+     * for both regular decode (where every layer has the same shape) and
+     * the future MTP block (single layer, same shape). */
+    const uint64_t expert_in_dim_g  = layer->ffn_gate_exps->dim[0];
+    const uint64_t expert_mid_dim_g = layer->ffn_gate_exps->dim[1];
+    const uint64_t down_in_dim_g    = layer->ffn_down_exps->dim[0];
+    const uint64_t routed_out_dim_g = layer->ffn_down_exps->dim[1];
+    const uint64_t shared_dim_g     = layer->ffn_gate_shexp->dim[1];
+    (void)expert_mid_dim_g;
+
+    const ds4_layer_weights *L = layer;
+    const float fb  = layer_rope_freq_base(il);
+    const float fs  = layer_rope_freq_scale(il);
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    const bool  cmp = ratio != 0;
+    const uint32_t coff = ratio == 4 ? 2u : 1u;
+    const float ef  = cmp && DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
+    float       af  = 1.0f;
+    if (ef != 0.0f && fs > 0.0f) af /= 1.0f + 0.1f * logf(1.0f / fs);
+    const uint32_t nco = (uint32_t)(cmp ? DS4_ROPE_ORIG_CTX : 0);
+    const uint64_t gate_row_b    = routed_expert_row_bytes(L->ffn_gate_exps);
+    const uint64_t gate_expert_b = expert_mid_dim_g * gate_row_b;
+    const uint64_t down_row_b    = routed_expert_row_bytes(L->ffn_down_exps);
+    const uint64_t down_expert_b = routed_out_dim_g * down_row_b;
+    const bool     hbias = L->ffn_exp_probs_b != NULL;
+    const bool     hhash = L->ffn_gate_tid2eid != NULL;
+    const uint64_t boff  = hbias ? L->ffn_exp_probs_b->abs_offset : 0;
+    const uint64_t hoff  = hhash ? L->ffn_gate_tid2eid->abs_offset : 0;
+    const uint32_t hrows = hhash ? (uint32_t)L->ffn_gate_tid2eid->dim[1] : 0;
+    /* Compressor emit fires at the END of every ratio-aligned span.
+     * Metal's metal_graph_encode_decode_layer at ds4.c:9348 uses the same
+     * predicate. */
+    const bool emit = cmp && (((pos + 1u) % ratio) == 0u);
+
+    int ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_rms_norm_plain_tensor(g->flat_hc, cur_hc,
+                                                 (uint32_t)hc_dim, DS4_RMS_EPS);
+    if (ok) ok = ds4_cuda_matmul_f16_tensor(g->hc_mix, model->map, model->size,
+                                             L->hc_attn_fn->abs_offset,
+                                             hc_dim, mix_dim, g->flat_hc, 1u);
+    if (ok) ok = ds4_cuda_hc_split_weighted_sum_norm_tensor(
+                    g->attn_cur, g->attn_norm, g->hc_split, g->hc_mix, cur_hc,
+                    model->map, model->size,
+                    L->hc_attn_scale->abs_offset, L->hc_attn_base->abs_offset,
+                    L->attn_norm->abs_offset, DS4_N_EMBD, DS4_N_HC,
+                    DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS);
+    if (ok) ok = ds4_cuda_matmul_q8_0_tensor(g->qr, model->map, model->size,
+                                              L->attn_q_a->abs_offset,
+                                              DS4_N_EMBD, DS4_N_LORA_O, g->attn_norm, 1u);
+    if (ok) ok = ds4_cuda_rms_norm_weight_tensor(g->qr_norm, g->qr,
+                                                 model->map, model->size,
+                                                 L->attn_q_a_norm->abs_offset,
+                                                 DS4_N_LORA_O, DS4_RMS_EPS);
+    if (ok) ok = ds4_cuda_matmul_q8_0_tensor(g->q, model->map, model->size,
+                                              L->attn_q_b->abs_offset,
+                                              DS4_N_LORA_O, q_dim, g->qr_norm, 1u);
+    if (ok) ok = ds4_cuda_head_rms_norm_tensor(g->q, 1u, DS4_N_HEAD,
+                                                DS4_N_HEAD_DIM, DS4_RMS_EPS);
+    if (ok) ok = ds4_cuda_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
+                                              L->attn_kv->abs_offset,
+                                              DS4_N_EMBD, kv_dim, g->attn_norm, 1u);
+    if (ok) ok = ds4_cuda_rms_norm_weight_tensor(g->kv, g->kv_raw,
+                                                 model->map, model->size,
+                                                 L->attn_kv_a_norm->abs_offset,
+                                                 (uint32_t)kv_dim, DS4_RMS_EPS);
+    /* Phase 3b-12: paired q+kv rope_tail (algo lever A8). */
+    if (ok) ok = ds4_cuda_rope_tail_pair_tensor(
+                    g->q, g->kv, 1u,
+                    DS4_N_HEAD, DS4_N_HEAD_KV,
+                    DS4_N_HEAD_DIM, DS4_N_ROT,
+                    pos, nco, false, fb, fs, ef, af,
+                    DS4_ROPE_YARN_BETA_FAST,
+                    DS4_ROPE_YARN_BETA_SLOW);
+    /* fp8_kv_store_raw modifies kv's NOPE prefix in-place to its FP8
+     * round-trip and writes the F16-rounded full row to raw_cache. */
+    if (ok) ok = ds4_cuda_kv_fp8_store_raw_tensor(g->kv, raw_cache,
+                                                   raw_cap, raw_row,
+                                                   DS4_N_HEAD_DIM, DS4_N_ROT);
+
+    /* Compressor block — only for ratio!=0 layers.  Mirrors Metal at
+     * ds4.c:9344-9586.  attn_compressor projects attn_norm -> comp_kv_cur
+     * + comp_sc_cur (paired F16 matmuls), then compressor_update_tensor
+     * pools/quantizes/optionally emits a new compressed-cache row.  Each
+     * call may be a no-op-emit (state-only update) depending on pos. */
+    bool comp_selected_used = false;
+    uint32_t n_selected = 0;
+    if (ok && cmp) {
+        const uint32_t comp_width = coff * DS4_N_HEAD_DIM;
+        const uint32_t comp_row = g->layer_n_comp[il];
+        if (emit && comp_row >= g->comp_cap) {
+            fprintf(stderr,
+                    "ds4: cuda graph compressed KV cache capacity exceeded at layer %u (cap=%u)\n",
+                    il, g->comp_cap);
+            ok = false;
+        }
+        if (ok) ok = ds4_cuda_matmul_f16_pair_tensor(
+                        g->comp_kv_cur, g->comp_sc_cur,
+                        model->map, model->size,
+                        L->attn_compressor_kv->abs_offset,
+                        L->attn_compressor_gate->abs_offset,
+                        DS4_N_EMBD, comp_width, g->attn_norm, 1u);
+        if (ok) ok = ds4_cuda_compressor_update_tensor(
+                        g->comp_kv_cur, g->comp_sc_cur,
+                        g->layer_attn_state_kv[il],
+                        g->layer_attn_state_score[il],
+                        g->layer_attn_comp_cache[il],
+                        model->map, model->size,
+                        L->attn_compressor_ape->abs_offset,
+                        (uint32_t)L->attn_compressor_ape->type,
+                        L->attn_compressor_norm->abs_offset,
+                        (uint32_t)L->attn_compressor_norm->type,
+                        DS4_N_HEAD_DIM, ratio, pos, comp_row,
+                        DS4_N_ROT, nco,
+                        fb, fs, ef, af,
+                        DS4_ROPE_YARN_BETA_FAST,
+                        DS4_ROPE_YARN_BETA_SLOW,
+                        DS4_RMS_EPS);
+        if (ok && emit) {
+            /* The just-emitted comp_cache row holds raw F32 values; FP8-
+             * round-trip its NOPE prefix in place to match the post-decode
+             * cache row format the attention kernel expects. */
+            ds4_cuda_tensor *row_view = ds4_cuda_tensor_view(
+                g->layer_attn_comp_cache[il],
+                (uint64_t)comp_row * DS4_N_HEAD_DIM * sizeof(float),
+                (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+            if (!row_view) { ok = false; }
+            else {
+                ok = ds4_cuda_dsv4_fp8_kv_quantize_tensor(
+                        row_view, 1u, DS4_N_HEAD_DIM, DS4_N_ROT);
+                ds4_cuda_tensor_free(row_view);
+            }
+        }
+
+        /* Indexer (ratio==4 only): another paired compressor + state
+         * advance, then — when the attention compressed-cache has more
+         * rows than top_k — compute indexer Q/scores/topk so the sparse
+         * indexed attention kernel can pick which compressed rows to
+         * read.  Mirrors Metal at ds4.c:9427-9582. */
+        if (ok && ratio == 4u) {
+            const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
+            const uint32_t index_row = g->layer_n_index_comp[il];
+            if (emit && index_row >= g->comp_cap) {
+                fprintf(stderr,
+                        "ds4: cuda graph indexer compressed KV cache capacity exceeded at layer %u (cap=%u)\n",
+                        il, g->comp_cap);
+                ok = false;
+            }
+            if (ok) ok = ds4_cuda_matmul_f16_pair_tensor(
+                            g->comp_kv_cur, g->comp_sc_cur,
+                            model->map, model->size,
+                            L->indexer_compressor_kv->abs_offset,
+                            L->indexer_compressor_gate->abs_offset,
+                            DS4_N_EMBD, index_width, g->attn_norm, 1u);
+            if (ok) ok = ds4_cuda_compressor_update_tensor(
+                            g->comp_kv_cur, g->comp_sc_cur,
+                            g->layer_index_state_kv[il],
+                            g->layer_index_state_score[il],
+                            g->layer_index_comp_cache[il],
+                            model->map, model->size,
+                            L->indexer_compressor_ape->abs_offset,
+                            (uint32_t)L->indexer_compressor_ape->type,
+                            L->indexer_compressor_norm->abs_offset,
+                            (uint32_t)L->indexer_compressor_norm->type,
+                            DS4_N_INDEXER_HEAD_DIM, ratio, pos, index_row,
+                            DS4_N_ROT, nco,
+                            fb, fs, ef, af,
+                            DS4_ROPE_YARN_BETA_FAST,
+                            DS4_ROPE_YARN_BETA_SLOW,
+                            DS4_RMS_EPS);
+            if (ok && emit) g->layer_n_index_comp[il]++;
+
+            const uint32_t decode_top_k = DS4_N_INDEXER_TOP_K;
+            if (ok && (g->layer_n_comp[il] + (emit ? 1u : 0u)) > decode_top_k) {
+                /* Compute indexer query, RoPE, score, top-K. */
+                const uint64_t indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+                if (ok) ok = ds4_cuda_matmul_f16_tensor(
+                                g->indexer_q, model->map, model->size,
+                                L->indexer_attn_q_b->abs_offset,
+                                DS4_N_LORA_O, indexer_q_dim, g->qr_norm, 1u);
+                if (ok) ok = ds4_cuda_rope_tail_tensor(
+                                g->indexer_q, 1u,
+                                DS4_N_INDEXER_HEAD,
+                                DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT,
+                                pos, nco, false, fb, fs, ef, af,
+                                DS4_ROPE_YARN_BETA_FAST,
+                                DS4_ROPE_YARN_BETA_SLOW);
+                if (ok) ok = ds4_cuda_matmul_f16_tensor(
+                                g->indexer_weights, model->map, model->size,
+                                L->indexer_proj->abs_offset,
+                                DS4_N_EMBD, DS4_N_INDEXER_HEAD,
+                                g->attn_norm, 1u);
+                const float index_scale =
+                    1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
+                if (ok) ok = ds4_cuda_indexer_score_one_tensor(
+                                g->indexer_scores, g->indexer_q,
+                                g->indexer_weights,
+                                g->layer_index_comp_cache[il],
+                                g->layer_n_index_comp[il],
+                                DS4_N_INDEXER_HEAD,
+                                DS4_N_INDEXER_HEAD_DIM, index_scale);
+                if (ok) ok = ds4_cuda_indexer_topk_tensor(
+                                g->comp_selected, g->indexer_scores,
+                                g->layer_n_index_comp[il], 1u, decode_top_k);
+                if (ok) {
+                    comp_selected_used = true;
+                    n_selected = decode_top_k < g->layer_n_index_comp[il]
+                                 ? decode_top_k
+                                 : g->layer_n_index_comp[il];
+                }
+            }
+        }
+
+        /* Account the new attention compressor row last so the indexer
+         * scoring above sees the same n_comp that Metal sees: at emit, the
+         * new row has just been pooled+APE'd but the layer counter still
+         * points at it, so attention reads up through layer_n_comp[il]
+         * INCLUSIVE of comp_row.  We bump the counter after the indexer
+         * branch (above) used (n_comp + emit) for the >top_k threshold. */
+        if (ok && emit) g->layer_n_comp[il]++;
+    }
+
+    const uint32_t n_comp = cmp ? g->layer_n_comp[il] : 0u;
+
+    /* Attention dispatch.  Three modes:
+     *   - indexed mixed (ratio==4 with top_k applied): sparse over
+     *     comp_selected[0..n_selected) plus the SWA raw window
+     *   - mixed (ratio==128, or ratio==4 with n_comp <= top_k): dense
+     *     over all comp rows + raw window
+     *   - raw-only (uncompressed layers, or before any comp emit): only
+     *     the SWA raw window
+     */
+    if (ok) {
+        if (n_comp != 0u && comp_selected_used && n_selected != 0u) {
+            ok = ds4_cuda_attention_indexed_mixed_batch_heads_tensor(
+                    g->heads, model->map, model->size,
+                    L->attn_sinks->abs_offset, g->q,
+                    raw_cache,
+                    g->layer_attn_comp_cache[il],
+                    g->comp_selected,
+                    1u, pos, n_raw, raw_cap, raw_start,
+                    n_comp, n_selected,
+                    g->raw_window, ratio,
+                    DS4_N_HEAD, DS4_N_HEAD_DIM);
+        } else {
+            /* comp_kv_cur and comp_mask are passed even when n_comp=0
+             * because the kernel requires non-NULL pointers; their
+             * content is unread when n_comp=0. */
+            ok = ds4_cuda_attention_decode_heads_tensor(
+                    g->heads, model->map, model->size,
+                    L->attn_sinks->abs_offset, g->q,
+                    raw_cache,
+                    n_raw, raw_cap, raw_start,
+                    n_comp ? g->layer_attn_comp_cache[il] : g->comp_kv_cur,
+                    n_comp,
+                    g->comp_mask, 0u,
+                    DS4_N_HEAD, DS4_N_HEAD_DIM);
+        }
+    }
+    if (ok) ok = ds4_cuda_rope_tail_tensor(g->heads, 1u, DS4_N_HEAD,
+                                            DS4_N_HEAD_DIM, DS4_N_ROT,
+                                            pos, nco, true, fb, fs, ef, af,
+                                            DS4_ROPE_YARN_BETA_FAST,
+                                            DS4_ROPE_YARN_BETA_SLOW);
+    if (ok) ok = ds4_cuda_attention_output_q8_batch_tensor(
+                    g->attn_out, g->attn_low, g->attn_group_tmp, g->attn_low_tmp,
+                    model->map, model->size,
+                    L->attn_output_a->abs_offset, L->attn_output_b->abs_offset,
+                    4096u, 1024u, 8u, DS4_N_EMBD, g->heads, 1u);
+    if (ok) ok = ds4_cuda_hc_expand_tensor(g->after_attn_hc, g->attn_out, cur_hc,
+                                            g->hc_post, g->hc_comb,
+                                            DS4_N_EMBD, DS4_N_HC);
+    if (ok) ok = ds4_cuda_rms_norm_plain_tensor(g->ffn_flat, g->after_attn_hc,
+                                                 (uint32_t)hc_dim, DS4_RMS_EPS);
+    if (ok) ok = ds4_cuda_matmul_f16_tensor(g->ffn_mix, model->map, model->size,
+                                             L->hc_ffn_fn->abs_offset,
+                                             hc_dim, mix_dim, g->ffn_flat, 1u);
+    if (ok) ok = ds4_cuda_hc_split_weighted_sum_norm_tensor(
+                    g->ffn_cur, g->ffn_norm, g->ffn_split, g->ffn_mix,
+                    g->after_attn_hc, model->map, model->size,
+                    L->hc_ffn_scale->abs_offset, L->hc_ffn_base->abs_offset,
+                    L->ffn_norm->abs_offset, DS4_N_EMBD, DS4_N_HC,
+                    DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS);
+    if (ok) ok = ds4_cuda_matmul_f16_tensor(g->router_logits, model->map, model->size,
+                                             L->ffn_gate_inp->abs_offset,
+                                             DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1u);
+    if (ok) ok = ds4_cuda_router_select_tensor(
+                    g->router_selected, g->router_weights, g->router_probs,
+                    model->map, model->size,
+                    boff, hoff, hrows, (uint32_t)token,
+                    0u, 0u, hbias, hhash, g->router_logits);
+    if (ok) ok = ds4_cuda_routed_moe_one_tensor(
+                    g->routed_out, g->routed_gate, g->routed_up,
+                    g->routed_mid, g->routed_down,
+                    model->map, model->size,
+                    L->ffn_gate_exps->abs_offset, L->ffn_up_exps->abs_offset,
+                    L->ffn_down_exps->abs_offset,
+                    L->ffn_gate_exps->type, L->ffn_down_exps->type,
+                    gate_expert_b, gate_row_b, down_expert_b, down_row_b,
+                    (uint32_t)expert_in_dim_g, (uint32_t)down_in_dim_g,
+                    (uint32_t)routed_out_dim_g,
+                    g->router_selected, g->router_weights,
+                    DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm);
+    if (ok) ok = ds4_cuda_shared_gate_up_swiglu_q8_0_tensor(
+                    g->shared_gate, g->shared_up, g->shared_mid,
+                    model->map, model->size,
+                    L->ffn_gate_shexp->abs_offset, L->ffn_up_shexp->abs_offset,
+                    DS4_N_EMBD, shared_dim_g, g->ffn_norm);
+    if (ok) ok = ds4_cuda_shared_down_hc_expand_q8_0_tensor(
+                    after_ffn_hc, g->shared_out, model->map, model->size,
+                    L->ffn_down_shexp->abs_offset,
+                    shared_dim_g, DS4_N_EMBD,
+                    g->shared_mid, g->routed_out, g->after_attn_hc,
+                    g->ffn_split, DS4_N_EMBD, DS4_N_HC);
+    /* Phase 3b-11: end batch without syncing — the next layer's
+     * begin/launches queue onto the same stream behind this layer's
+     * GPU work; only the host-side cur/nxt pointer ping-pong runs
+     * before re-entering the loop, and that doesn't depend on GPU
+     * output.  This pipelines host-side kernel issuance with prior-
+     * layer GPU execution (was 43 host-blocking syncs/token). */
+    if (ok) ok = ds4_cuda_end_commands_async();
+    return ok ? true : false;
+}
+
 static bool cuda_graph_eval_token_raw_swa(
         ds4_cuda_graph    *g,
         const ds4_model   *model,
@@ -14297,15 +14656,6 @@ static bool cuda_graph_eval_token_raw_swa(
         uint32_t           pos,
         float             *logits_out) {
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
-    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
-    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
-    const uint64_t mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
-    const uint64_t expert_in_dim_g  = weights->layer[0].ffn_gate_exps->dim[0];
-    const uint64_t expert_mid_dim_g = weights->layer[0].ffn_gate_exps->dim[1];
-    const uint64_t down_in_dim_g    = weights->layer[0].ffn_down_exps->dim[0];
-    const uint64_t routed_out_dim_g = weights->layer[0].ffn_down_exps->dim[1];
-    const uint64_t shared_dim_g     = weights->layer[0].ffn_gate_shexp->dim[1];
-    (void)expert_mid_dim_g;
 
     /* SWA window math.  raw_row is the ring slot for the new KV; n_raw is the
      * visible window size (capped at raw_window); raw_start is the ring
@@ -14335,320 +14685,12 @@ static bool cuda_graph_eval_token_raw_swa(
     ds4_cuda_tensor *nxt = g->next_hc;
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const ds4_layer_weights *L = &weights->layer[il];
-        const float fb  = layer_rope_freq_base(il);
-        const float fs  = layer_rope_freq_scale(il);
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
-        const bool  cmp = ratio != 0;
-        const uint32_t coff = ratio == 4 ? 2u : 1u;
-        const float ef  = cmp && DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
-        float       af  = 1.0f;
-        if (ef != 0.0f && fs > 0.0f) af /= 1.0f + 0.1f * logf(1.0f / fs);
-        const uint32_t nco = (uint32_t)(cmp ? DS4_ROPE_ORIG_CTX : 0);
-        const uint64_t gate_row_b    = routed_expert_row_bytes(L->ffn_gate_exps);
-        const uint64_t gate_expert_b = expert_mid_dim_g * gate_row_b;
-        const uint64_t down_row_b    = routed_expert_row_bytes(L->ffn_down_exps);
-        const uint64_t down_expert_b = routed_out_dim_g * down_row_b;
-        const bool     hbias = L->ffn_exp_probs_b != NULL;
-        const bool     hhash = L->ffn_gate_tid2eid != NULL;
-        const uint64_t boff  = hbias ? L->ffn_exp_probs_b->abs_offset : 0;
-        const uint64_t hoff  = hhash ? L->ffn_gate_tid2eid->abs_offset : 0;
-        const uint32_t hrows = hhash ? (uint32_t)L->ffn_gate_tid2eid->dim[1] : 0;
-        /* Compressor emit fires at the END of every ratio-aligned span.
-         * Metal's metal_graph_encode_decode_layer at ds4.c:9348 uses the same
-         * predicate. */
-        const bool emit = cmp && (((pos + 1u) % ratio) == 0u);
-
-        ok = ds4_cuda_begin_commands();
-        if (ok) ok = ds4_cuda_rms_norm_plain_tensor(g->flat_hc, cur,
-                                                     (uint32_t)hc_dim, DS4_RMS_EPS);
-        if (ok) ok = ds4_cuda_matmul_f16_tensor(g->hc_mix, model->map, model->size,
-                                                 L->hc_attn_fn->abs_offset,
-                                                 hc_dim, mix_dim, g->flat_hc, 1u);
-        if (ok) ok = ds4_cuda_hc_split_weighted_sum_norm_tensor(
-                        g->attn_cur, g->attn_norm, g->hc_split, g->hc_mix, cur,
-                        model->map, model->size,
-                        L->hc_attn_scale->abs_offset, L->hc_attn_base->abs_offset,
-                        L->attn_norm->abs_offset, DS4_N_EMBD, DS4_N_HC,
-                        DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS);
-        if (ok) ok = ds4_cuda_matmul_q8_0_tensor(g->qr, model->map, model->size,
-                                                  L->attn_q_a->abs_offset,
-                                                  DS4_N_EMBD, DS4_N_LORA_O, g->attn_norm, 1u);
-        if (ok) ok = ds4_cuda_rms_norm_weight_tensor(g->qr_norm, g->qr,
-                                                     model->map, model->size,
-                                                     L->attn_q_a_norm->abs_offset,
-                                                     DS4_N_LORA_O, DS4_RMS_EPS);
-        if (ok) ok = ds4_cuda_matmul_q8_0_tensor(g->q, model->map, model->size,
-                                                  L->attn_q_b->abs_offset,
-                                                  DS4_N_LORA_O, q_dim, g->qr_norm, 1u);
-        if (ok) ok = ds4_cuda_head_rms_norm_tensor(g->q, 1u, DS4_N_HEAD,
-                                                    DS4_N_HEAD_DIM, DS4_RMS_EPS);
-        if (ok) ok = ds4_cuda_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
-                                                  L->attn_kv->abs_offset,
-                                                  DS4_N_EMBD, kv_dim, g->attn_norm, 1u);
-        if (ok) ok = ds4_cuda_rms_norm_weight_tensor(g->kv, g->kv_raw,
-                                                     model->map, model->size,
-                                                     L->attn_kv_a_norm->abs_offset,
-                                                     (uint32_t)kv_dim, DS4_RMS_EPS);
-        /* Phase 3b-12: paired q+kv rope_tail (algo lever A8) — back-to-back
-         * launches with identical params except buffer/n_head folded into a
-         * single kernel launch.  Math bit-identical. */
-        if (ok) ok = ds4_cuda_rope_tail_pair_tensor(
-                        g->q, g->kv, 1u,
-                        DS4_N_HEAD, DS4_N_HEAD_KV,
-                        DS4_N_HEAD_DIM, DS4_N_ROT,
-                        pos, nco, false, fb, fs, ef, af,
-                        DS4_ROPE_YARN_BETA_FAST,
-                        DS4_ROPE_YARN_BETA_SLOW);
-        /* fp8_kv_store_raw modifies kv's NOPE prefix in-place to its FP8
-         * round-trip and writes the F16-rounded full row to layer_raw_cache. */
-        if (ok) ok = ds4_cuda_kv_fp8_store_raw_tensor(g->kv, g->layer_raw_cache[il],
-                                                       g->raw_cap, raw_row,
-                                                       DS4_N_HEAD_DIM, DS4_N_ROT);
-
-        /* Compressor block — only for ratio!=0 layers.  Mirrors Metal at
-         * ds4.c:9344-9586.  attn_compressor projects attn_norm -> comp_kv_cur
-         * + comp_sc_cur (paired F16 matmuls), then compressor_update_tensor
-         * pools/quantizes/optionally emits a new compressed-cache row.  Each
-         * call may be a no-op-emit (state-only update) depending on pos. */
-        bool comp_selected_used = false;
-        uint32_t n_selected = 0;
-        if (ok && cmp) {
-            const uint32_t comp_width = coff * DS4_N_HEAD_DIM;
-            const uint32_t comp_row = g->layer_n_comp[il];
-            if (emit && comp_row >= g->comp_cap) {
-                fprintf(stderr,
-                        "ds4: cuda graph compressed KV cache capacity exceeded at layer %u (cap=%u)\n",
-                        il, g->comp_cap);
-                ok = false;
-            }
-            if (ok) ok = ds4_cuda_matmul_f16_pair_tensor(
-                            g->comp_kv_cur, g->comp_sc_cur,
-                            model->map, model->size,
-                            L->attn_compressor_kv->abs_offset,
-                            L->attn_compressor_gate->abs_offset,
-                            DS4_N_EMBD, comp_width, g->attn_norm, 1u);
-            if (ok) ok = ds4_cuda_compressor_update_tensor(
-                            g->comp_kv_cur, g->comp_sc_cur,
-                            g->layer_attn_state_kv[il],
-                            g->layer_attn_state_score[il],
-                            g->layer_attn_comp_cache[il],
-                            model->map, model->size,
-                            L->attn_compressor_ape->abs_offset,
-                            (uint32_t)L->attn_compressor_ape->type,
-                            L->attn_compressor_norm->abs_offset,
-                            (uint32_t)L->attn_compressor_norm->type,
-                            DS4_N_HEAD_DIM, ratio, pos, comp_row,
-                            DS4_N_ROT, nco,
-                            fb, fs, ef, af,
-                            DS4_ROPE_YARN_BETA_FAST,
-                            DS4_ROPE_YARN_BETA_SLOW,
-                            DS4_RMS_EPS);
-            if (ok && emit) {
-                /* The just-emitted comp_cache row holds raw F32 values; FP8-
-                 * round-trip its NOPE prefix in place to match the post-decode
-                 * cache row format the attention kernel expects. */
-                ds4_cuda_tensor *row_view = ds4_cuda_tensor_view(
-                    g->layer_attn_comp_cache[il],
-                    (uint64_t)comp_row * DS4_N_HEAD_DIM * sizeof(float),
-                    (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
-                if (!row_view) { ok = false; }
-                else {
-                    ok = ds4_cuda_dsv4_fp8_kv_quantize_tensor(
-                            row_view, 1u, DS4_N_HEAD_DIM, DS4_N_ROT);
-                    ds4_cuda_tensor_free(row_view);
-                }
-            }
-
-            /* Indexer (ratio==4 only): another paired compressor + state
-             * advance, then — when the attention compressed-cache has more
-             * rows than top_k — compute indexer Q/scores/topk so the sparse
-             * indexed attention kernel can pick which compressed rows to
-             * read.  Mirrors Metal at ds4.c:9427-9582. */
-            if (ok && ratio == 4u) {
-                const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
-                const uint32_t index_row = g->layer_n_index_comp[il];
-                if (emit && index_row >= g->comp_cap) {
-                    fprintf(stderr,
-                            "ds4: cuda graph indexer compressed KV cache capacity exceeded at layer %u (cap=%u)\n",
-                            il, g->comp_cap);
-                    ok = false;
-                }
-                if (ok) ok = ds4_cuda_matmul_f16_pair_tensor(
-                                g->comp_kv_cur, g->comp_sc_cur,
-                                model->map, model->size,
-                                L->indexer_compressor_kv->abs_offset,
-                                L->indexer_compressor_gate->abs_offset,
-                                DS4_N_EMBD, index_width, g->attn_norm, 1u);
-                if (ok) ok = ds4_cuda_compressor_update_tensor(
-                                g->comp_kv_cur, g->comp_sc_cur,
-                                g->layer_index_state_kv[il],
-                                g->layer_index_state_score[il],
-                                g->layer_index_comp_cache[il],
-                                model->map, model->size,
-                                L->indexer_compressor_ape->abs_offset,
-                                (uint32_t)L->indexer_compressor_ape->type,
-                                L->indexer_compressor_norm->abs_offset,
-                                (uint32_t)L->indexer_compressor_norm->type,
-                                DS4_N_INDEXER_HEAD_DIM, ratio, pos, index_row,
-                                DS4_N_ROT, nco,
-                                fb, fs, ef, af,
-                                DS4_ROPE_YARN_BETA_FAST,
-                                DS4_ROPE_YARN_BETA_SLOW,
-                                DS4_RMS_EPS);
-                if (ok && emit) g->layer_n_index_comp[il]++;
-
-                const uint32_t decode_top_k = DS4_N_INDEXER_TOP_K;
-                if (ok && (g->layer_n_comp[il] + (emit ? 1u : 0u)) > decode_top_k) {
-                    /* Compute indexer query, RoPE, score, top-K. */
-                    const uint64_t indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
-                    if (ok) ok = ds4_cuda_matmul_f16_tensor(
-                                    g->indexer_q, model->map, model->size,
-                                    L->indexer_attn_q_b->abs_offset,
-                                    DS4_N_LORA_O, indexer_q_dim, g->qr_norm, 1u);
-                    if (ok) ok = ds4_cuda_rope_tail_tensor(
-                                    g->indexer_q, 1u,
-                                    DS4_N_INDEXER_HEAD,
-                                    DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT,
-                                    pos, nco, false, fb, fs, ef, af,
-                                    DS4_ROPE_YARN_BETA_FAST,
-                                    DS4_ROPE_YARN_BETA_SLOW);
-                    if (ok) ok = ds4_cuda_matmul_f16_tensor(
-                                    g->indexer_weights, model->map, model->size,
-                                    L->indexer_proj->abs_offset,
-                                    DS4_N_EMBD, DS4_N_INDEXER_HEAD,
-                                    g->attn_norm, 1u);
-                    const float index_scale =
-                        1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
-                    if (ok) ok = ds4_cuda_indexer_score_one_tensor(
-                                    g->indexer_scores, g->indexer_q,
-                                    g->indexer_weights,
-                                    g->layer_index_comp_cache[il],
-                                    g->layer_n_index_comp[il],
-                                    DS4_N_INDEXER_HEAD,
-                                    DS4_N_INDEXER_HEAD_DIM, index_scale);
-                    if (ok) ok = ds4_cuda_indexer_topk_tensor(
-                                    g->comp_selected, g->indexer_scores,
-                                    g->layer_n_index_comp[il], 1u, decode_top_k);
-                    if (ok) {
-                        comp_selected_used = true;
-                        n_selected = decode_top_k < g->layer_n_index_comp[il]
-                                     ? decode_top_k
-                                     : g->layer_n_index_comp[il];
-                    }
-                }
-            }
-
-            /* Account the new attention compressor row last so the indexer
-             * scoring above sees the same n_comp that Metal sees: at emit, the
-             * new row has just been pooled+APE'd but the layer counter still
-             * points at it, so attention reads up through layer_n_comp[il]
-             * INCLUSIVE of comp_row.  We bump the counter after the indexer
-             * branch (above) used (n_comp + emit) for the >top_k threshold. */
-            if (ok && emit) g->layer_n_comp[il]++;
+        if (!cuda_graph_encode_one_layer(g, model, &weights->layer[il], il, pos,
+                                         g->layer_raw_cache[il], g->raw_cap,
+                                         raw_row, n_raw, raw_start,
+                                         (int)token, cur, nxt)) {
+            return false;
         }
-
-        const uint32_t n_comp = cmp ? g->layer_n_comp[il] : 0u;
-
-        /* Attention dispatch.  Three modes:
-         *   - indexed mixed (ratio==4 with top_k applied): sparse over
-         *     comp_selected[0..n_selected) plus the SWA raw window
-         *   - mixed (ratio==128, or ratio==4 with n_comp <= top_k): dense
-         *     over all comp rows + raw window
-         *   - raw-only (uncompressed layers, or before any comp emit): only
-         *     the SWA raw window
-         */
-        if (ok) {
-            if (n_comp != 0u && comp_selected_used && n_selected != 0u) {
-                ok = ds4_cuda_attention_indexed_mixed_batch_heads_tensor(
-                        g->heads, model->map, model->size,
-                        L->attn_sinks->abs_offset, g->q,
-                        g->layer_raw_cache[il],
-                        g->layer_attn_comp_cache[il],
-                        g->comp_selected,
-                        1u, pos, n_raw, g->raw_cap, raw_start,
-                        n_comp, n_selected,
-                        g->raw_window, ratio,
-                        DS4_N_HEAD, DS4_N_HEAD_DIM);
-            } else {
-                /* comp_kv_cur and comp_mask are passed even when n_comp=0
-                 * because the kernel requires non-NULL pointers; their
-                 * content is unread when n_comp=0. */
-                ok = ds4_cuda_attention_decode_heads_tensor(
-                        g->heads, model->map, model->size,
-                        L->attn_sinks->abs_offset, g->q,
-                        g->layer_raw_cache[il],
-                        n_raw, g->raw_cap, raw_start,
-                        n_comp ? g->layer_attn_comp_cache[il] : g->comp_kv_cur,
-                        n_comp,
-                        g->comp_mask, 0u,
-                        DS4_N_HEAD, DS4_N_HEAD_DIM);
-            }
-        }
-        if (ok) ok = ds4_cuda_rope_tail_tensor(g->heads, 1u, DS4_N_HEAD,
-                                                DS4_N_HEAD_DIM, DS4_N_ROT,
-                                                pos, nco, true, fb, fs, ef, af,
-                                                DS4_ROPE_YARN_BETA_FAST,
-                                                DS4_ROPE_YARN_BETA_SLOW);
-        if (ok) ok = ds4_cuda_attention_output_q8_batch_tensor(
-                        g->attn_out, g->attn_low, g->attn_group_tmp, g->attn_low_tmp,
-                        model->map, model->size,
-                        L->attn_output_a->abs_offset, L->attn_output_b->abs_offset,
-                        4096u, 1024u, 8u, DS4_N_EMBD, g->heads, 1u);
-        if (ok) ok = ds4_cuda_hc_expand_tensor(g->after_attn_hc, g->attn_out, cur,
-                                                g->hc_post, g->hc_comb,
-                                                DS4_N_EMBD, DS4_N_HC);
-        if (ok) ok = ds4_cuda_rms_norm_plain_tensor(g->ffn_flat, g->after_attn_hc,
-                                                     (uint32_t)hc_dim, DS4_RMS_EPS);
-        if (ok) ok = ds4_cuda_matmul_f16_tensor(g->ffn_mix, model->map, model->size,
-                                                 L->hc_ffn_fn->abs_offset,
-                                                 hc_dim, mix_dim, g->ffn_flat, 1u);
-        if (ok) ok = ds4_cuda_hc_split_weighted_sum_norm_tensor(
-                        g->ffn_cur, g->ffn_norm, g->ffn_split, g->ffn_mix,
-                        g->after_attn_hc, model->map, model->size,
-                        L->hc_ffn_scale->abs_offset, L->hc_ffn_base->abs_offset,
-                        L->ffn_norm->abs_offset, DS4_N_EMBD, DS4_N_HC,
-                        DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS);
-        if (ok) ok = ds4_cuda_matmul_f16_tensor(g->router_logits, model->map, model->size,
-                                                 L->ffn_gate_inp->abs_offset,
-                                                 DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1u);
-        if (ok) ok = ds4_cuda_router_select_tensor(
-                        g->router_selected, g->router_weights, g->router_probs,
-                        model->map, model->size,
-                        boff, hoff, hrows, token,
-                        0u, 0u, hbias, hhash, g->router_logits);
-        if (ok) ok = ds4_cuda_routed_moe_one_tensor(
-                        g->routed_out, g->routed_gate, g->routed_up,
-                        g->routed_mid, g->routed_down,
-                        model->map, model->size,
-                        L->ffn_gate_exps->abs_offset, L->ffn_up_exps->abs_offset,
-                        L->ffn_down_exps->abs_offset,
-                        L->ffn_gate_exps->type, L->ffn_down_exps->type,
-                        gate_expert_b, gate_row_b, down_expert_b, down_row_b,
-                        (uint32_t)expert_in_dim_g, (uint32_t)down_in_dim_g,
-                        (uint32_t)routed_out_dim_g,
-                        g->router_selected, g->router_weights,
-                        DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm);
-        if (ok) ok = ds4_cuda_shared_gate_up_swiglu_q8_0_tensor(
-                        g->shared_gate, g->shared_up, g->shared_mid,
-                        model->map, model->size,
-                        L->ffn_gate_shexp->abs_offset, L->ffn_up_shexp->abs_offset,
-                        DS4_N_EMBD, shared_dim_g, g->ffn_norm);
-        if (ok) ok = ds4_cuda_shared_down_hc_expand_q8_0_tensor(
-                        nxt, g->shared_out, model->map, model->size,
-                        L->ffn_down_shexp->abs_offset,
-                        shared_dim_g, DS4_N_EMBD,
-                        g->shared_mid, g->routed_out, g->after_attn_hc,
-                        g->ffn_split, DS4_N_EMBD, DS4_N_HC);
-        /* Phase 3b-11: end batch without syncing — the next layer's
-         * begin/launches queue onto the same stream behind this layer's
-         * GPU work; only the host-side cur/nxt pointer ping-pong runs
-         * before re-entering the loop, and that doesn't depend on GPU
-         * output.  This pipelines host-side kernel issuance with prior-
-         * layer GPU execution (was 43 host-blocking syncs/token). */
-        if (ok) ok = ds4_cuda_end_commands_async();
-        if (!ok) return false;
-
         ds4_cuda_tensor *tmp = cur; cur = nxt; nxt = tmp;
     }
 
