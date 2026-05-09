@@ -1043,6 +1043,130 @@ static __global__ void ds4_cuda_dense_f32_matvec_kernel(
     out[(uint64_t)tok * out_dim + row] = acc;
 }
 
+/* Phase 3b-7 retile companion to ds4_cuda_dense_f16_matvec_kernel.
+ *
+ * F16 matvec is structurally different from Q8 (float dot, not int + FP
+ * scale), so naive warp tree-reduction would re-introduce the FMA-chain
+ * ordering parity wall we hit at 4 ULP on 3b-1 option 1.  This helper goes
+ * "Option A" — match the existing 8-lane unroll order BIT-EXACTLY by
+ * activating only 8 of the 32 warp lanes, each accumulating one of the
+ * original kernel's 8 named partials (acc0[0..3] / acc1[0..3]):
+ *
+ *   lane k (k < 4): acc0[k] = sum over j: w[8j+k] * x[8j+k]
+ *   lane k (k 4..7): acc1[k-4] = sum over j: w[8j+k] * x[8j+k]
+ *
+ * Lanes 8..31 don't accumulate (idle work) but remain in the warp for
+ * `__shfl_sync` participation.  Lane 0 then runs the same final reduction
+ * the original used — `(a0_0 + a1_0) + (a0_1 + a1_1)` then `+= (a0_2 +
+ * a1_2) + (a0_3 + a1_3)` — bit-exact under `--use_fast_math`.  The
+ * non-multiple-of-8 tail is added by lane 0 in the same linear order as
+ * the original `for (; i < in_dim; i++) acc += w*x;`.
+ *
+ * Within-row parallelism: 8x (vs 1x serial); warp utilisation: 25%.  The
+ * accuracy preservation is the priority — `prod_matmul_f16_pair` is
+ * tol=0 strict bit-exact in tolerances.md, so a less-bit-exact 32-lane
+ * scheme would have failed that bar.
+ *
+ * Caller must invoke from a full warp. */
+static __device__ __forceinline__ float ds4_cuda_warp_dense_f16_dot_f32(
+        const uint16_t *w_row,
+        const float    *x_row,
+        uint32_t        in_dim,
+        uint32_t        lane) {
+    const uint32_t n_full = in_dim / 8u;
+
+    float partial = 0.0f;
+    if (lane < 8u) {
+        for (uint32_t j = 0; j < n_full; j++) {
+            const uint32_t idx = j * 8u + lane;
+            partial += ds4_cuda_f16_to_f32(w_row[idx]) * x_row[idx];
+        }
+    }
+
+    const uint32_t mask = 0xffffffffu;
+    const float p0 = __shfl_sync(mask, partial, 0);
+    const float p1 = __shfl_sync(mask, partial, 1);
+    const float p2 = __shfl_sync(mask, partial, 2);
+    const float p3 = __shfl_sync(mask, partial, 3);
+    const float p4 = __shfl_sync(mask, partial, 4);
+    const float p5 = __shfl_sync(mask, partial, 5);
+    const float p6 = __shfl_sync(mask, partial, 6);
+    const float p7 = __shfl_sync(mask, partial, 7);
+
+    /* Reproduce the original kernel's reduction parenthesisation exactly:
+     *   acc = (a0_0 + a1_0) + (a0_1 + a1_1);
+     *   acc += (a0_2 + a1_2) + (a0_3 + a1_3); */
+    float acc = (p0 + p4) + (p1 + p5);
+    acc += (p2 + p6) + (p3 + p7);
+
+    /* Linear tail (in_dim % 8 != 0); same FMA chain as the original. */
+    for (uint32_t i = n_full * 8u; i < in_dim; i++) {
+        acc += ds4_cuda_f16_to_f32(w_row[i]) * x_row[i];
+    }
+    return acc;
+}
+
+/* Pair variant: same 8-lane bit-exact pattern, two outputs.  Each lane
+ * carries TWO partials (a_partial for the weights0 dot, b_partial for
+ * weights1) and the activation is read once per element.  Final reduction
+ * runs both s0/s1 in lock-step on every lane, mirroring the original
+ * kernel's two parallel `s0 = ...; s1 = ...` chains.  Tail added by every
+ * lane in lock-step (same linear order). */
+static __device__ __forceinline__ void ds4_cuda_warp_dense_f16_pair_dot_f32(
+        const uint16_t *w0_row,
+        const uint16_t *w1_row,
+        const float    *x_row,
+        uint32_t        in_dim,
+        uint32_t        lane,
+        float          *out_s0,
+        float          *out_s1) {
+    const uint32_t n_full = in_dim / 8u;
+
+    float a_partial = 0.0f;
+    float b_partial = 0.0f;
+    if (lane < 8u) {
+        for (uint32_t j = 0; j < n_full; j++) {
+            const uint32_t idx = j * 8u + lane;
+            const float xv = x_row[idx];
+            a_partial += ds4_cuda_f16_to_f32(w0_row[idx]) * xv;
+            b_partial += ds4_cuda_f16_to_f32(w1_row[idx]) * xv;
+        }
+    }
+
+    const uint32_t mask = 0xffffffffu;
+    const float pa0 = __shfl_sync(mask, a_partial, 0);
+    const float pa1 = __shfl_sync(mask, a_partial, 1);
+    const float pa2 = __shfl_sync(mask, a_partial, 2);
+    const float pa3 = __shfl_sync(mask, a_partial, 3);
+    const float pa4 = __shfl_sync(mask, a_partial, 4);
+    const float pa5 = __shfl_sync(mask, a_partial, 5);
+    const float pa6 = __shfl_sync(mask, a_partial, 6);
+    const float pa7 = __shfl_sync(mask, a_partial, 7);
+    const float pb0 = __shfl_sync(mask, b_partial, 0);
+    const float pb1 = __shfl_sync(mask, b_partial, 1);
+    const float pb2 = __shfl_sync(mask, b_partial, 2);
+    const float pb3 = __shfl_sync(mask, b_partial, 3);
+    const float pb4 = __shfl_sync(mask, b_partial, 4);
+    const float pb5 = __shfl_sync(mask, b_partial, 5);
+    const float pb6 = __shfl_sync(mask, b_partial, 6);
+    const float pb7 = __shfl_sync(mask, b_partial, 7);
+
+    float s0 = (pa0 + pa4) + (pa1 + pa5);
+    s0 += (pa2 + pa6) + (pa3 + pa7);
+    float s1 = (pb0 + pb4) + (pb1 + pb5);
+    s1 += (pb2 + pb6) + (pb3 + pb7);
+
+    for (uint32_t i = n_full * 8u; i < in_dim; i++) {
+        const float xv = x_row[i];
+        s0 += ds4_cuda_f16_to_f32(w0_row[i]) * xv;
+        s1 += ds4_cuda_f16_to_f32(w1_row[i]) * xv;
+    }
+
+    *out_s0 = s0;
+    *out_s1 = s1;
+}
+
+template<uint32_t ROWS_PER_BLOCK>
 static __global__ void ds4_cuda_dense_f16_pair_matvec_kernel(
         const uint16_t *weights0,
         const uint16_t *weights1,
@@ -1052,45 +1176,21 @@ static __global__ void ds4_cuda_dense_f16_pair_matvec_kernel(
         uint32_t        in_dim,
         uint32_t        out_dim,
         uint32_t        n_tok) {
-    const uint32_t row = blockIdx.x;
+    const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
     const uint32_t tok = blockIdx.y;
-    if (row >= out_dim || tok >= n_tok || threadIdx.x != 0) return;
+    if (row >= out_dim || tok >= n_tok) return;
+    const uint32_t lane = threadIdx.x;
     const uint16_t *w0 = weights0 + (uint64_t)row * in_dim;
     const uint16_t *w1 = weights1 + (uint64_t)row * in_dim;
-    const float *xrow = x + (uint64_t)tok * in_dim;
-    float a0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float a1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float b0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float b1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    uint32_t i = 0;
-    for (; i + 8u <= in_dim; i += 8u) {
-        a0[0] += ds4_cuda_f16_to_f32(w0[i + 0]) * xrow[i + 0];
-        a0[1] += ds4_cuda_f16_to_f32(w0[i + 1]) * xrow[i + 1];
-        a0[2] += ds4_cuda_f16_to_f32(w0[i + 2]) * xrow[i + 2];
-        a0[3] += ds4_cuda_f16_to_f32(w0[i + 3]) * xrow[i + 3];
-        a1[0] += ds4_cuda_f16_to_f32(w0[i + 4]) * xrow[i + 4];
-        a1[1] += ds4_cuda_f16_to_f32(w0[i + 5]) * xrow[i + 5];
-        a1[2] += ds4_cuda_f16_to_f32(w0[i + 6]) * xrow[i + 6];
-        a1[3] += ds4_cuda_f16_to_f32(w0[i + 7]) * xrow[i + 7];
-        b0[0] += ds4_cuda_f16_to_f32(w1[i + 0]) * xrow[i + 0];
-        b0[1] += ds4_cuda_f16_to_f32(w1[i + 1]) * xrow[i + 1];
-        b0[2] += ds4_cuda_f16_to_f32(w1[i + 2]) * xrow[i + 2];
-        b0[3] += ds4_cuda_f16_to_f32(w1[i + 3]) * xrow[i + 3];
-        b1[0] += ds4_cuda_f16_to_f32(w1[i + 4]) * xrow[i + 4];
-        b1[1] += ds4_cuda_f16_to_f32(w1[i + 5]) * xrow[i + 5];
-        b1[2] += ds4_cuda_f16_to_f32(w1[i + 6]) * xrow[i + 6];
-        b1[3] += ds4_cuda_f16_to_f32(w1[i + 7]) * xrow[i + 7];
+    const float    *xrow = x      + (uint64_t)tok * in_dim;
+
+    float s0 = 0.0f, s1 = 0.0f;
+    ds4_cuda_warp_dense_f16_pair_dot_f32(w0, w1, xrow, in_dim, lane, &s0, &s1);
+
+    if (lane == 0u) {
+        out0[(uint64_t)tok * out_dim + row] = s0;
+        out1[(uint64_t)tok * out_dim + row] = s1;
     }
-    float s0 = (a0[0] + a1[0]) + (a0[1] + a1[1]);
-    s0 += (a0[2] + a1[2]) + (a0[3] + a1[3]);
-    float s1 = (b0[0] + b1[0]) + (b0[1] + b1[1]);
-    s1 += (b0[2] + b1[2]) + (b0[3] + b1[3]);
-    for (; i < in_dim; i++) {
-        s0 += ds4_cuda_f16_to_f32(w0[i]) * xrow[i];
-        s1 += ds4_cuda_f16_to_f32(w1[i]) * xrow[i];
-    }
-    out0[(uint64_t)tok * out_dim + row] = s0;
-    out1[(uint64_t)tok * out_dim + row] = s1;
 }
 
 template<uint32_t ROWS_PER_BLOCK>
@@ -1124,32 +1224,19 @@ static __global__ void ds4_cuda_shared_gate_up_swiglu_q8_0_kernel(
     }
 }
 
+template<uint32_t ROWS_PER_BLOCK>
 static __global__ void ds4_cuda_dense_f16_matvec_kernel(
         const uint16_t *weights,
         const float    *x,
         float          *out,
         uint32_t        in_dim,
         uint32_t        out_dim) {
-    const uint32_t row = blockIdx.x;
-    if (row >= out_dim || threadIdx.x != 0) return;
+    const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
+    if (row >= out_dim) return;
+    const uint32_t lane = threadIdx.x;
     const uint16_t *wrow = weights + (uint64_t)row * in_dim;
-    float acc0[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    float acc1[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    uint32_t i = 0;
-    for (; i + 8u <= in_dim; i += 8u) {
-        acc0[0] += ds4_cuda_f16_to_f32(wrow[i + 0]) * x[i + 0];
-        acc0[1] += ds4_cuda_f16_to_f32(wrow[i + 1]) * x[i + 1];
-        acc0[2] += ds4_cuda_f16_to_f32(wrow[i + 2]) * x[i + 2];
-        acc0[3] += ds4_cuda_f16_to_f32(wrow[i + 3]) * x[i + 3];
-        acc1[0] += ds4_cuda_f16_to_f32(wrow[i + 4]) * x[i + 4];
-        acc1[1] += ds4_cuda_f16_to_f32(wrow[i + 5]) * x[i + 5];
-        acc1[2] += ds4_cuda_f16_to_f32(wrow[i + 6]) * x[i + 6];
-        acc1[3] += ds4_cuda_f16_to_f32(wrow[i + 7]) * x[i + 7];
-    }
-    float acc = (acc0[0] + acc1[0]) + (acc0[1] + acc1[1]);
-    acc += (acc0[2] + acc1[2]) + (acc0[3] + acc1[3]);
-    for (; i < in_dim; i++) acc += ds4_cuda_f16_to_f32(wrow[i]) * x[i];
-    out[row] = acc;
+    const float acc = ds4_cuda_warp_dense_f16_dot_f32(wrow, x, in_dim, lane);
+    if (lane == 0u) out[row] = acc;
 }
 
 static __global__ void ds4_cuda_dense_q2_k_matvec_kernel(
@@ -1911,7 +1998,12 @@ int ds4_cuda_test_dense_f16_matvec_tensor(
         return 0;
     }
 
-    ds4_cuda_dense_f16_matvec_kernel<<<out_dim, 1, 0, g_stream>>>(
+    constexpr uint32_t ROWS_PER_BLOCK = 4u;
+    const uint32_t row_blocks = (out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
+    ds4_cuda_dense_f16_matvec_kernel<ROWS_PER_BLOCK><<<
+            dim3(row_blocks, 1, 1),
+            dim3(32u, ROWS_PER_BLOCK, 1),
+            0, g_stream>>>(
         (const uint16_t *)w_ptr, (const float *)x_ptr, (float *)out_ptr, in_dim, out_dim);
     return ds4_cuda_check(cudaGetLastError(), "launch dense f16 matvec");
 }
@@ -2172,8 +2264,13 @@ int ds4_cuda_matmul_f16_tensor(
     }
 
     const uint16_t *weights = (const uint16_t *)((const uint8_t *)model_map + weight_offset);
+    constexpr uint32_t ROWS_PER_BLOCK = 4u;
+    const uint32_t row_blocks = ((uint32_t)out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
     for (uint32_t t = 0; t < (uint32_t)n_tok; t++) {
-        ds4_cuda_dense_f16_matvec_kernel<<<(uint32_t)out_dim, 1, 0, g_stream>>>(
+        ds4_cuda_dense_f16_matvec_kernel<ROWS_PER_BLOCK><<<
+                dim3(row_blocks, 1, 1),
+                dim3(32u, ROWS_PER_BLOCK, 1),
+                0, g_stream>>>(
             weights,
             (const float *)x_ptr + (uint64_t)t * in_dim,
             (float *)out_ptr + (uint64_t)t * out_dim,
@@ -2216,7 +2313,12 @@ int ds4_cuda_matmul_f16_pair_tensor(
     }
     const uint16_t *weights_a = (const uint16_t *)((const uint8_t *)model_map + weight_a_offset);
     const uint16_t *weights_b = (const uint16_t *)((const uint8_t *)model_map + weight_b_offset);
-    ds4_cuda_dense_f16_pair_matvec_kernel<<<dim3((uint32_t)out_dim, (uint32_t)n_tok, 1), 1, 0, g_stream>>>(
+    constexpr uint32_t ROWS_PER_BLOCK = 4u;
+    const uint32_t row_blocks = ((uint32_t)out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
+    ds4_cuda_dense_f16_pair_matvec_kernel<ROWS_PER_BLOCK><<<
+            dim3(row_blocks, (uint32_t)n_tok, 1),
+            dim3(32u, ROWS_PER_BLOCK, 1),
+            0, g_stream>>>(
         weights_a, weights_b, (const float *)x_ptr,
         (float *)out_a_ptr, (float *)out_b_ptr,
         (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
