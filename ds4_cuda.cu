@@ -2579,7 +2579,9 @@ int ds4_cuda_test_dense_iq2_xxs_pair_matvec_tensor(
 
 /* ds4_cuda_embed_token_hc_tensor implemented in the Phase 1.5 section at the
  * bottom of this file. */
-DS4_CUDA_STUB(ds4_cuda_embed_tokens_hc_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t))
+/* ds4_cuda_embed_tokens_hc_tensor implemented in the Phase 1.5 section
+ * alongside the single-token embed_token_hc_tensor (Phase 7 batched
+ * prefill). */
 /* ds4_cuda_indexer_score_one_tensor / _topk_tensor / dsv4_topk_mask_tensor
  * are implemented in the m5a dsv4_misc section.
  * ds4_cuda_indexer_scores_prefill_tensor and _decode_batch_tensor are
@@ -2894,7 +2896,8 @@ int ds4_cuda_rms_norm_plain_rows_tensor(
  * ds4_cuda_rope_tail_tensor is implemented in the m4 section. */
 /* ds4_cuda_store_raw_kv_tensor implemented in the Phase 1.5 section at the
  * bottom of this file. */
-DS4_CUDA_STUB(ds4_cuda_store_raw_kv_batch_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t, uint32_t))
+/* ds4_cuda_store_raw_kv_batch_tensor implemented in the Phase 1.5 section
+ * alongside the single-token store_raw_kv_tensor (Phase 7 batched prefill). */
 
 /* ds4_cuda_compressor_update_tensor implemented in the Phase 3a
  * compressor section at the bottom of this file. */
@@ -5825,6 +5828,56 @@ static __global__ void ds4_cuda_store_raw_kv_kernel(
     raw_cache[(uint64_t)slot * head_dim + i] = kv[i];
 }
 
+/* ---- embed_tokens_hc: batched embed-and-replicate.  Out layout is
+ *      [n_tokens, n_hc, n_embd] (per-token block of n_hc HC streams,
+ *      each stream is the same f16→f32-decoded embedding row).  Mirrors
+ *      Metal's batch_cur_hc layout (pc × n_hc × n_embd, ds4.c:8840). */
+static __global__ void ds4_cuda_embed_tokens_hc_kernel(
+        float          *out_hc,
+        const int32_t  *tokens,
+        const uint16_t *embd_table,
+        uint32_t        n_tokens,
+        uint32_t        n_embd,
+        uint32_t        n_hc) {
+    const uint32_t hc = blockIdx.x;
+    const uint32_t t  = blockIdx.y;
+    if (hc >= n_hc || t >= n_tokens) return;
+    const int32_t token = tokens[t];
+    /* Defensive on negative / out-of-range token IDs: write zeros so the
+     * downstream pipeline produces a deterministic answer instead of
+     * dereferencing wild memory.  The caller validates token IDs upstream
+     * (token_vec is sourced from the tokenizer); this is belt-and-braces. */
+    float *dst = out_hc + ((uint64_t)t * n_hc + hc) * n_embd;
+    if (token < 0) {
+        for (uint32_t i = threadIdx.x; i < n_embd; i += blockDim.x) {
+            dst[i] = 0.0f;
+        }
+        return;
+    }
+    const uint16_t *row = embd_table + (uint64_t)token * n_embd;
+    for (uint32_t i = threadIdx.x; i < n_embd; i += blockDim.x) {
+        dst[i] = ds4_cuda_f16_to_f32_phase15(row[i]);
+    }
+}
+
+/* ---- store_raw_kv_batch: write each token's KV row to its ring slot.
+ *      Slot for token t = (pos0 + t) % raw_cap.  kv_batch layout is
+ *      [n_tokens, head_dim]. */
+static __global__ void ds4_cuda_store_raw_kv_batch_kernel(
+        float       *raw_cache,
+        const float *kv_batch,
+        uint32_t     raw_cap,
+        uint32_t     pos0,
+        uint32_t     n_tokens,
+        uint32_t     head_dim) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (i >= head_dim || t >= n_tokens) return;
+    const uint32_t slot = (pos0 + t) % raw_cap;
+    raw_cache[(uint64_t)slot * head_dim + i] =
+        kv_batch[(uint64_t)t * head_dim + i];
+}
+
 extern "C" {
 
 int ds4_cuda_rms_norm_weight_tensor(
@@ -5974,6 +6027,63 @@ int ds4_cuda_store_raw_kv_tensor(
     ds4_cuda_store_raw_kv_kernel<<<blocks, block_size, 0, g_stream>>>(
         (float *)cache_ptr, (const float *)kv_ptr, raw_cap, row, head_dim);
     return ds4_cuda_check(cudaGetLastError(), "launch store_raw_kv");
+}
+
+int ds4_cuda_embed_tokens_hc_tensor(
+        ds4_cuda_tensor       *out_hc,
+        const ds4_cuda_tensor *tokens,
+        const void            *model_map,
+        uint64_t               model_size,
+        uint64_t               weight_offset,
+        uint32_t               n_vocab,
+        uint32_t               n_tokens,
+        uint32_t               n_embd,
+        uint32_t               n_hc) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (n_vocab == 0u || n_tokens == 0u || n_embd == 0u || n_hc == 0u) return 0;
+    const uint64_t embd_bytes = (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
+    if (weight_offset > model_size || embd_bytes > model_size - weight_offset) return 0;
+
+    const uint64_t out_bytes    = (uint64_t)n_tokens * n_hc * n_embd * sizeof(float);
+    const uint64_t tokens_bytes = (uint64_t)n_tokens * sizeof(int32_t);
+    void *out_ptr = NULL, *tokens_ptr = NULL;
+    if (!ds4_cuda_tensor_range(out_hc, out_bytes,    "embed_tokens_hc out",    &out_ptr))    return 0;
+    if (!ds4_cuda_tensor_range(tokens, tokens_bytes, "embed_tokens_hc tokens", &tokens_ptr)) return 0;
+
+    const uint16_t *embd_table = (const uint16_t *)((const uint8_t *)model_map + weight_offset);
+
+    const int block_size = 256;
+    dim3 grid(n_hc, n_tokens, 1u);
+    ds4_cuda_embed_tokens_hc_kernel<<<grid, block_size, 0, g_stream>>>(
+        (float *)out_ptr, (const int32_t *)tokens_ptr, embd_table,
+        n_tokens, n_embd, n_hc);
+    return ds4_cuda_check(cudaGetLastError(), "launch embed_tokens_hc");
+}
+
+int ds4_cuda_store_raw_kv_batch_tensor(
+        ds4_cuda_tensor       *raw_cache,
+        const ds4_cuda_tensor *kv_batch,
+        uint32_t               raw_cap,
+        uint32_t               pos0,
+        uint32_t               n_tokens,
+        uint32_t               head_dim) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (raw_cap == 0u || head_dim == 0u || n_tokens == 0u) return 0;
+
+    const uint64_t cache_bytes = (uint64_t)raw_cap * head_dim * sizeof(float);
+    const uint64_t kv_bytes    = (uint64_t)n_tokens * head_dim * sizeof(float);
+    void *cache_ptr = NULL, *kv_ptr = NULL;
+    if (!ds4_cuda_tensor_range(raw_cache, cache_bytes, "store_raw_kv_batch cache", &cache_ptr)) return 0;
+    if (!ds4_cuda_tensor_range(kv_batch,  kv_bytes,    "store_raw_kv_batch kv",    &kv_ptr))    return 0;
+
+    const int block_size = 128;
+    const uint32_t blocks_x = (head_dim + (uint32_t)block_size - 1u) / (uint32_t)block_size;
+    dim3 grid(blocks_x, n_tokens, 1u);
+    ds4_cuda_store_raw_kv_batch_kernel<<<grid, block_size, 0, g_stream>>>(
+        (float *)cache_ptr, (const float *)kv_ptr, raw_cap, pos0, n_tokens, head_dim);
+    return ds4_cuda_check(cudaGetLastError(), "launch store_raw_kv_batch");
 }
 
 } /* extern "C" */

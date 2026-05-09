@@ -3277,6 +3277,165 @@ DS4_CUDA_PARITY_TEST(store_raw_kv,
     .cuda_fn = store_raw_kv_cuda,
     .cfg = (void *)&store_raw_kv_cfg_v);
 
+/* ---- embed_tokens_hc (Phase 7 batched): per-token table lookup + replicate.
+ *      Out layout [n_tokens, n_hc, n_embd].  Bit-exact (same F16→F32 + memcpy
+ *      as single-token).  Token IDs come in via a separate int32 device buffer. */
+
+struct embed_tokens_hc_cfg {
+    uint32_t n_vocab;
+    uint32_t n_tokens;
+    uint32_t n_embd;
+    uint32_t n_hc;
+    const int32_t *tokens;
+};
+
+/* Random F32 input, when reinterpreted as F16 bytes, occasionally produces
+ * F16 NaN/Inf bit patterns (exp==31).  Mask bit-14 of every entry so the
+ * resulting F16 exponent stays ≤15 (still spans denormals + small normals,
+ * plenty for parity).  Same mask applied on both sides → parity holds. */
+static void embed_tokens_hc_sanitize(uint16_t *dst, const uint16_t *src, size_t n) {
+    for (size_t i = 0; i < n; i++) dst[i] = src[i] & 0xBFFFu;
+}
+
+static int embed_tokens_hc_cpu(const float *in, float *out, void *cfg) {
+    const struct embed_tokens_hc_cfg *c = cfg;
+    const size_t n_table = (size_t)c->n_vocab * c->n_embd;
+    uint16_t *table = (uint16_t *)malloc(n_table * sizeof(uint16_t));
+    if (!table) return 0;
+    embed_tokens_hc_sanitize(table, (const uint16_t *)in, n_table);
+    for (uint32_t t = 0; t < c->n_tokens; t++) {
+        const int32_t tok = c->tokens[t];
+        const uint16_t *row = (tok >= 0 && (uint32_t)tok < c->n_vocab)
+            ? table + (size_t)tok * c->n_embd
+            : NULL;
+        for (uint32_t hc = 0; hc < c->n_hc; hc++) {
+            float *dst = out + ((size_t)t * c->n_hc + hc) * c->n_embd;
+            for (uint32_t i = 0; i < c->n_embd; i++) {
+                dst[i] = row ? test_f16_to_f32_value(row[i]) : 0.0f;
+            }
+        }
+    }
+    free(table);
+    return 1;
+}
+
+static int embed_tokens_hc_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct embed_tokens_hc_cfg *c = cfg;
+    const size_t table_bytes = (size_t)c->n_vocab * c->n_embd * sizeof(uint16_t);
+    ds4_cuda_tensor *table_dev = ds4_cuda_tensor_alloc(table_bytes);
+    ds4_cuda_tensor *tokens_dev = ds4_cuda_tensor_alloc((uint64_t)c->n_tokens * sizeof(int32_t));
+    if (!table_dev || !tokens_dev) {
+        ds4_cuda_tensor_free(table_dev);
+        ds4_cuda_tensor_free(tokens_dev);
+        return 0;
+    }
+    const size_t n_table = (size_t)c->n_vocab * c->n_embd;
+    uint16_t *sanitized = (uint16_t *)malloc(n_table * sizeof(uint16_t));
+    if (!sanitized) {
+        ds4_cuda_tensor_free(table_dev);
+        ds4_cuda_tensor_free(tokens_dev);
+        return 0;
+    }
+    embed_tokens_hc_sanitize(sanitized, (const uint16_t *)in, n_table);
+    int ok = ds4_cuda_tensor_write(table_dev, 0, sanitized, table_bytes);
+    free(sanitized);
+    if (ok) ok = ds4_cuda_tensor_write(tokens_dev, 0, c->tokens,
+                                       (uint64_t)c->n_tokens * sizeof(int32_t));
+    const void *fake_model_map = ds4_cuda_tensor_contents(table_dev);
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_embed_tokens_hc_tensor(out_dev, tokens_dev,
+                                                 fake_model_map, table_bytes,
+                                                 /*weight_offset=*/0u,
+                                                 c->n_vocab, c->n_tokens,
+                                                 c->n_embd, c->n_hc);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(tokens_dev);
+    ds4_cuda_tensor_free(table_dev);
+    return ok;
+}
+
+/* n_vocab=8, n_tokens=5, n_embd=64, n_hc=4 — exercises distinct token IDs
+ * including a repeat (token 3 appears twice) so kernel correctly handles
+ * non-monotonic gathers. */
+static const int32_t embed_tokens_hc_tokens[] = { 3, 0, 5, 3, 7 };
+static const struct embed_tokens_hc_cfg embed_tokens_hc_cfg_v = {
+    .n_vocab = 8, .n_tokens = 5, .n_embd = 64, .n_hc = 4,
+    .tokens = embed_tokens_hc_tokens
+};
+
+DS4_CUDA_PARITY_TEST(embed_tokens_hc,
+    .seed = 0xE7B1,
+    /* in_elems = 8*64*2/4 = 256 floats (the F16 table reinterpreted). */
+    .in_elems = 256,
+    .out_elems = 5 * 4 * 64,
+    .ulp_tolerance = 0,
+    .cpu_fn = embed_tokens_hc_cpu,
+    .cuda_fn = embed_tokens_hc_cuda,
+    .cfg = (void *)&embed_tokens_hc_cfg_v);
+
+/* ---- store_raw_kv_batch (Phase 7 batched): per-token write to ring slot.
+ *      Slot[t] = (pos0 + t) % raw_cap.  Bit-exact (memcpy semantic). */
+
+struct store_raw_kv_batch_cfg {
+    uint32_t raw_cap;
+    uint32_t pos0;
+    uint32_t n_tokens;
+    uint32_t head_dim;
+};
+
+static int store_raw_kv_batch_cpu(const float *in, float *out, void *cfg) {
+    const struct store_raw_kv_batch_cfg *c = cfg;
+    /* in layout: [kv_batch (n_tokens*head_dim) | initial_cache (raw_cap*head_dim)]. */
+    const float *kv_batch = in;
+    const float *initial_cache = in + (size_t)c->n_tokens * c->head_dim;
+    memcpy(out, initial_cache, (size_t)c->raw_cap * c->head_dim * sizeof(float));
+    for (uint32_t t = 0; t < c->n_tokens; t++) {
+        const uint32_t slot = (c->pos0 + t) % c->raw_cap;
+        memcpy(out + (size_t)slot * c->head_dim,
+               kv_batch + (size_t)t * c->head_dim,
+               c->head_dim * sizeof(float));
+    }
+    return 1;
+}
+
+static int store_raw_kv_batch_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                   size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct store_raw_kv_batch_cfg *c = cfg;
+    int ok = ds4_cuda_tensor_write(out_dev, 0,
+                                   in + (size_t)c->n_tokens * c->head_dim,
+                                   (uint64_t)c->raw_cap * c->head_dim * sizeof(float));
+    ds4_cuda_tensor *kv_dev = ds4_cuda_tensor_alloc(
+        (uint64_t)c->n_tokens * c->head_dim * sizeof(float));
+    if (!kv_dev) return 0;
+    if (ok) ok = ds4_cuda_tensor_write(kv_dev, 0, in,
+                                       (uint64_t)c->n_tokens * c->head_dim * sizeof(float));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_store_raw_kv_batch_tensor(out_dev, kv_dev,
+                                                    c->raw_cap, c->pos0,
+                                                    c->n_tokens, c->head_dim);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(kv_dev);
+    return ok;
+}
+
+/* raw_cap=8, pos0=5, n_tokens=6 — pos0+5=10 wraps to slot 2, exercising
+ * the % raw_cap modulo across the batch (slots: 5,6,7,0,1,2). */
+static const struct store_raw_kv_batch_cfg store_raw_kv_batch_cfg_v = {
+    .raw_cap = 8, .pos0 = 5, .n_tokens = 6, .head_dim = 64
+};
+
+DS4_CUDA_PARITY_TEST(store_raw_kv_batch,
+    .seed = 0x57085,
+    .in_elems = 6 * 64 + 8 * 64,    /* kv_batch + initial_cache = 896 */
+    .out_elems = 8 * 64,
+    .ulp_tolerance = 0,
+    .cpu_fn = store_raw_kv_batch_cpu,
+    .cuda_fn = store_raw_kv_batch_cuda,
+    .cfg = (void *)&store_raw_kv_batch_cfg_v);
+
 /* ---- output_hc_weights: per-token sigmoid_stable(pre * scalar + base) +
  *      eps.  Composed in Metal from 4 pipelines; fused into a single CUDA
  *      kernel.  CPU oracle uses sigmoid_stable from ds4.h (already double-
@@ -5766,7 +5925,9 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_dsv4_qkv_rms_norm_rows,
     &ds4_cuda_parity_head_rms_norm,
     &ds4_cuda_parity_embed_token_hc,
+    &ds4_cuda_parity_embed_tokens_hc,
     &ds4_cuda_parity_store_raw_kv,
+    &ds4_cuda_parity_store_raw_kv_batch,
     &ds4_cuda_parity_hc_weighted_sum,
     &ds4_cuda_parity_hc_weighted_sum_split,
     &ds4_cuda_parity_hc_expand,
