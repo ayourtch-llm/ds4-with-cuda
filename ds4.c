@@ -13957,6 +13957,44 @@ typedef struct {
     ds4_cuda_tensor *output_norm;
     ds4_cuda_tensor *logits;
 
+    /* Phase 4 Step 3: optional MTP draft model state.  Allocated only when
+     * the engine has loaded an MTP weights blob (e->mtp_ready); otherwise
+     * all tensors stay NULL.  The drafter has its own raw cache because it
+     * speculates on future tokens that target attention only sees post-
+     * acceptance.  Mirrors Metal's mtp_* graph fields (ds4.c:8358-8368). */
+    ds4_cuda_tensor *mtp_embed;
+    ds4_cuda_tensor *mtp_enorm;
+    ds4_cuda_tensor *mtp_eproj;
+    ds4_cuda_tensor *mtp_eproj_hc;
+    ds4_cuda_tensor *mtp_hnorm_hc;
+    ds4_cuda_tensor *mtp_hproj_hc;
+    ds4_cuda_tensor *mtp_input_hc;
+    ds4_cuda_tensor *mtp_state_hc;
+    ds4_cuda_tensor *mtp_next_hc;
+    ds4_cuda_tensor *mtp_raw_cache;
+    uint32_t         mtp_n_raw;
+
+    /* Phase 4 Step 3: speculative-decode frontier scratch for the strict
+     * decode2_exact verifier (Step 5 will populate, Step 6 will consume).
+     * Per-layer copies of the compressor / indexer state shadow each
+     * verified token's worth of cache mutations so a partial-accept can
+     * rewind without re-running the prefix.  spec_logits is sized for the
+     * batched output head (16 rows max).  Allocated only when
+     * e->mtp_ready and only for ratio>0 (compressor) / ratio==4 (indexer)
+     * layers.  Mirrors Metal's spec_* graph fields (ds4.c:8301-8314). */
+    ds4_cuda_tensor *spec_attn_state_kv[DS4_N_LAYER];
+    ds4_cuda_tensor *spec_attn_state_score[DS4_N_LAYER];
+    ds4_cuda_tensor *spec_index_state_kv[DS4_N_LAYER];
+    ds4_cuda_tensor *spec_index_state_score[DS4_N_LAYER];
+    ds4_cuda_tensor *spec_prefix1_attn_state_kv[DS4_N_LAYER];
+    ds4_cuda_tensor *spec_prefix1_attn_state_score[DS4_N_LAYER];
+    ds4_cuda_tensor *spec_prefix1_index_state_kv[DS4_N_LAYER];
+    ds4_cuda_tensor *spec_prefix1_index_state_score[DS4_N_LAYER];
+    ds4_cuda_tensor *spec_logits;
+    uint32_t         spec_prefix1_n_comp[DS4_N_LAYER];
+    uint32_t         spec_prefix1_n_index_comp[DS4_N_LAYER];
+    bool             spec_capture_prefix1;
+
     bool quality;
 } ds4_cuda_graph;
 
@@ -13976,6 +14014,31 @@ static bool cuda_tensor_fill_f32(ds4_cuda_tensor *t, float v, uint64_t n) {
  * after ds4_cuda_synchronize() (no in-flight kernels) and outside an open
  * command batch.  Views are freed before the bases they alias. */
 static void cuda_graph_free(ds4_cuda_graph *g) {
+    /* Phase 4 Step 3: MTP + spec_frontier scratch frees first (reverse of
+     * alloc order).  All tensor_free calls are NULL-safe so this is a no-op
+     * when the graph was allocated with mtp_ready=false. */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_cuda_tensor_free(g->spec_prefix1_index_state_score[il]);
+        ds4_cuda_tensor_free(g->spec_prefix1_index_state_kv[il]);
+        ds4_cuda_tensor_free(g->spec_prefix1_attn_state_score[il]);
+        ds4_cuda_tensor_free(g->spec_prefix1_attn_state_kv[il]);
+        ds4_cuda_tensor_free(g->spec_index_state_score[il]);
+        ds4_cuda_tensor_free(g->spec_index_state_kv[il]);
+        ds4_cuda_tensor_free(g->spec_attn_state_score[il]);
+        ds4_cuda_tensor_free(g->spec_attn_state_kv[il]);
+    }
+    ds4_cuda_tensor_free(g->spec_logits);
+    ds4_cuda_tensor_free(g->mtp_raw_cache);
+    ds4_cuda_tensor_free(g->mtp_next_hc);
+    ds4_cuda_tensor_free(g->mtp_state_hc);
+    ds4_cuda_tensor_free(g->mtp_input_hc);
+    ds4_cuda_tensor_free(g->mtp_hproj_hc);
+    ds4_cuda_tensor_free(g->mtp_hnorm_hc);
+    ds4_cuda_tensor_free(g->mtp_eproj_hc);
+    ds4_cuda_tensor_free(g->mtp_eproj);
+    ds4_cuda_tensor_free(g->mtp_enorm);
+    ds4_cuda_tensor_free(g->mtp_embed);
+
     ds4_cuda_tensor_free(g->logits);
     ds4_cuda_tensor_free(g->output_norm);
     ds4_cuda_tensor_free(g->output_embd);
@@ -14042,16 +14105,20 @@ static void cuda_graph_free(ds4_cuda_graph *g) {
 }
 
 /* Allocate the CUDA graph state for a chosen raw-cache capacity.  Mirrors
- * metal_graph_alloc_raw_cap minus MTP, speculative, and batched-prefill
- * tensors (Phase 3b deferred).  Model weights are referenced via the registered
- * GGUF mmap range; this function does not copy them. */
+ * metal_graph_alloc_raw_cap minus batched-prefill tensors (Phase 3b deferred).
+ * Phase 4 Step 3: gates MTP draft + speculative-frontier scratch on
+ * `mtp_ready`; when MTP isn't loaded these allocations are skipped and the
+ * pointers stay NULL (matches the regular non-MTP behaviour exactly).
+ * Model weights are referenced via the registered GGUF mmap range; this
+ * function does not copy them. */
 static bool cuda_graph_alloc_raw_cap(
         ds4_cuda_graph          *g,
         const ds4_weights       *weights,
         const ds4_layer_weights *layer,
         uint32_t                 raw_cap,
         uint32_t                 ctx_size,
-        uint32_t                 prefill_cap) {
+        uint32_t                 prefill_cap,
+        bool                     mtp_ready) {
     memset(g, 0, sizeof(*g));
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
@@ -14209,6 +14276,69 @@ static bool cuda_graph_alloc_raw_cap(
     g->output_norm = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->logits = ds4_cuda_tensor_alloc(vocab_dim * sizeof(float));
 
+    /* Phase 4 Step 3: optional MTP draft scratch + speculative frontier.
+     * Skipped entirely when mtp_ready is false; pointers stay NULL and the
+     * `ok` validation below short-circuits the MTP-tagged checks via the
+     * `!mtp_ready ||` guard so non-MTP sessions don't fail-validate on
+     * NULL MTP tensors.  Sizing mirrors Metal at ds4.c:8825-8835 +
+     * 8746-8757 + 8835. */
+    bool mtp_alloc_ok = true;
+    if (mtp_ready) {
+        g->mtp_embed     = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        g->mtp_enorm     = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        g->mtp_eproj     = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        g->mtp_eproj_hc  = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+        g->mtp_hnorm_hc  = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+        g->mtp_hproj_hc  = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+        g->mtp_input_hc  = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+        g->mtp_state_hc  = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+        g->mtp_next_hc   = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+        g->mtp_raw_cache = ds4_cuda_tensor_alloc(
+            (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+        g->mtp_n_raw = 0u;
+
+        mtp_alloc_ok = g->mtp_embed && g->mtp_enorm && g->mtp_eproj &&
+                       g->mtp_eproj_hc && g->mtp_hnorm_hc && g->mtp_hproj_hc &&
+                       g->mtp_input_hc && g->mtp_state_hc && g->mtp_next_hc &&
+                       g->mtp_raw_cache;
+
+        /* spec_logits sized for the batched output head's max emit (16 rows
+         * × vocab) — Metal allocates the same fixed cap. */
+        g->spec_logits = ds4_cuda_tensor_alloc(16ull * vocab_dim * sizeof(float));
+        mtp_alloc_ok = mtp_alloc_ok && g->spec_logits != NULL;
+        g->spec_capture_prefix1 = false;
+
+        for (uint32_t il = 0; mtp_alloc_ok && il < DS4_N_LAYER; il++) {
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            if (ratio == 0) continue;
+            const uint32_t coff = ratio == 4 ? 2u : 1u;
+            const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
+            const uint64_t attn_rows  = (uint64_t)coff * ratio;
+            const uint64_t attn_bytes = attn_width * attn_rows * sizeof(float);
+            g->spec_attn_state_kv[il]            = ds4_cuda_tensor_alloc(attn_bytes);
+            g->spec_attn_state_score[il]         = ds4_cuda_tensor_alloc(attn_bytes);
+            g->spec_prefix1_attn_state_kv[il]    = ds4_cuda_tensor_alloc(attn_bytes);
+            g->spec_prefix1_attn_state_score[il] = ds4_cuda_tensor_alloc(attn_bytes);
+            mtp_alloc_ok = g->spec_attn_state_kv[il] &&
+                           g->spec_attn_state_score[il] &&
+                           g->spec_prefix1_attn_state_kv[il] &&
+                           g->spec_prefix1_attn_state_score[il];
+            if (mtp_alloc_ok && ratio == 4u) {
+                const uint64_t index_width = (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM;
+                const uint64_t index_rows  = (uint64_t)coff * ratio;
+                const uint64_t index_bytes = index_width * index_rows * sizeof(float);
+                g->spec_index_state_kv[il]            = ds4_cuda_tensor_alloc(index_bytes);
+                g->spec_index_state_score[il]         = ds4_cuda_tensor_alloc(index_bytes);
+                g->spec_prefix1_index_state_kv[il]    = ds4_cuda_tensor_alloc(index_bytes);
+                g->spec_prefix1_index_state_score[il] = ds4_cuda_tensor_alloc(index_bytes);
+                mtp_alloc_ok = g->spec_index_state_kv[il] &&
+                               g->spec_index_state_score[il] &&
+                               g->spec_prefix1_index_state_kv[il] &&
+                               g->spec_prefix1_index_state_score[il];
+            }
+        }
+    }
+
     bool layer_cache_ok = true;
     for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
         layer_cache_ok = g->layer_raw_cache[il] != NULL;
@@ -14225,7 +14355,7 @@ static bool cuda_graph_alloc_raw_cap(
         }
     }
 
-    const bool ok = state_init_ok && layer_cache_ok &&
+    const bool ok = state_init_ok && layer_cache_ok && mtp_alloc_ok &&
                     g->cur_hc && g->next_hc && g->flat_hc &&
                     g->hc_mix && g->hc_split &&
                     g->hc_pre && g->hc_post && g->hc_comb &&
@@ -19973,7 +20103,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             ctx_size, s->prefill_cap);
         if (!cuda_graph_alloc_raw_cap(&s->cuda_graph, &e->weights,
                                       &e->weights.layer[0],
-                                      raw_cap, (uint32_t)ctx_size, s->prefill_cap))
+                                      raw_cap, (uint32_t)ctx_size, s->prefill_cap,
+                                      e->mtp_ready))
         {
             free(s);
             return 1;
@@ -19981,8 +20112,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->cuda_graph.quality = e->quality;
         s->cuda_graph_ready = true;
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-        /* MTP and speculative decode are deferred from Phase 3c (per the
-         * session-backend brief); s->mtp_logits stays NULL. */
+        /* Phase 4 Step 3: MTP draft scratch is allocated inside
+         * cuda_graph_alloc_raw_cap when e->mtp_ready.  Session-level
+         * s->mtp_logits heap allocation is gated on Step 4 wiring (the
+         * draft kernel chain that writes into it); stays NULL until then. */
         *out = s;
         return 0;
     }
@@ -20128,7 +20261,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             if (!cuda_graph_alloc_raw_cap(&s->cuda_graph, &ec->weights,
                                           &ec->weights.layer[0],
                                           new_raw_cap, (uint32_t)s->ctx_size,
-                                          new_prefill_cap))
+                                          new_prefill_cap, ec->mtp_ready))
             {
                 snprintf(err, errlen, "CUDA graph realloc failed for cold prefill");
                 return 1;
