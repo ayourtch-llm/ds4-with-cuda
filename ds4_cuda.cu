@@ -46,6 +46,17 @@ typedef struct {
     uint16_t dmin;
 } ds4_cuda_block_q2_K;
 
+/* Phase 4 Step 7a: Q4_K block.  Mirrors block_q4_K in ggml-common.h /
+ * ds4.c:138 — 256-element super-block, 4-bit quants packed two-per-byte
+ * with 6-bit per-sub-block d/m scales (8 sub-blocks of 32 elements).
+ * Total: 2 + 2 + 12 + 128 = 144 bytes. */
+typedef struct {
+    uint16_t d;       /* fp16 super-block scale for d */
+    uint16_t dmin;    /* fp16 super-block scale for m */
+    uint8_t  scales[12];  /* 8 d_i + 8 m_i, 6-bit each, packed via get_scale_min_k4 */
+    uint8_t  qs[128]; /* 256 quants × 4 bits */
+} ds4_cuda_block_q4_K;
+
 typedef struct {
     float   d;
     int8_t  qs[256];
@@ -907,6 +918,128 @@ static __device__ __forceinline__ float ds4_cuda_warp_quantize_and_dot_q2_K_q8_K
     return sumf;
 }
 
+/* Phase 4 Step 7: Q4_K · Q8_K warp helper with fused activation quantize.
+ *
+ * Mirrors warp_quantize_and_dot_q2_K_q8_K_f32 (3b-10) for the Q4_K format.
+ * Q4_K layout: 256-element super-block with 8 sub-blocks of 32 elements,
+ * fp16 super-block d (scale) and dmin (min-scale), 12 bytes packing 16
+ * 6-bit per-sub-block d_j/m_j scales (see get_scale_min_k4 below), 128
+ * bytes packing 256 4-bit quants in a pair-low/pair-high nibble layout.
+ *
+ * Per-block dot product (matching ggml/ds4 dequant):
+ *   For sub-block j: dequant(e) = super_d * d_j * q_value_e - super_dmin * m_j
+ *   Block sum = super_d * Σ_j (d_j * isum_j) - super_dmin * Σ_j (m_j * bsum_j)
+ *     where isum_j = Σ_{e in j} (q_value_e * q8_e),
+ *           bsum_j = Σ_{e in j} q8_e = q8_K.bsums[2j] + q8_K.bsums[2j+1]
+ *           (each q8_K bsum entry covers 16 elements; sub-block j has 32).
+ *
+ * Lane mapping (mirrors q2_K helper):
+ *   summs:  lane ∈ [0,8) computes m_j * bsum_j for sub-block j=lane.
+ *   isum:   8 elements per lane (stride 32 across the 256).  For each step,
+ *           e = step*32 + lane, j = e>>5, pair_idx = j>>1, byte_idx =
+ *           pair_idx*32 + (e & 31), nibble_select = j & 1.  q_value =
+ *           (qs[byte_idx] >> (4*nibble_select)) & 0xF.
+ *
+ * FP chain mirrors q2_K's NEON-matched order (super_dmin pre-negated):
+ *   sumf = fmaf(super_dmin_neg, summs, sumf);
+ *   sumf = fmaf(super_d,        isum,  sumf);
+ *
+ * Caller must invoke from a full warp (32 lanes participating). */
+static __device__ __forceinline__ void ds4_cuda_q4_K_get_scale_min(
+        uint32_t       j,
+        const uint8_t *sc,
+        uint8_t       *out_d,
+        uint8_t       *out_m) {
+    /* Standard ggml get_scale_min_k4: 6-bit packed scales/mins.  For j<4,
+     * d/m sit in the low 6 bits of sc[j] / sc[j+4].  For j∈[4,8), d/m use
+     * the low nibble of sc[j+4-4]=sc[j] (wait no; see ggml-quants.c:818).
+     * Re-derived from llama.cpp:
+     *   if j<4:   d = sc[j]   & 0x3F,  m = sc[j+4] & 0x3F
+     *   else:     d = (sc[j+4] & 0x0F) | ((sc[j-4] >> 6) << 4),
+     *             m = (sc[j+4] >> 4)   | ((sc[j]   >> 6) << 4) */
+    if (j < 4u) {
+        *out_d = (uint8_t)(sc[j]      & 0x3Fu);
+        *out_m = (uint8_t)(sc[j + 4u] & 0x3Fu);
+    } else {
+        *out_d = (uint8_t)((sc[j + 4u] & 0x0Fu) | (((uint32_t)sc[j - 4u] >> 6u) << 4u));
+        *out_m = (uint8_t)(((uint32_t)sc[j + 4u] >> 4u) | (((uint32_t)sc[j] >> 6u) << 4u));
+    }
+}
+
+static __device__ __forceinline__ float ds4_cuda_warp_quantize_and_dot_q4_K_q8_K_f32(
+        const ds4_cuda_block_q4_K *x,
+        const float               *act,
+        uint32_t                   nb,
+        uint32_t                   lane) {
+    const uint32_t mask = 0xffffffffu;
+    float sumf = 0.0f;
+    for (uint32_t i = 0; i < nb; i++) {
+        int8_t  lane_qs[8];
+        int16_t lane_bsum;
+        float   yd;
+        ds4_cuda_warp_quantize_q8_K_block(act + (uint64_t)i * 256u,
+                                          lane, lane_qs, &lane_bsum, &yd);
+
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *sc = x[i].scales;
+
+        /* summs: each q8_K bsum entry covers 16 elements; sub-block j (32
+         * elements) needs bsums[2j] + bsums[2j+1].  warp_quantize_q8_K_block
+         * leaves bsums[k] in lane k's `lane_bsum` for k<16 (else 0).  All
+         * 32 lanes call __shfl_sync uniformly (warp-coherent); lanes >= 8
+         * read bogus srcLanes but discard the result (lane_summ stays 0). */
+        const int32_t bsum_pair_a = __shfl_sync(mask, (int32_t)lane_bsum, (int)(lane * 2u));
+        const int32_t bsum_pair_b = __shfl_sync(mask, (int32_t)lane_bsum, (int)(lane * 2u + 1u));
+
+        int32_t lane_summ = 0;
+        if (lane < 8u) {
+            uint8_t d_j, m_j;
+            ds4_cuda_q4_K_get_scale_min(lane, sc, &d_j, &m_j);
+            (void)d_j; /* d_j re-extracted in the isum loop per step */
+            lane_summ = (int32_t)m_j * (bsum_pair_a + bsum_pair_b);
+        }
+        lane_summ += __shfl_xor_sync(mask, lane_summ, 16);
+        lane_summ += __shfl_xor_sync(mask, lane_summ, 8);
+        lane_summ += __shfl_xor_sync(mask, lane_summ, 4);
+        lane_summ += __shfl_xor_sync(mask, lane_summ, 2);
+        lane_summ += __shfl_xor_sync(mask, lane_summ, 1);
+        const int32_t summs = lane_summ;
+
+        const float super_d    =  yd * ds4_cuda_f16_to_f32(x[i].d);
+        const float super_dmin = -yd * ds4_cuda_f16_to_f32(x[i].dmin);
+        sumf = fmaf(super_dmin, (float)summs, sumf);
+
+        /* isum: 256 element products.  e = step*32 + lane; sub-block j =
+         * e>>5; q_value extracted via pair-low/pair-high nibble; per-step
+         * d_j extracted via get_scale_min_k4. */
+        int32_t lane_isum = 0;
+        #pragma unroll
+        for (uint32_t step = 0; step < 8u; step++) {
+            const uint32_t e             = step * 32u + lane;
+            const uint32_t j             = e >> 5;
+            const uint32_t pair_idx      = j >> 1;
+            const uint32_t pos_in_pair   = e & 31u;
+            const uint32_t byte_idx      = pair_idx * 32u + pos_in_pair;
+            const uint32_t nibble_select = j & 1u;
+            uint8_t d_j, m_j;
+            ds4_cuda_q4_K_get_scale_min(j, sc, &d_j, &m_j);
+            (void)m_j;
+            const int32_t qv  = (int32_t)(((uint32_t)qs[byte_idx] >> (4u * nibble_select)) & 0xFu);
+            const int32_t q8v = (int32_t)lane_qs[step];
+            lane_isum += (int32_t)d_j * qv * q8v;
+        }
+        lane_isum += __shfl_xor_sync(mask, lane_isum, 16);
+        lane_isum += __shfl_xor_sync(mask, lane_isum, 8);
+        lane_isum += __shfl_xor_sync(mask, lane_isum, 4);
+        lane_isum += __shfl_xor_sync(mask, lane_isum, 2);
+        lane_isum += __shfl_xor_sync(mask, lane_isum, 1);
+        const int32_t isum = lane_isum;
+
+        sumf = fmaf(super_d, (float)isum, sumf);
+    }
+    return sumf;
+}
+
 /* Phase 3b-5: fused quantize+matvec.  One warp per output row; the prior
  * 3b-1 retile's int-dot body now lives inside the fused helper above
  * alongside the on-the-fly activation quantize, eliminating the
@@ -1438,6 +1571,101 @@ static __global__ void ds4_cuda_routed_moe_down_q2_k_kernel(
         const float *slot_mid =
             mid_act + ((uint64_t)token * n_expert + slot) * expert_mid_dim;
         const float v = ds4_cuda_warp_quantize_and_dot_q2_K_q8_K_f32(down_row, slot_mid, expert_mid_dim / 256u, lane);
+        if (lane == 0u && experts) {
+            experts[((uint64_t)token * n_expert + slot) * out_dim + row] = v;
+        }
+        sum += v;
+    }
+    if (lane == 0u) out[(uint64_t)token * out_dim + row] = sum;
+}
+
+/* Phase 4 Step 7: Q4_K routed MoE mid kernel (gate + up dot against Q8_K
+ * activation, fused on the fly).  Mirrors routed_moe_mid_iq2_xxs_kernel
+ * structure exactly; only differences are the Q4_K weight type and the
+ * helper called.  Used by the MTP draft block when its FFN experts are
+ * Q4_K (DS4 Flash MTP gguf default). */
+template<uint32_t ROWS_PER_BLOCK>
+static __global__ void ds4_cuda_routed_moe_mid_q4_K_kernel(
+        const ds4_cuda_block_q4_K *gate_w,
+        const ds4_cuda_block_q4_K *up_w,
+        const float               *act,
+        const int32_t             *selected,
+        const float               *route_weights,
+        float                     *gate,
+        float                     *up,
+        float                     *mid,
+        uint32_t                   n_tokens,
+        uint32_t                   n_expert,
+        uint32_t                   expert_in_dim,
+        uint32_t                   expert_mid_dim,
+        uint64_t                   gate_expert_bytes,
+        uint64_t                   gate_row_bytes,
+        float                      clamp) {
+    const uint32_t row  = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
+    const uint32_t pair = blockIdx.y;
+    if (row >= expert_mid_dim || pair >= n_tokens * n_expert) return;
+    const uint32_t lane = threadIdx.x;
+
+    const uint32_t token = pair / n_expert;
+    const uint32_t slot  = pair - token * n_expert;
+    const int32_t expert = selected[(uint64_t)token * n_expert + slot];
+    if (expert < 0) return;
+
+    const float *token_act = act + (uint64_t)token * expert_in_dim;
+    const uint32_t xq_blocks = expert_in_dim / 256u;
+    const uint8_t *gate_base = (const uint8_t *)gate_w + (uint64_t)(uint32_t)expert * gate_expert_bytes;
+    const uint8_t *up_base   = (const uint8_t *)up_w   + (uint64_t)(uint32_t)expert * gate_expert_bytes;
+    const ds4_cuda_block_q4_K *gate_row =
+        (const ds4_cuda_block_q4_K *)(gate_base + (uint64_t)row * gate_row_bytes);
+    const ds4_cuda_block_q4_K *up_row =
+        (const ds4_cuda_block_q4_K *)(up_base + (uint64_t)row * gate_row_bytes);
+
+    float g = ds4_cuda_warp_quantize_and_dot_q4_K_q8_K_f32(gate_row, token_act, xq_blocks, lane);
+    float u = ds4_cuda_warp_quantize_and_dot_q4_K_q8_K_f32(up_row,   token_act, xq_blocks, lane);
+    if (clamp > 1.0e-6f) {
+        if (g > clamp) g = clamp;
+        if (u > clamp) u = clamp;
+        if (u < -clamp) u = -clamp;
+    }
+
+    if (lane == 0) {
+        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+        gate[off] = g;
+        up[off]   = u;
+        mid[off]  = ds4_cuda_silu_f32(g) * u * route_weights[(uint64_t)token * n_expert + slot];
+    }
+}
+
+/* Phase 4 Step 7: Q4_K routed MoE down kernel.  Mirrors
+ * routed_moe_down_q2_k_kernel structure with Q4_K weights. */
+template<uint32_t ROWS_PER_BLOCK>
+static __global__ void ds4_cuda_routed_moe_down_q4_K_kernel(
+        const ds4_cuda_block_q4_K *down_w,
+        const float               *mid_act,
+        const int32_t             *selected,
+        float                     *experts,
+        float                     *out,
+        uint32_t                   n_tokens,
+        uint32_t                   n_expert,
+        uint32_t                   expert_mid_dim,
+        uint32_t                   out_dim,
+        uint64_t                   down_expert_bytes,
+        uint64_t                   down_row_bytes) {
+    const uint32_t row   = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
+    const uint32_t token = blockIdx.y;
+    if (row >= out_dim || token >= n_tokens) return;
+    const uint32_t lane = threadIdx.x;
+
+    float sum = 0.0f;
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
+        const int32_t expert = selected[(uint64_t)token * n_expert + slot];
+        if (expert < 0) continue;
+        const uint8_t *down_base = (const uint8_t *)down_w + (uint64_t)(uint32_t)expert * down_expert_bytes;
+        const ds4_cuda_block_q4_K *down_row =
+            (const ds4_cuda_block_q4_K *)(down_base + (uint64_t)row * down_row_bytes);
+        const float *slot_mid =
+            mid_act + ((uint64_t)token * n_expert + slot) * expert_mid_dim;
+        const float v = ds4_cuda_warp_quantize_and_dot_q4_K_q8_K_f32(down_row, slot_mid, expert_mid_dim / 256u, lane);
         if (lane == 0u && experts) {
             experts[((uint64_t)token * n_expert + slot) * out_dim + row] = v;
         }
@@ -2782,8 +3010,20 @@ static int ds4_cuda_routed_moe_impl(
         n_tokens == 0 || n_expert == 0 || n_expert > 6) {
         return 0;
     }
-    if (gate_type != 16u || down_type != 10u) {
-        fprintf(stderr, "ds4: CUDA routed MoE currently supports IQ2_XXS gate/up and Q2_K down only (gate=%u down=%u)\n",
+    /* Phase 4 Step 7: dispatch on (gate_type, down_type).  Two supported
+     * combos:
+     *   gate=16 (IQ2_XXS) + down=10 (Q2_K) — DS4 base model.
+     *   gate=12 (Q4_K)    + down=12 (Q4_K) — DS4 Flash MTP model.
+     * The MTP file's `tensor_expect_routed_expert` requires gate/up to share
+     * the same type (ds4.c:2321) but doesn't constrain down vs gate; in
+     * practice DS4 Flash MTP uses Q4_K throughout, while the base model
+     * mixes IQ2_XXS gate/up with Q2_K down.  Other combos are rejected. */
+    const bool combo_iq2xxs_q2k = (gate_type == 16u && down_type == 10u);
+    const bool combo_q4k_q4k    = (gate_type == 12u && down_type == 12u);
+    if (!combo_iq2xxs_q2k && !combo_q4k_q4k) {
+        fprintf(stderr,
+                "ds4: CUDA routed MoE supports IQ2_XXS+Q2_K (gate=16 down=10) "
+                "and Q4_K+Q4_K (gate=12 down=12) only; got (gate=%u down=%u)\n",
                 gate_type, down_type);
         return 0;
     }
@@ -2825,55 +3065,74 @@ static int ds4_cuda_routed_moe_impl(
      * fused inside the consumer warp kernels — see
      * ds4_cuda_warp_quantize_q8_K_block. */
 
-    const ds4_cuda_block_iq2_xxs *gate_w =
-        (const ds4_cuda_block_iq2_xxs *)((const uint8_t *)model_map + gate_offset);
-    const ds4_cuda_block_iq2_xxs *up_w =
-        (const ds4_cuda_block_iq2_xxs *)((const uint8_t *)model_map + up_offset);
-    const ds4_cuda_block_q2_K *down_w =
-        (const ds4_cuda_block_q2_K *)((const uint8_t *)model_map + down_offset);
-
     int ok = 1;
-    if (ok) {
-        constexpr uint32_t ROWS_PER_BLOCK = 4u;
-        const uint32_t row_blocks = (expert_mid_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
+    constexpr uint32_t ROWS_PER_BLOCK = 4u;
+    const uint32_t mid_row_blocks = (expert_mid_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
+    const uint32_t out_row_blocks = (out_dim       + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
+
+    if (combo_iq2xxs_q2k) {
+        const ds4_cuda_block_iq2_xxs *gate_w =
+            (const ds4_cuda_block_iq2_xxs *)((const uint8_t *)model_map + gate_offset);
+        const ds4_cuda_block_iq2_xxs *up_w =
+            (const ds4_cuda_block_iq2_xxs *)((const uint8_t *)model_map + up_offset);
+        const ds4_cuda_block_q2_K *down_w =
+            (const ds4_cuda_block_q2_K *)((const uint8_t *)model_map + down_offset);
+
         ds4_cuda_routed_moe_mid_iq2_xxs_kernel<ROWS_PER_BLOCK><<<
-                dim3(row_blocks, (uint32_t)pair_rows, 1),
+                dim3(mid_row_blocks, (uint32_t)pair_rows, 1),
                 dim3(32u, ROWS_PER_BLOCK, 1),
                 0, g_stream>>>(
             gate_w, up_w, (const float *)x_ptr,
             (const int32_t *)selected_ptr,
             (const float *)weights_ptr,
-            (float *)gate_ptr,
-            (float *)up_ptr,
-            (float *)mid_ptr,
-            n_tokens,
-            n_expert,
-            expert_in_dim,
-            expert_mid_dim,
-            gate_expert_bytes,
-            gate_row_bytes,
-            clamp);
-        ok = ds4_cuda_check(cudaGetLastError(), "launch routed MoE gate/up/mid fused");
-    }
-    if (ok) {
-        constexpr uint32_t ROWS_PER_BLOCK = 4u;
-        const uint32_t row_blocks = (out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
-        ds4_cuda_routed_moe_down_q2_k_kernel<ROWS_PER_BLOCK><<<
-                dim3(row_blocks, n_tokens, 1),
+            (float *)gate_ptr, (float *)up_ptr, (float *)mid_ptr,
+            n_tokens, n_expert, expert_in_dim, expert_mid_dim,
+            gate_expert_bytes, gate_row_bytes, clamp);
+        ok = ds4_cuda_check(cudaGetLastError(), "launch routed MoE gate/up/mid (IQ2_XXS) fused");
+        if (ok) {
+            ds4_cuda_routed_moe_down_q2_k_kernel<ROWS_PER_BLOCK><<<
+                    dim3(out_row_blocks, n_tokens, 1),
+                    dim3(32u, ROWS_PER_BLOCK, 1),
+                    0, g_stream>>>(
+                down_w, (const float *)mid_ptr,
+                (const int32_t *)selected_ptr,
+                (float *)experts_ptr, (float *)out_ptr,
+                n_tokens, n_expert, expert_mid_dim, out_dim,
+                down_expert_bytes, down_row_bytes);
+            ok = ds4_cuda_check(cudaGetLastError(), "launch routed MoE down (Q2_K) fused");
+        }
+    } else {
+        /* Q4_K + Q4_K (DS4 Flash MTP). */
+        const ds4_cuda_block_q4_K *gate_w =
+            (const ds4_cuda_block_q4_K *)((const uint8_t *)model_map + gate_offset);
+        const ds4_cuda_block_q4_K *up_w =
+            (const ds4_cuda_block_q4_K *)((const uint8_t *)model_map + up_offset);
+        const ds4_cuda_block_q4_K *down_w =
+            (const ds4_cuda_block_q4_K *)((const uint8_t *)model_map + down_offset);
+
+        ds4_cuda_routed_moe_mid_q4_K_kernel<ROWS_PER_BLOCK><<<
+                dim3(mid_row_blocks, (uint32_t)pair_rows, 1),
                 dim3(32u, ROWS_PER_BLOCK, 1),
                 0, g_stream>>>(
-            down_w,
-            (const float *)mid_ptr,
+            gate_w, up_w, (const float *)x_ptr,
             (const int32_t *)selected_ptr,
-            (float *)experts_ptr,
-            (float *)out_ptr,
-            n_tokens,
-            n_expert,
-            expert_mid_dim,
-            out_dim,
-            down_expert_bytes,
-            down_row_bytes);
-        ok = ds4_cuda_check(cudaGetLastError(), "launch routed MoE down fused");
+            (const float *)weights_ptr,
+            (float *)gate_ptr, (float *)up_ptr, (float *)mid_ptr,
+            n_tokens, n_expert, expert_in_dim, expert_mid_dim,
+            gate_expert_bytes, gate_row_bytes, clamp);
+        ok = ds4_cuda_check(cudaGetLastError(), "launch routed MoE gate/up/mid (Q4_K) fused");
+        if (ok) {
+            ds4_cuda_routed_moe_down_q4_K_kernel<ROWS_PER_BLOCK><<<
+                    dim3(out_row_blocks, n_tokens, 1),
+                    dim3(32u, ROWS_PER_BLOCK, 1),
+                    0, g_stream>>>(
+                down_w, (const float *)mid_ptr,
+                (const int32_t *)selected_ptr,
+                (float *)experts_ptr, (float *)out_ptr,
+                n_tokens, n_expert, expert_mid_dim, out_dim,
+                down_expert_bytes, down_row_bytes);
+            ok = ds4_cuda_check(cudaGetLastError(), "launch routed MoE down (Q4_K) fused");
+        }
     }
 
     return ok;
