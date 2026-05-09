@@ -1834,6 +1834,36 @@ int ds4_cuda_init(void) {
         return 0;
     }
 
+    /* Phase 5 C3 calibration: opt-in L2 persisting region.
+     * DS4_CUDA_L2_PERSIST_MB=N sets the device-level persisting L2 budget
+     * to N MiB (clamped to MaxPersistingL2CacheSize).  The matching access
+     * policy window is installed on g_stream once the model mmap is
+     * registered (see ds4_cuda_set_model_map_range).  When the env var is
+     * unset or 0, behavior is unchanged (no hint, no budget reservation). */
+    const char *l2_persist_env = getenv("DS4_CUDA_L2_PERSIST_MB");
+    if (l2_persist_env && l2_persist_env[0]) {
+        char *end = NULL;
+        long mb = strtol(l2_persist_env, &end, 10);
+        if (end != l2_persist_env && mb > 0) {
+            int max_persist = ds4_cuda_get_device_attr(cudaDevAttrMaxPersistingL2CacheSize);
+            size_t requested = (size_t)mb * (size_t)(1024 * 1024);
+            size_t budget = requested;
+            if (max_persist > 0 && requested > (size_t)max_persist) {
+                budget = (size_t)max_persist;
+                fprintf(stderr,
+                        "ds4: L2 persist budget %ld MiB clamped to device max %.2f MiB\n",
+                        mb, ds4_cuda_mib((uint64_t)max_persist));
+            }
+            if (cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, budget) == cudaSuccess) {
+                fprintf(stderr, "ds4: L2 persisting cache budget %.2f MiB\n",
+                        ds4_cuda_mib((uint64_t)budget));
+            } else {
+                fprintf(stderr, "ds4: WARN failed to set L2 persisting budget %.2f MiB\n",
+                        ds4_cuda_mib((uint64_t)budget));
+            }
+        }
+    }
+
     g_initialized = 1;
     return 1;
 }
@@ -2093,6 +2123,61 @@ int ds4_cuda_set_model_map_range(const void *model_map, uint64_t model_size, uin
             "ds4: CUDA registered mmaped model range %.2f MiB from offset %.2f MiB\n",
             ds4_cuda_mib((uint64_t)registered_bytes),
             ds4_cuda_mib(map_offset));
+
+    /* Phase 5 C3 calibration: install L2 persisting access policy window
+     * on g_stream covering DS4_CUDA_L2_PERSIST_MB worth of bytes from
+     * (registered_base + DS4_CUDA_L2_PERSIST_OFFSET_MB).  num_bytes can
+     * exceed the device persisting budget — CUDA round-robins residency
+     * within the budget.  hitRatio=1.0 forces all touches inside the
+     * window to bias persisting; missProp=Streaming biases everything
+     * outside to evict-on-touch (the default decode behavior).  The L2
+     * size on GB10 sm_121 is 24 MiB; max persisting budget 18 MiB. */
+    const char *l2_mb_env = getenv("DS4_CUDA_L2_PERSIST_MB");
+    if (l2_mb_env && l2_mb_env[0]) {
+        char *end = NULL;
+        long win_mb = strtol(l2_mb_env, &end, 10);
+        if (end != l2_mb_env && win_mb > 0) {
+            size_t win_bytes = (size_t)win_mb * (size_t)(1024 * 1024);
+            size_t off_bytes = 0;
+            const char *l2_off_env = getenv("DS4_CUDA_L2_PERSIST_OFFSET_MB");
+            if (l2_off_env && l2_off_env[0]) {
+                long off_mb = strtol(l2_off_env, NULL, 10);
+                if (off_mb > 0) off_bytes = (size_t)off_mb * (size_t)(1024 * 1024);
+            }
+            if (off_bytes >= registered_bytes) {
+                fprintf(stderr,
+                        "ds4: WARN L2 persist offset %.2f MiB exceeds model %.2f MiB; skipping\n",
+                        ds4_cuda_mib((uint64_t)off_bytes),
+                        ds4_cuda_mib((uint64_t)registered_bytes));
+            } else {
+                if (off_bytes + win_bytes > registered_bytes) {
+                    win_bytes = registered_bytes - off_bytes;
+                }
+                cudaStreamAttrValue attr = {};
+                attr.accessPolicyWindow.base_ptr = (char *)registered_base + off_bytes;
+                attr.accessPolicyWindow.num_bytes = win_bytes;
+                attr.accessPolicyWindow.hitRatio  = 1.0f;
+                attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+                /* missProp=Normal: leave non-window accesses on default L2
+                 * policy (no streaming-evict bias).  E2-E4 calibration
+                 * showed missProp=Streaming with 128MB window caused -15.6%
+                 * regression; the default L2 policy plays better with the
+                 * wide-streaming decode access pattern. */
+                attr.accessPolicyWindow.missProp  = cudaAccessPropertyNormal;
+                if (cudaStreamSetAttribute(g_stream,
+                                           cudaStreamAttributeAccessPolicyWindow,
+                                           &attr) == cudaSuccess) {
+                    fprintf(stderr,
+                            "ds4: L2 persist window %.2f MiB at model+%.2f MiB (hit=persist, miss=stream)\n",
+                            ds4_cuda_mib((uint64_t)win_bytes),
+                            ds4_cuda_mib((uint64_t)off_bytes));
+                } else {
+                    fprintf(stderr, "ds4: WARN cudaStreamSetAttribute persisting failed\n");
+                }
+            }
+        }
+    }
+
     return 1;
 }
 

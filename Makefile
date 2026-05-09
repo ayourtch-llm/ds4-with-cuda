@@ -2,7 +2,7 @@ CC ?= cc
 CFLAGS ?= -O3 -ffast-math -mcpu=native -Wall -Wextra -std=c99
 OBJCFLAGS ?= -O3 -ffast-math -mcpu=native -Wall -Wextra -fobjc-arc
 NVCC ?= $(shell command -v nvcc 2>/dev/null)
-CUDAFLAGS ?= -O3 --use_fast_math -std=c++17 -arch=sm_100 -Xcompiler=-Wall,-Wextra
+CUDAFLAGS ?= -O3 --use_fast_math -std=c++17 -arch=sm_121 -Xcompiler=-Wall,-Wextra
 
 LDLIBS ?= -lm -pthread
 UNAME_S := $(shell uname -s)
