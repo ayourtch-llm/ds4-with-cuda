@@ -17209,6 +17209,141 @@ cleanup_2_1c_2:
              * production inference quality and matches the drift-amplification
              * envelope from the 2.1b prod-shape parity diagnosis. */
             if (l3_rel > 1.0e-2) rc = 1;
+
+            /* ============================================================
+             * 2.1c-4: output head — final RMSNorm + Q8 vocab projection.
+             * Chain: rms_norm_plain on cur_hc → matmul_f16(output_hc_fn) →
+             * output_hc_weights (sigmoid+scale+base+eps) → hc_weighted_sum
+             * (collapse 4 HC streams to 1×n_embd) → rms_norm_weight(output_norm)
+             * → matmul_q8_0(weights->output) → logits[n_vocab].
+             * Compared element-wise against output_logits_one(cpu_final_hc).
+             * ============================================================ */
+            if (rc == 0) {
+                ds4_cuda_tensor *out_flat = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+                ds4_cuda_tensor *out_pre  = ds4_cuda_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
+                ds4_cuda_tensor *out_w    = ds4_cuda_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
+                ds4_cuda_tensor *out_embd = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+                ds4_cuda_tensor *out_norm = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+                ds4_cuda_tensor *out_logits = ds4_cuda_tensor_alloc((uint64_t)DS4_N_VOCAB * sizeof(float));
+
+                if (!out_flat || !out_pre || !out_w || !out_embd || !out_norm || !out_logits) {
+                    fprintf(stderr, "ds4: cuda_single_layer_test 2.1c-4 alloc failed\n");
+                    rc = 1;
+                } else {
+                    int ok4 = ds4_cuda_begin_commands();
+                    if (ok4) ok4 = ds4_cuda_rms_norm_plain_tensor(out_flat, cur_hc3,
+                                                                   (uint32_t)hc_dim, DS4_RMS_EPS);
+                    if (ok4) ok4 = ds4_cuda_matmul_f16_tensor(out_pre,
+                                                               e->model.map, e->model.size,
+                                                               weights->output_hc_fn->abs_offset,
+                                                               hc_dim, DS4_N_HC,
+                                                               out_flat, 1u);
+                    if (ok4) ok4 = ds4_cuda_output_hc_weights_tensor(
+                                    out_w, out_pre,
+                                    e->model.map, e->model.size,
+                                    weights->output_hc_scale->abs_offset,
+                                    weights->output_hc_base->abs_offset,
+                                    DS4_N_HC, DS4_HC_EPS);
+                    if (ok4) ok4 = ds4_cuda_hc_weighted_sum_tensor(out_embd, cur_hc3,
+                                                                    out_w,
+                                                                    DS4_N_EMBD, DS4_N_HC);
+                    if (ok4) ok4 = ds4_cuda_rms_norm_weight_tensor(out_norm, out_embd,
+                                                                    e->model.map, e->model.size,
+                                                                    weights->output_norm->abs_offset,
+                                                                    DS4_N_EMBD, DS4_RMS_EPS);
+                    if (ok4) ok4 = ds4_cuda_matmul_q8_0_tensor(out_logits,
+                                                                e->model.map, e->model.size,
+                                                                weights->output->abs_offset,
+                                                                DS4_N_EMBD, DS4_N_VOCAB,
+                                                                out_norm, 1u);
+                    if (ok4) ok4 = ds4_cuda_end_commands();
+                    if (!ok4) {
+                        fprintf(stderr, "ds4: cuda_single_layer_test 2.1c-4 chain failed\n");
+                        rc = 1;
+                    } else {
+                        float *cuda_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+                        float *cpu_logits  = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+                        ds4_cuda_tensor_read(out_logits, 0, cuda_logits,
+                                             (size_t)DS4_N_VOCAB * sizeof(float));
+                        output_logits_one(cpu_logits, model, weights, cpu_final_hc);
+
+                        int      worst_l4_ulp = 0;
+                        uint64_t worst_l4_idx = 0;
+                        double   l4_max_abserr = 0.0;
+                        double   l4_max_absmag = 0.0;
+                        for (uint64_t i = 0; i < DS4_N_VOCAB; i++) {
+                            const float c = cpu_logits[i];
+                            const float g = cuda_logits[i];
+                            union { float f; int32_t i; } ua, ub; ua.f = c; ub.f = g;
+                            int32_t d = (c == g) ? 0 :
+                                        ((ua.i < 0) != (ub.i < 0)) ? INT32_MAX :
+                                        (ua.i > ub.i ? ua.i - ub.i : ub.i - ua.i);
+                            if (d > worst_l4_ulp) { worst_l4_ulp = d; worst_l4_idx = i; }
+                            const double e1 = fabs((double)c - (double)g);
+                            const double m1 = fmax(fabs((double)c), fabs((double)g));
+                            if (e1 > l4_max_abserr) { l4_max_abserr = e1; l4_max_absmag = m1; }
+                        }
+                        const double l4_rel = l4_max_abserr / fmax(l4_max_absmag, 1.0);
+
+                        /* Top-K agreement check: do CPU and CUDA agree on the top-K
+                         * predicted tokens?  This is the meaningful semantic test —
+                         * raw ULP/abs_err can be deceptive at logit scale. */
+                        const int K = 8;
+                        int cpu_top[8], cuda_top[8];
+                        for (int k = 0; k < K; k++) { cpu_top[k] = -1; cuda_top[k] = -1; }
+                        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+                            for (int k = 0; k < K; k++) {
+                                if (cpu_top[k] < 0 || cpu_logits[i] > cpu_logits[cpu_top[k]]) {
+                                    for (int j = K - 1; j > k; j--) cpu_top[j] = cpu_top[j - 1];
+                                    cpu_top[k] = (int)i;
+                                    break;
+                                }
+                            }
+                            for (int k = 0; k < K; k++) {
+                                if (cuda_top[k] < 0 || cuda_logits[i] > cuda_logits[cuda_top[k]]) {
+                                    for (int j = K - 1; j > k; j--) cuda_top[j] = cuda_top[j - 1];
+                                    cuda_top[k] = (int)i;
+                                    break;
+                                }
+                            }
+                        }
+                        int top1_match = (cpu_top[0] == cuda_top[0]);
+                        int topk_overlap = 0;
+                        for (int a = 0; a < K; a++) {
+                            for (int b = 0; b < K; b++) {
+                                if (cpu_top[a] >= 0 && cpu_top[a] == cuda_top[b]) { topk_overlap++; break; }
+                            }
+                        }
+
+                        fprintf(stderr,
+                                "ds4: cuda_single_layer_test 2.1c-4 output head logits token=%d: "
+                                "worst_ulp=%d at idx=%llu cpu/cuda=%.6e/%.6e  "
+                                "max_abserr=%.3e at_absmag=%.3e  rel=%.3e  top1_match=%d  top%d_overlap=%d/%d\n",
+                                first_token, worst_l4_ulp, (unsigned long long)worst_l4_idx,
+                                (double)cpu_logits[worst_l4_idx], (double)cuda_logits[worst_l4_idx],
+                                l4_max_abserr, l4_max_absmag, l4_rel,
+                                top1_match, K, topk_overlap, K);
+
+                        /* Print top-1 details. */
+                        fprintf(stderr,
+                                "ds4: 2.1c-4 top1 cpu=%d (%.4f)  cuda=%d (%.4f)\n",
+                                cpu_top[0], cpu_logits[cpu_top[0]],
+                                cuda_top[0], cuda_logits[cuda_top[0]]);
+
+                        /* Gate: 1% relative error AND top-1 must match. */
+                        if (l4_rel > 1.0e-2 || !top1_match) rc = 1;
+
+                        free(cuda_logits); free(cpu_logits);
+                    }
+                }
+                ds4_cuda_tensor_free(out_logits);
+                ds4_cuda_tensor_free(out_norm);
+                ds4_cuda_tensor_free(out_embd);
+                ds4_cuda_tensor_free(out_w);
+                ds4_cuda_tensor_free(out_pre);
+                ds4_cuda_tensor_free(out_flat);
+            }
+
             free(cuda_final_hc); free(cpu_final_hc);
         }
 
