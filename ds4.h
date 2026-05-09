@@ -110,6 +110,14 @@ int ds4_engine_metal_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, 
  * non-zero on mismatch / setup failure. */
 int ds4_engine_cuda_single_layer_test(ds4_engine *e, const ds4_tokens *prompt);
 
+/* Phase 2.1d (Option B): standalone fresh-cache test-vector driver.  For each
+ * case in vec_path (default tests/test-vectors/official.vec), run CUDA
+ * fresh-cache forward (embed -> 43 layers -> output head) on the LAST prompt
+ * token and compare argmax + top-K against the recorded API step-0 row.
+ * Step-0 only; full prefill+decode requires Phase 1.5c-compressor + CUDA
+ * session APIs (Option A path).  Informational; does not gate. */
+int ds4_engine_cuda_test_vectors_test(ds4_engine *e, const char *vec_path);
+
 void ds4_tokens_push(ds4_tokens *tv, int token);
 void ds4_tokens_free(ds4_tokens *tv);
 void ds4_tokens_copy(ds4_tokens *dst, const ds4_tokens *src);

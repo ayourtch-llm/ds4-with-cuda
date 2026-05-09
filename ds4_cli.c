@@ -41,6 +41,8 @@ typedef struct {
     bool metal_graph_full_test;
     bool metal_graph_prompt_test;
     bool cuda_single_layer_test;
+    const char *cuda_test_vectors_path;  /* NULL unless --cuda-test-vectors */
+    bool cuda_test_vectors;
 } cli_generation_options;
 
 typedef struct {
@@ -707,6 +709,10 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
         ds4_tokens_free(&prompt);
         return rc;
     }
+    if (cfg->gen.cuda_test_vectors) {
+        ds4_tokens_free(&prompt);
+        return ds4_engine_cuda_test_vectors_test(engine, cfg->gen.cuda_test_vectors_path);
+    }
     if (cfg->gen.dump_logprobs_path) {
         rc = run_logprob_dump(engine, cfg, &prompt);
         ds4_tokens_free(&prompt);
@@ -1233,6 +1239,13 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--cuda-single-layer-test")) {
             c.gen.cuda_single_layer_test = true;
             c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--cuda-test-vectors")) {
+            c.gen.cuda_test_vectors = true;
+            c.engine.backend = DS4_BACKEND_CUDA;
+            /* Optional path argument; if next arg looks like a path, consume it. */
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                c.gen.cuda_test_vectors_path = argv[++i];
+            }
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logprobs")) {

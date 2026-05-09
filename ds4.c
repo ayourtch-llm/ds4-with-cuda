@@ -17430,6 +17430,566 @@ cuda_test_cleanup_2_1c:
 #endif
 }
 
+#ifdef DS4_USE_CUDA
+/* ---------------------------------------------------------------------------
+ * Phase 2.1d (Option B): standalone CUDA test-vector driver.
+ *
+ * Runs CUDA fresh-cache forward (the 2.1c-3+4 chain: embed → 43 layers →
+ * output head → vocab logits) for the LAST prompt token of each test case
+ * in tests/test-vectors/official.vec, and compares CUDA's top-K against the
+ * recorded step-0 row from the official DeepSeek API.
+ *
+ * SCOPE LIMITATION: fresh-cache means each token is processed without the
+ * preceding context's KV cache.  For non-trivial prompts the model sees only
+ * the single chat-template tail token, not the user's actual question, so
+ * step-0 agreement with the API is generally NOT expected.  This driver
+ * reports the gap as a data point pending Phase 1.5c-compressor + CUDA
+ * session-level prefill (Option A), which would unblock real prefill+decode
+ * and full step-0..N comparison.
+ * ------------------------------------------------------------------------- */
+
+static int cuda_2_1d_hex_to_bytes(const char *hex, unsigned char *out, int cap, int *out_len) {
+    int n = 0;
+    while (hex[n*2] && hex[n*2 + 1]) {
+        if (n >= cap) return 0;
+        const char a = hex[n*2], b = hex[n*2 + 1];
+        int hi = (a >= '0' && a <= '9') ? a - '0'
+               : (a >= 'a' && a <= 'f') ? a - 'a' + 10
+               : (a >= 'A' && a <= 'F') ? a - 'A' + 10 : -1;
+        int lo = (b >= '0' && b <= '9') ? b - '0'
+               : (b >= 'a' && b <= 'f') ? b - 'a' + 10
+               : (b >= 'A' && b <= 'F') ? b - 'A' + 10 : -1;
+        if (hi < 0 || lo < 0) return 0;
+        out[n++] = (unsigned char)((hi << 4) | lo);
+    }
+    *out_len = n;
+    return 1;
+}
+
+static char *cuda_2_1d_read_file(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz < 0) { fclose(fp); return NULL; }
+    char *buf = xmalloc((size_t)sz + 1);
+    size_t n = fread(buf, 1, (size_t)sz, fp);
+    fclose(fp);
+    buf[n] = '\0';
+    return buf;
+}
+
+/* Run a single fresh-cache forward (embed → 43 layers → output head) for one
+ * token; write logits[DS4_N_VOCAB] to caller-provided buffer.  Inlines the
+ * 2.1c-3+4 chain.  Returns 0 on success, 1 on failure. */
+static int cuda_2_1d_fresh_cache_logits(ds4_engine *e, int token, float *logits_out) {
+    const ds4_weights *weights = &e->weights;
+    const uint64_t hc_dim  = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+    const uint64_t q_dim   = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim  = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t expert_in_dim_g  = weights->layer[0].ffn_gate_exps->dim[0];
+    const uint64_t expert_mid_dim_g = weights->layer[0].ffn_gate_exps->dim[1];
+    const uint64_t down_in_dim_g    = weights->layer[0].ffn_down_exps->dim[0];
+    const uint64_t routed_out_dim_g = weights->layer[0].ffn_down_exps->dim[1];
+    const uint64_t shared_dim_g     = weights->layer[0].ffn_gate_shexp->dim[1];
+    const uint64_t pair_rows_g      = DS4_N_EXPERT_USED;
+    (void)expert_mid_dim_g;
+
+    ds4_cuda_tensor *cur = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+    ds4_cuda_tensor *nxt = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+    ds4_cuda_tensor *flat= ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+    ds4_cuda_tensor *mix = ds4_cuda_tensor_alloc(mix_dim * sizeof(float));
+    ds4_cuda_tensor *acur= ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    ds4_cuda_tensor *anrm= ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    ds4_cuda_tensor *spl = ds4_cuda_tensor_alloc(mix_dim * sizeof(float));
+    ds4_cuda_tensor *qr  = ds4_cuda_tensor_alloc(1024u * sizeof(float));
+    ds4_cuda_tensor *qrn = ds4_cuda_tensor_alloc(1024u * sizeof(float));
+    ds4_cuda_tensor *q   = ds4_cuda_tensor_alloc(q_dim * sizeof(float));
+    ds4_cuda_tensor *kvr = ds4_cuda_tensor_alloc(kv_dim * sizeof(float));
+    ds4_cuda_tensor *kv  = ds4_cuda_tensor_alloc(kv_dim * sizeof(float));
+    ds4_cuda_tensor *rkv = ds4_cuda_tensor_alloc((uint64_t)DS4_N_SWA * DS4_N_HEAD_DIM * sizeof(float));
+    ds4_cuda_tensor *hd  = ds4_cuda_tensor_alloc(q_dim * sizeof(float));
+    ds4_cuda_tensor *aout= ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    ds4_cuda_tensor *low = ds4_cuda_tensor_alloc((uint64_t)8u * 1024u * sizeof(float));
+    ds4_cuda_tensor *gtmp= ds4_cuda_tensor_alloc((uint64_t)8u * 1024u * sizeof(float));
+    ds4_cuda_tensor *ltmp= ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    ds4_cuda_tensor *aatt= ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+    ds4_cuda_tensor *ckvd= ds4_cuda_tensor_alloc(sizeof(float));
+    ds4_cuda_tensor *cmkd= ds4_cuda_tensor_alloc(sizeof(float));
+    ds4_cuda_tensor *pv  = ds4_cuda_tensor_view(spl, DS4_N_HC * sizeof(float),
+                                                DS4_N_HC * sizeof(float));
+    ds4_cuda_tensor *cv  = ds4_cuda_tensor_view(spl, 2u * DS4_N_HC * sizeof(float),
+                                                DS4_N_HC * DS4_N_HC * sizeof(float));
+    ds4_cuda_tensor *fflat= ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+    ds4_cuda_tensor *fmix = ds4_cuda_tensor_alloc(mix_dim * sizeof(float));
+    ds4_cuda_tensor *fcur = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    ds4_cuda_tensor *fnrm = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    ds4_cuda_tensor *fspl = ds4_cuda_tensor_alloc(mix_dim * sizeof(float));
+    ds4_cuda_tensor *rl   = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+    ds4_cuda_tensor *rs   = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+    ds4_cuda_tensor *rw   = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+    ds4_cuda_tensor *rp   = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+    ds4_cuda_tensor *rout = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    ds4_cuda_tensor *rg   = ds4_cuda_tensor_alloc(pair_rows_g * down_in_dim_g * sizeof(float));
+    ds4_cuda_tensor *ru   = ds4_cuda_tensor_alloc(pair_rows_g * down_in_dim_g * sizeof(float));
+    ds4_cuda_tensor *rm   = ds4_cuda_tensor_alloc(pair_rows_g * down_in_dim_g * sizeof(float));
+    ds4_cuda_tensor *re   = ds4_cuda_tensor_alloc(pair_rows_g * routed_out_dim_g * sizeof(float));
+    ds4_cuda_tensor *sg   = ds4_cuda_tensor_alloc(shared_dim_g * sizeof(float));
+    ds4_cuda_tensor *su   = ds4_cuda_tensor_alloc(shared_dim_g * sizeof(float));
+    ds4_cuda_tensor *sm   = ds4_cuda_tensor_alloc(shared_dim_g * sizeof(float));
+    ds4_cuda_tensor *so   = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    ds4_cuda_tensor *of   = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+    ds4_cuda_tensor *opre = ds4_cuda_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
+    ds4_cuda_tensor *ow   = ds4_cuda_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
+    ds4_cuda_tensor *oemb = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    ds4_cuda_tensor *onrm = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    ds4_cuda_tensor *olg  = ds4_cuda_tensor_alloc((uint64_t)DS4_N_VOCAB * sizeof(float));
+
+    int rc = 0;
+    if (!cur || !nxt || !flat || !mix || !acur || !anrm || !spl || !qr || !qrn ||
+        !q || !kvr || !kv || !rkv || !hd || !aout || !low || !gtmp || !ltmp ||
+        !aatt || !ckvd || !cmkd || !pv || !cv || !fflat || !fmix || !fcur || !fnrm ||
+        !fspl || !rl || !rs || !rw || !rp || !rout || !rg || !ru || !rm || !re ||
+        !sg || !su || !sm || !so || !of || !opre || !ow || !oemb || !onrm || !olg) {
+        rc = 1;
+        goto cleanup;
+    }
+
+    /* Zero raw KV cache + dummies. */
+    {
+        const float zero = 0.0f;
+        for (uint32_t r = 0; r < DS4_N_SWA; r++) {
+            for (uint32_t i = 0; i < DS4_N_HEAD_DIM; i++) {
+                ds4_cuda_tensor_write(rkv,
+                                      ((uint64_t)r * DS4_N_HEAD_DIM + i) * sizeof(float),
+                                      &zero, sizeof(float));
+            }
+        }
+        ds4_cuda_tensor_write(ckvd, 0, &zero, sizeof(float));
+        ds4_cuda_tensor_write(cmkd, 0, &zero, sizeof(float));
+    }
+
+    /* Embed token. */
+    {
+        int ok = ds4_cuda_begin_commands();
+        if (ok) ok = ds4_cuda_embed_token_hc_tensor(
+                        cur, e->model.map, e->model.size,
+                        weights->token_embd->abs_offset,
+                        DS4_N_VOCAB, (uint32_t)token,
+                        DS4_N_EMBD, DS4_N_HC);
+        if (ok) ok = ds4_cuda_end_commands();
+        if (!ok) { rc = 1; goto cleanup; }
+    }
+
+    /* 43-layer loop. */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *L = &weights->layer[il];
+        const uint32_t pos = 0u;
+        const float fb  = layer_rope_freq_base(il);
+        const float fs  = layer_rope_freq_scale(il);
+        const bool  cmp = ds4_layer_compress_ratio(il) != 0;
+        const float ef  = cmp && DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
+        float       af  = 1.0f;
+        if (ef != 0.0f && fs > 0.0f) af /= 1.0f + 0.1f * logf(1.0f / fs);
+        const uint32_t nco = (uint32_t)(cmp ? DS4_ROPE_ORIG_CTX : 0);
+        const uint64_t gate_row_b    = routed_expert_row_bytes(L->ffn_gate_exps);
+        const uint64_t gate_expert_b = expert_mid_dim_g * gate_row_b;
+        const uint64_t down_row_b    = routed_expert_row_bytes(L->ffn_down_exps);
+        const uint64_t down_expert_b = routed_out_dim_g * down_row_b;
+        const bool     hbias = L->ffn_exp_probs_b != NULL;
+        const bool     hhash = L->ffn_gate_tid2eid != NULL;
+        const uint64_t boff  = hbias ? L->ffn_exp_probs_b->abs_offset : 0;
+        const uint64_t hoff  = hhash ? L->ffn_gate_tid2eid->abs_offset : 0;
+        const uint32_t hrows = hhash ? (uint32_t)L->ffn_gate_tid2eid->dim[1] : 0;
+
+        int ok = ds4_cuda_begin_commands();
+        if (ok) ok = ds4_cuda_rms_norm_plain_tensor(flat, cur, (uint32_t)hc_dim, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_matmul_f16_tensor(mix, e->model.map, e->model.size,
+                                                 L->hc_attn_fn->abs_offset,
+                                                 hc_dim, mix_dim, flat, 1u);
+        if (ok) ok = ds4_cuda_hc_split_weighted_sum_norm_tensor(
+                        acur, anrm, spl, mix, cur, e->model.map, e->model.size,
+                        L->hc_attn_scale->abs_offset, L->hc_attn_base->abs_offset,
+                        L->attn_norm->abs_offset, DS4_N_EMBD, DS4_N_HC,
+                        DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_matmul_q8_0_tensor(qr, e->model.map, e->model.size,
+                                                  L->attn_q_a->abs_offset,
+                                                  DS4_N_EMBD, 1024u, anrm, 1u);
+        if (ok) ok = ds4_cuda_rms_norm_weight_tensor(qrn, qr, e->model.map, e->model.size,
+                                                      L->attn_q_a_norm->abs_offset,
+                                                      1024u, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_matmul_q8_0_tensor(q, e->model.map, e->model.size,
+                                                  L->attn_q_b->abs_offset,
+                                                  1024u, q_dim, qrn, 1u);
+        if (ok) ok = ds4_cuda_head_rms_norm_tensor(q, 1u, DS4_N_HEAD,
+                                                    DS4_N_HEAD_DIM, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_matmul_q8_0_tensor(kvr, e->model.map, e->model.size,
+                                                  L->attn_kv->abs_offset,
+                                                  DS4_N_EMBD, kv_dim, anrm, 1u);
+        if (ok) ok = ds4_cuda_rms_norm_weight_tensor(kv, kvr, e->model.map, e->model.size,
+                                                      L->attn_kv_a_norm->abs_offset,
+                                                      (uint32_t)kv_dim, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_rope_tail_tensor(q, 1u, DS4_N_HEAD,
+                                                DS4_N_HEAD_DIM, DS4_N_ROT,
+                                                pos, nco, false, fb, fs, ef, af,
+                                                DS4_ROPE_YARN_BETA_FAST,
+                                                DS4_ROPE_YARN_BETA_SLOW);
+        if (ok) ok = ds4_cuda_rope_tail_tensor(kv, 1u, DS4_N_HEAD_KV,
+                                                DS4_N_HEAD_DIM, DS4_N_ROT,
+                                                pos, nco, false, fb, fs, ef, af,
+                                                DS4_ROPE_YARN_BETA_FAST,
+                                                DS4_ROPE_YARN_BETA_SLOW);
+        if (ok) ok = ds4_cuda_kv_fp8_store_raw_tensor(kv, rkv, DS4_N_SWA, 0u,
+                                                       DS4_N_HEAD_DIM, DS4_N_ROT);
+        if (ok) ok = ds4_cuda_attention_decode_heads_tensor(
+                        hd, e->model.map, e->model.size,
+                        L->attn_sinks->abs_offset, q, rkv,
+                        1u, DS4_N_SWA, 0u, ckvd, 0u, cmkd, 0u,
+                        DS4_N_HEAD, DS4_N_HEAD_DIM);
+        if (ok) ok = ds4_cuda_rope_tail_tensor(hd, 1u, DS4_N_HEAD,
+                                                DS4_N_HEAD_DIM, DS4_N_ROT,
+                                                pos, nco, true, fb, fs, ef, af,
+                                                DS4_ROPE_YARN_BETA_FAST,
+                                                DS4_ROPE_YARN_BETA_SLOW);
+        if (ok) ok = ds4_cuda_attention_output_q8_batch_tensor(
+                        aout, low, gtmp, ltmp, e->model.map, e->model.size,
+                        L->attn_output_a->abs_offset, L->attn_output_b->abs_offset,
+                        4096u, 1024u, 8u, DS4_N_EMBD, hd, 1u);
+        if (ok) ok = ds4_cuda_hc_expand_tensor(aatt, aout, cur, pv, cv,
+                                                DS4_N_EMBD, DS4_N_HC);
+        if (ok) ok = ds4_cuda_rms_norm_plain_tensor(fflat, aatt,
+                                                     (uint32_t)hc_dim, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_matmul_f16_tensor(fmix, e->model.map, e->model.size,
+                                                 L->hc_ffn_fn->abs_offset,
+                                                 hc_dim, mix_dim, fflat, 1u);
+        if (ok) ok = ds4_cuda_hc_split_weighted_sum_norm_tensor(
+                        fcur, fnrm, fspl, fmix, aatt, e->model.map, e->model.size,
+                        L->hc_ffn_scale->abs_offset, L->hc_ffn_base->abs_offset,
+                        L->ffn_norm->abs_offset, DS4_N_EMBD, DS4_N_HC,
+                        DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_matmul_f16_tensor(rl, e->model.map, e->model.size,
+                                                 L->ffn_gate_inp->abs_offset,
+                                                 DS4_N_EMBD, DS4_N_EXPERT, fnrm, 1u);
+        if (ok) ok = ds4_cuda_router_select_tensor(
+                        rs, rw, rp, e->model.map, e->model.size,
+                        boff, hoff, hrows, (uint32_t)token,
+                        0u, 0u, hbias, hhash, rl);
+        if (ok) ok = ds4_cuda_routed_moe_one_tensor(
+                        rout, rg, ru, rm, re,
+                        e->model.map, e->model.size,
+                        L->ffn_gate_exps->abs_offset, L->ffn_up_exps->abs_offset,
+                        L->ffn_down_exps->abs_offset,
+                        L->ffn_gate_exps->type, L->ffn_down_exps->type,
+                        gate_expert_b, gate_row_b, down_expert_b, down_row_b,
+                        (uint32_t)expert_in_dim_g, (uint32_t)down_in_dim_g,
+                        (uint32_t)routed_out_dim_g, rs, rw,
+                        DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, fnrm);
+        if (ok) ok = ds4_cuda_shared_gate_up_swiglu_q8_0_tensor(
+                        sg, su, sm, e->model.map, e->model.size,
+                        L->ffn_gate_shexp->abs_offset, L->ffn_up_shexp->abs_offset,
+                        DS4_N_EMBD, shared_dim_g, fnrm);
+        if (ok) ok = ds4_cuda_shared_down_hc_expand_q8_0_tensor(
+                        nxt, so, e->model.map, e->model.size,
+                        L->ffn_down_shexp->abs_offset,
+                        shared_dim_g, DS4_N_EMBD,
+                        sm, rout, aatt, fspl, DS4_N_EMBD, DS4_N_HC);
+        if (ok) ok = ds4_cuda_end_commands();
+        if (!ok) { rc = 1; goto cleanup; }
+
+        ds4_cuda_tensor *tmp = cur; cur = nxt; nxt = tmp;
+    }
+
+    /* Output head. */
+    {
+        int ok = ds4_cuda_begin_commands();
+        if (ok) ok = ds4_cuda_rms_norm_plain_tensor(of, cur, (uint32_t)hc_dim, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_matmul_f16_tensor(opre, e->model.map, e->model.size,
+                                                 weights->output_hc_fn->abs_offset,
+                                                 hc_dim, DS4_N_HC, of, 1u);
+        if (ok) ok = ds4_cuda_output_hc_weights_tensor(
+                        ow, opre, e->model.map, e->model.size,
+                        weights->output_hc_scale->abs_offset,
+                        weights->output_hc_base->abs_offset,
+                        DS4_N_HC, DS4_HC_EPS);
+        if (ok) ok = ds4_cuda_hc_weighted_sum_tensor(oemb, cur, ow,
+                                                      DS4_N_EMBD, DS4_N_HC);
+        if (ok) ok = ds4_cuda_rms_norm_weight_tensor(onrm, oemb,
+                                                      e->model.map, e->model.size,
+                                                      weights->output_norm->abs_offset,
+                                                      DS4_N_EMBD, DS4_RMS_EPS);
+        if (ok) ok = ds4_cuda_matmul_q8_0_tensor(olg, e->model.map, e->model.size,
+                                                  weights->output->abs_offset,
+                                                  DS4_N_EMBD, DS4_N_VOCAB, onrm, 1u);
+        if (ok) ok = ds4_cuda_end_commands();
+        if (!ok) { rc = 1; goto cleanup; }
+    }
+
+    if (!ds4_cuda_tensor_read(olg, 0, logits_out,
+                              (size_t)DS4_N_VOCAB * sizeof(float))) {
+        rc = 1;
+    }
+
+cleanup:
+    ds4_cuda_tensor_free(olg); ds4_cuda_tensor_free(onrm); ds4_cuda_tensor_free(oemb);
+    ds4_cuda_tensor_free(ow); ds4_cuda_tensor_free(opre); ds4_cuda_tensor_free(of);
+    ds4_cuda_tensor_free(so); ds4_cuda_tensor_free(sm); ds4_cuda_tensor_free(su); ds4_cuda_tensor_free(sg);
+    ds4_cuda_tensor_free(re); ds4_cuda_tensor_free(rm); ds4_cuda_tensor_free(ru); ds4_cuda_tensor_free(rg);
+    ds4_cuda_tensor_free(rout); ds4_cuda_tensor_free(rp); ds4_cuda_tensor_free(rw);
+    ds4_cuda_tensor_free(rs); ds4_cuda_tensor_free(rl);
+    ds4_cuda_tensor_free(fspl); ds4_cuda_tensor_free(fnrm); ds4_cuda_tensor_free(fcur);
+    ds4_cuda_tensor_free(fmix); ds4_cuda_tensor_free(fflat);
+    ds4_cuda_tensor_free(cv); ds4_cuda_tensor_free(pv);
+    ds4_cuda_tensor_free(cmkd); ds4_cuda_tensor_free(ckvd);
+    ds4_cuda_tensor_free(aatt); ds4_cuda_tensor_free(ltmp); ds4_cuda_tensor_free(gtmp);
+    ds4_cuda_tensor_free(low); ds4_cuda_tensor_free(aout); ds4_cuda_tensor_free(hd);
+    ds4_cuda_tensor_free(rkv); ds4_cuda_tensor_free(kv); ds4_cuda_tensor_free(kvr);
+    ds4_cuda_tensor_free(q); ds4_cuda_tensor_free(qrn); ds4_cuda_tensor_free(qr);
+    ds4_cuda_tensor_free(spl); ds4_cuda_tensor_free(anrm); ds4_cuda_tensor_free(acur);
+    ds4_cuda_tensor_free(mix); ds4_cuda_tensor_free(flat);
+    ds4_cuda_tensor_free(nxt); ds4_cuda_tensor_free(cur);
+    return rc;
+}
+#endif
+
+int ds4_engine_cuda_test_vectors_test(ds4_engine *e, const char *vec_path) {
+#ifndef DS4_USE_CUDA
+    (void)e; (void)vec_path;
+    fprintf(stderr, "ds4: cuda_test_vectors requires a build with DS4_USE_CUDA\n");
+    return 1;
+#else
+    if (!e->cuda_ready) {
+        fprintf(stderr, "ds4: cuda_test_vectors requires the CUDA backend\n");
+        return 1;
+    }
+    if (!vec_path || !vec_path[0]) vec_path = "tests/test-vectors/official.vec";
+
+    FILE *fp = fopen(vec_path, "rb");
+    if (!fp) {
+        fprintf(stderr, "ds4: cuda_test_vectors cannot open '%s'\n", vec_path);
+        return 1;
+    }
+
+    fprintf(stderr,
+            "ds4: 2.1d test-vectors (Option B / fresh-cache) — vec=%s\n"
+            "ds4: NOTE: fresh-cache mode runs only the LAST prompt token through\n"
+            "ds4:       the model with no prior context (KV cache empty); step-0\n"
+            "ds4:       agreement vs API is generally NOT expected for non-trivial\n"
+            "ds4:       prompts.  See tmp/PHASE-2.1d-PLAN.md for Option A path.\n",
+            vec_path);
+
+    int total_cases     = 0;
+    int top1_match      = 0;
+    int topk_overlap_sum = 0;
+    int topk_total      = 0;
+
+    char line[2048];
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (!*p || *p == '#') continue;
+
+        char id[96];
+        int  ctx_unused = 0;
+        int  nsteps = 0;
+        char prompt_path[512];
+        if (sscanf(p, "case %95s %d %d %511s", id, &ctx_unused, &nsteps, prompt_path) != 4) {
+            continue;
+        }
+
+        char *prompt_text = cuda_2_1d_read_file(prompt_path);
+        if (!prompt_text) {
+            fprintf(stderr, "ds4: 2.1d case %s — cannot read prompt '%s', skipping\n",
+                    id, prompt_path);
+            continue;
+        }
+
+        ds4_tokens prompt = {0};
+        ds4_encode_chat_prompt(e, "", prompt_text, DS4_THINK_NONE, &prompt);
+        free(prompt_text);
+        if (prompt.len <= 0) {
+            fprintf(stderr, "ds4: 2.1d case %s — empty prompt after encoding\n", id);
+            ds4_tokens_free(&prompt);
+            continue;
+        }
+        const int last_tok = prompt.v[prompt.len - 1];
+
+        float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+        if (cuda_2_1d_fresh_cache_logits(e, last_tok, logits) != 0) {
+            fprintf(stderr, "ds4: 2.1d case %s — fresh-cache forward failed\n", id);
+            free(logits);
+            ds4_tokens_free(&prompt);
+            continue;
+        }
+
+        /* Compute top-K (top 20) by IDs and logits, then logprobs. */
+        const int K = 20;
+        int   top_id[20];
+        float top_logit[20];
+        for (int k = 0; k < K; k++) { top_id[k] = -1; top_logit[k] = -INFINITY; }
+        for (int v = 0; v < DS4_N_VOCAB; v++) {
+            const float lv = logits[v];
+            for (int k = 0; k < K; k++) {
+                if (top_id[k] < 0 || lv > top_logit[k]) {
+                    for (int j = K - 1; j > k; j--) {
+                        top_id[j] = top_id[j - 1];
+                        top_logit[j] = top_logit[j - 1];
+                    }
+                    top_id[k] = v;
+                    top_logit[k] = lv;
+                    break;
+                }
+            }
+        }
+
+        /* logsumexp for logprobs. */
+        float lmax = top_logit[0];
+        double lse = 0.0;
+        for (int v = 0; v < DS4_N_VOCAB; v++) {
+            lse += exp((double)logits[v] - (double)lmax);
+        }
+        const float log_z = lmax + (float)log(lse);
+        float top_logprob[20];
+        for (int k = 0; k < K; k++) top_logprob[k] = top_logit[k] - log_z;
+
+        /* Read step rows for this case; capture step 0 expected. */
+        unsigned char selected_bytes[128];
+        int           selected_len = 0;
+        int           official_ntop = 0;
+        struct {
+            unsigned char bytes[128];
+            int           len;
+            float         logprob;
+        } official_top[32];
+
+        bool got_step0 = false;
+        int step_idx = -1;
+        int top_idx_in_step = 0;
+
+        while (fgets(line, sizeof(line), fp)) {
+            char *q1 = line;
+            while (*q1 && isspace((unsigned char)*q1)) q1++;
+            size_t qlen = strlen(q1);
+            while (qlen && isspace((unsigned char)q1[qlen - 1])) q1[--qlen] = '\0';
+            if (!q1[0] || q1[0] == '#') continue;
+            if (!strcmp(q1, "end")) break;
+
+            if (!strncmp(q1, "step ", 5)) {
+                int idx = -1, ntop = 0;
+                char hex[300] = {0};
+                if (sscanf(q1, "step %d %255s %d", &idx, hex, &ntop) != 3) continue;
+                step_idx = idx;
+                if (idx == 0) {
+                    if (!cuda_2_1d_hex_to_bytes(hex, selected_bytes, 128, &selected_len)) {
+                        selected_len = 0;
+                    }
+                    if (ntop < 0) ntop = 0;
+                    if (ntop > 32) ntop = 32;
+                    official_ntop = ntop;
+                    top_idx_in_step = 0;
+                }
+            } else if (!strncmp(q1, "top ", 4)) {
+                if (step_idx == 0 && top_idx_in_step < official_ntop) {
+                    char hex[300] = {0};
+                    float lp = 0.0f;
+                    if (sscanf(q1, "top %255s %f", hex, &lp) == 2) {
+                        int len = 0;
+                        if (cuda_2_1d_hex_to_bytes(hex, official_top[top_idx_in_step].bytes,
+                                                   128, &len)) {
+                            official_top[top_idx_in_step].len = len;
+                            official_top[top_idx_in_step].logprob = lp;
+                            top_idx_in_step++;
+                            if (top_idx_in_step == official_ntop) got_step0 = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!got_step0) {
+            fprintf(stderr, "ds4: 2.1d case %s — no step 0 found, skipping\n", id);
+            free(logits);
+            ds4_tokens_free(&prompt);
+            continue;
+        }
+
+        total_cases++;
+
+        /* Compare top-1: is CUDA's argmax token bytes == official selected? */
+        size_t cuda_top1_len = 0;
+        char *cuda_top1_text = ds4_token_text(e, top_id[0], &cuda_top1_len);
+        bool t1_match = (cuda_top1_text &&
+                         (size_t)selected_len == cuda_top1_len &&
+                         memcmp(cuda_top1_text, selected_bytes, selected_len) == 0);
+        if (t1_match) top1_match++;
+
+        /* Top-K overlap: how many official top entries appear in CUDA's top 20. */
+        int overlap = 0;
+        for (int i = 0; i < official_ntop; i++) {
+            for (int j = 0; j < K; j++) {
+                size_t cl = 0;
+                char *ct = ds4_token_text(e, top_id[j], &cl);
+                bool eq = (ct && cl == (size_t)official_top[i].len &&
+                           memcmp(ct, official_top[i].bytes, cl) == 0);
+                free(ct);
+                if (eq) { overlap++; break; }
+            }
+        }
+        topk_overlap_sum += overlap;
+        topk_total += official_ntop;
+
+        /* (Logprob comparison for selected token would require a within-top-K
+         * lookup; deferred — selected may not be in CUDA's top-20 in fresh-cache
+         * mode, in which case logprob comparison isn't meaningful anyway.) */
+
+        /* Render printable preview of selected & cuda top-1 token bytes (escape non-printables). */
+        char sel_repr[256], cuda_repr[256];
+        size_t sr = 0, cr = 0;
+        for (int i = 0; i < selected_len && sr + 4 < sizeof(sel_repr); i++) {
+            unsigned char c = selected_bytes[i];
+            if (c >= 0x20 && c < 0x7f && c != '\\' && c != '"') sel_repr[sr++] = (char)c;
+            else { sr += (size_t)snprintf(&sel_repr[sr], sizeof(sel_repr) - sr, "\\x%02x", c); }
+        }
+        sel_repr[sr] = '\0';
+        for (size_t i = 0; i < cuda_top1_len && cr + 4 < sizeof(cuda_repr); i++) {
+            unsigned char c = (unsigned char)cuda_top1_text[i];
+            if (c >= 0x20 && c < 0x7f && c != '\\' && c != '"') cuda_repr[cr++] = (char)c;
+            else { cr += (size_t)snprintf(&cuda_repr[cr], sizeof(cuda_repr) - cr, "\\x%02x", c); }
+        }
+        cuda_repr[cr] = '\0';
+
+        fprintf(stderr,
+                "ds4: 2.1d case %s prompt_len=%d last_tok=%d:  "
+                "official_step0=\"%s\" (logprob=%.4f, ntop=%d)  "
+                "cuda_top1=\"%s\" id=%d logit=%.4f logprob=%.4f  "
+                "top1_match=%d  topK_overlap=%d/%d\n",
+                id, prompt.len, last_tok,
+                sel_repr, official_top[0].logprob, official_ntop,
+                cuda_repr, top_id[0], top_logit[0], top_logprob[0],
+                t1_match ? 1 : 0, overlap, official_ntop);
+
+        free(cuda_top1_text);
+        free(logits);
+        ds4_tokens_free(&prompt);
+    }
+
+    fclose(fp);
+
+    fprintf(stderr,
+            "ds4: 2.1d test-vectors aggregate: %d cases — "
+            "top1 %d/%d (%.1f%%), topK overlap %d/%d (%.1f%%)  "
+            "[fresh-cache mode; no prefill context]\n",
+            total_cases,
+            top1_match, total_cases,
+            total_cases > 0 ? 100.0 * (double)top1_match / (double)total_cases : 0.0,
+            topk_overlap_sum, topk_total,
+            topk_total > 0 ? 100.0 * (double)topk_overlap_sum / (double)topk_total : 0.0);
+
+    return 0;  /* informational; no gate (fresh-cache mode is degenerate by design). */
+#endif
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
