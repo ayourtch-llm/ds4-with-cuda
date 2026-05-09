@@ -1928,7 +1928,8 @@ int ds4_cuda_compressor_prefill_ratio4_replay_tensor(
     (void)beta_fast; (void)beta_slow; (void)rms_eps;
     return ds4_cuda_kernel_stub("ds4_cuda_compressor_prefill_ratio4_replay_tensor");
 }
-DS4_CUDA_STUB(ds4_cuda_compressor_prefill_state_ratio4_tensor, (ds4_cuda_tensor *, ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, const void *, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t))
+/* ds4_cuda_compressor_prefill_state_ratio4_tensor implemented in the
+ * Phase 3a compressor section at the bottom of this file. */
 /* ds4_cuda_attention_decode_heads_tensor implemented in the Phase 1.5
  * section at the bottom of this file. */
 /* ds4_cuda_attention_prefill_raw_heads_tensor is implemented in the m3
@@ -6183,6 +6184,104 @@ int ds4_cuda_compressor_update_tensor(
     }
 
     return 1;
+}
+
+} /* extern "C" */
+
+/* compressor_prefill_state_ratio4 — tail-state finalizer for ratio=4
+ * prefill.  Initializes the 8-row recurrent state from a 4-row "tail"
+ * (kv_tail / sc_tail) holding the most recent 4 tokens that haven't yet
+ * crossed an emit boundary.  Layout per the Metal source ds4_metal.m:7634:
+ *
+ *   rows 0..3 of state ← kv_tail / sc_tail-with-APE-correction
+ *   rows 4..7 of state ← (state_kv = 0, state_score = -INFINITY)
+ *
+ * For rows 0..3, score gets `+ ape[((pos0 + r) % ratio) * width + d]`
+ * baked in the same way compressor_store_one does (this is the "projected
+ * set_rows" path in Metal).  CUDA fuses Metal's 2-stage dispatch (fill +
+ * set_rows_projected) into a single per-element kernel. */
+static __global__ void ds4_cuda_compressor_prefill_state_ratio4_kernel(
+        float       *state_kv,
+        float       *state_score,
+        const float *kv_tail,
+        const float *sc_tail,
+        const void  *ape,
+        uint32_t     width,
+        uint32_t     pos0,
+        uint32_t     ape_type) {
+    constexpr uint32_t ratio = 4u;
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t r = blockIdx.y;
+    if (d >= width || r >= 8u) return;
+
+    const uint64_t dst = (uint64_t)r * width + d;
+    if (r < ratio) {
+        /* Projected write: kv_tail[r, d] → state_kv[r, d];
+         * sc_tail[r, d] + ape[((pos0+r)%4) * width + d] → state_score[r, d]. */
+        const uint32_t ape_pos = (pos0 + r) % ratio;
+        const uint64_t ape_i = (uint64_t)ape_pos * width + d;
+        float ape_v;
+        if (ape_type == 1u) {
+            ape_v = __half2float(((const __half *)ape)[ape_i]);
+        } else {
+            ape_v = ((const float *)ape)[ape_i];
+        }
+        state_kv   [dst] = kv_tail[(uint64_t)r * width + d];
+        state_score[dst] = sc_tail[(uint64_t)r * width + d] + ape_v;
+    } else {
+        state_kv   [dst] = 0.0f;
+        state_score[dst] = -INFINITY;
+    }
+}
+
+extern "C" {
+
+int ds4_cuda_compressor_prefill_state_ratio4_tensor(
+        ds4_cuda_tensor       *state_kv,
+        ds4_cuda_tensor       *state_score,
+        const ds4_cuda_tensor *kv_tail,
+        const ds4_cuda_tensor *sc_tail,
+        const void            *model_map,
+        uint64_t               model_size,
+        uint64_t               ape_offset,
+        uint32_t               ape_type,
+        uint32_t               head_dim,
+        uint32_t               pos0) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (!state_kv || !state_score || !kv_tail || !sc_tail || !model_map ||
+        head_dim == 0u || (ape_type != 0u && ape_type != 1u)) return 0;
+
+    constexpr uint32_t ratio = 4u;
+    const uint32_t width = 2u * head_dim;
+    const uint32_t state_rows = 8u;
+    const uint64_t tail_bytes  = (uint64_t)ratio * width * sizeof(float);
+    const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
+    const uint64_t elem_ape    = (ape_type == 1u) ? 2u : 4u;
+    const uint64_t ape_bytes   = (uint64_t)ratio * width * elem_ape;
+
+    if (ape_offset > model_size || ape_bytes > model_size - ape_offset) {
+        fprintf(stderr,
+                "ds4: CUDA compressor_prefill_state_ratio4 APE range outside mapped model\n");
+        return 0;
+    }
+
+    void *st_kv_ptr = NULL, *st_sc_ptr = NULL, *kv_ptr = NULL, *sc_ptr = NULL;
+    if (!ds4_cuda_tensor_range(state_kv,    state_bytes, "prefill_state state_kv",    &st_kv_ptr)) return 0;
+    if (!ds4_cuda_tensor_range(state_score, state_bytes, "prefill_state state_score", &st_sc_ptr)) return 0;
+    if (!ds4_cuda_tensor_range(kv_tail,     tail_bytes,  "prefill_state kv_tail",     &kv_ptr))    return 0;
+    if (!ds4_cuda_tensor_range(sc_tail,     tail_bytes,  "prefill_state sc_tail",     &sc_ptr))    return 0;
+
+    const void *ape_ptr = (const uint8_t *)model_map + ape_offset;
+
+    constexpr uint32_t block_x = 256u;
+    dim3 block(block_x, 1u, 1u);
+    dim3 grid((width + block_x - 1u) / block_x, state_rows, 1u);
+    ds4_cuda_compressor_prefill_state_ratio4_kernel<<<grid, block, 0, g_stream>>>(
+        (float *)st_kv_ptr, (float *)st_sc_ptr,
+        (const float *)kv_ptr, (const float *)sc_ptr, ape_ptr,
+        width, pos0, ape_type);
+    return ds4_cuda_check(cudaGetLastError(), "launch compressor_prefill_state_ratio4");
 }
 
 } /* extern "C" */

@@ -4747,6 +4747,120 @@ DS4_CUDA_PARITY_TEST(compressor_update_r4_no_emit,
     .cfg = (void *)&compressor_update_r4_no_emit_cfg);
 
 /* ---------------------------------------------------------------------------
+ * Phase 3a-3 — compressor_prefill_state_ratio4 (tail-state finalizer).
+ *
+ * Initializes the 8-row recurrent state from a 4-row "tail" + APE
+ * correction.  CPU oracle: per (row, dim) — for r in 0..3, write
+ * kv_tail[r, d] / sc_tail[r, d] + ape[((pos0+r)%4) * width + d]; for
+ * r in 4..7, write 0.0 / -INFINITY.  Bit-exact expected (single ADD
+ * per element).
+ * --------------------------------------------------------------------------- */
+
+struct compressor_prefill_state_cfg {
+    uint32_t head_dim;
+    uint32_t pos0;
+    uint32_t ape_type;     /* 0 = f32 only for simplicity */
+};
+
+/* Layout in `in`:
+ *   kv_tail : 4 * width   (width = 2*head_dim)
+ *   sc_tail : 4 * width
+ *   ape     : 4 * width   (f32)
+ * Output: state_kv (8*width) | state_score (8*width). */
+
+static int compressor_prefill_state_cpu(const float *in, float *out, void *cfg) {
+    const struct compressor_prefill_state_cfg *c = cfg;
+    const uint32_t width = 2u * c->head_dim;
+    const uint32_t ratio = 4u;
+    const size_t tail_n = (size_t)ratio * width;
+    const float *kv_tail = in;
+    const float *sc_tail = kv_tail + tail_n;
+    const float *ape     = sc_tail + tail_n;
+
+    float *state_kv  = out;
+    float *state_sc  = out + (size_t)8u * width;
+    for (uint32_t r = 0; r < 8u; r++) {
+        for (uint32_t d = 0; d < width; d++) {
+            const size_t dst = (size_t)r * width + d;
+            if (r < ratio) {
+                const uint32_t ape_pos = (c->pos0 + r) % ratio;
+                const float ape_v = ape[(size_t)ape_pos * width + d];
+                state_kv[dst] = kv_tail[(size_t)r * width + d];
+                state_sc[dst] = sc_tail[(size_t)r * width + d] + ape_v;
+            } else {
+                state_kv[dst] = 0.0f;
+                state_sc[dst] = -INFINITY;
+            }
+        }
+    }
+    return 1;
+}
+
+static int compressor_prefill_state_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                         size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct compressor_prefill_state_cfg *c = cfg;
+    const uint32_t width = 2u * c->head_dim;
+    const uint32_t ratio = 4u;
+    const size_t tail_n  = (size_t)ratio * width;
+    const size_t state_n = (size_t)8u * width;
+    const float *kv_tail = in;
+    const float *sc_tail = kv_tail + tail_n;
+    const float *ape     = sc_tail + tail_n;
+
+    ds4_cuda_tensor *kv_dev    = ds4_cuda_tensor_alloc((uint64_t)tail_n  * sizeof(float));
+    ds4_cuda_tensor *sc_dev    = ds4_cuda_tensor_alloc((uint64_t)tail_n  * sizeof(float));
+    ds4_cuda_tensor *st_kv_dev = ds4_cuda_tensor_alloc((uint64_t)state_n * sizeof(float));
+    ds4_cuda_tensor *st_sc_dev = ds4_cuda_tensor_alloc((uint64_t)state_n * sizeof(float));
+    ds4_cuda_tensor *model_dev = ds4_cuda_tensor_alloc((uint64_t)tail_n  * sizeof(float));
+    if (!kv_dev || !sc_dev || !st_kv_dev || !st_sc_dev || !model_dev) {
+        ds4_cuda_tensor_free(kv_dev);    ds4_cuda_tensor_free(sc_dev);
+        ds4_cuda_tensor_free(st_kv_dev); ds4_cuda_tensor_free(st_sc_dev);
+        ds4_cuda_tensor_free(model_dev); return 0;
+    }
+    int ok = ds4_cuda_tensor_write(kv_dev,    0, kv_tail, (uint64_t)tail_n  * sizeof(float))
+          && ds4_cuda_tensor_write(sc_dev,    0, sc_tail, (uint64_t)tail_n  * sizeof(float))
+          && ds4_cuda_tensor_write(model_dev, 0, ape,     (uint64_t)tail_n  * sizeof(float));
+
+    const void *fake_model_map = ds4_cuda_tensor_contents(model_dev);
+    const uint64_t fake_model_size = (uint64_t)tail_n * sizeof(float);
+
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_compressor_prefill_state_ratio4_tensor(
+                    st_kv_dev, st_sc_dev, kv_dev, sc_dev,
+                    fake_model_map, fake_model_size, /*ape_offset=*/0,
+                    c->ape_type, c->head_dim, c->pos0);
+    if (ok) {
+        ok = ds4_cuda_tensor_copy(out_dev, 0,                                       st_kv_dev, 0, (uint64_t)state_n * sizeof(float))
+          && ds4_cuda_tensor_copy(out_dev, (uint64_t)state_n * sizeof(float),       st_sc_dev, 0, (uint64_t)state_n * sizeof(float));
+    }
+    if (ok) ok = ds4_cuda_end_commands();
+
+    ds4_cuda_tensor_free(kv_dev);    ds4_cuda_tensor_free(sc_dev);
+    ds4_cuda_tensor_free(st_kv_dev); ds4_cuda_tensor_free(st_sc_dev);
+    ds4_cuda_tensor_free(model_dev);
+    return ok;
+}
+
+/* DS4 production: head_dim=128.  pos0=5 → ape_pos cycles 1,2,3,0 over r=0..3
+ * (exercises the modular APE indexing). */
+static const struct compressor_prefill_state_cfg compressor_prefill_state_cfg_v = {
+    .head_dim = 128, .pos0 = 5, .ape_type = 0,
+};
+
+DS4_CUDA_PARITY_TEST(compressor_prefill_state_ratio4,
+    .seed = 0x53A4,
+    /* width=256, tail=4*256=1024 each.
+     *   kv_tail(1024) + sc_tail(1024) + ape(1024) = 3072 */
+    .in_elems  = 3072,
+    /* state_kv(8*256=2048) + state_score(2048) = 4096 */
+    .out_elems = 4096,
+    .ulp_tolerance = 0,
+    .cpu_fn = compressor_prefill_state_cpu,
+    .cuda_fn = compressor_prefill_state_cuda,
+    .cfg = (void *)&compressor_prefill_state_cfg_v);
+
+/* ---------------------------------------------------------------------------
  * Registry — order does not matter; failures are counted globally.
  * --------------------------------------------------------------------------- */
 
@@ -4817,6 +4931,7 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_compressor_store_batch_r4_f16,
     &ds4_cuda_parity_compressor_update_r4_emit,
     &ds4_cuda_parity_compressor_update_r4_no_emit,
+    &ds4_cuda_parity_compressor_prefill_state_ratio4,
     NULL,
 };
 
