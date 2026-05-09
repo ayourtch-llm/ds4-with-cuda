@@ -16366,6 +16366,30 @@ static bool cuda_graph_prefill_layer_major(
     return true;
 }
 
+/* Phase 7b Stage 1.2: dump final logits to disk for path-vs-path diff
+ * analysis.  Env var DS4_CUDA_DUMP_LOGITS_PATH=<path>; writes the
+ * DS4_N_VOCAB float32 logits buffer after prefill returns.  Used by the
+ * compare-prefill-paths script to validate the layer-major / per-token
+ * divergence is drift-class not corruption-class. */
+static void cuda_graph_maybe_dump_logits(const float *logits) {
+    const char *path = getenv("DS4_CUDA_DUMP_LOGITS_PATH");
+    if (!path || !path[0] || !logits) return;
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "ds4: cuda dump logits open '%s' failed\n", path);
+        return;
+    }
+    const size_t n = (size_t)DS4_N_VOCAB;
+    const size_t w = fwrite(logits, sizeof(float), n, f);
+    fclose(f);
+    if (w != n) {
+        fprintf(stderr, "ds4: cuda dump logits short write (%zu/%zu)\n", w, n);
+        return;
+    }
+    fprintf(stderr, "ds4: cuda dump logits %s (%zu floats = %zu bytes)\n",
+            path, n, n * sizeof(float));
+}
+
 /* Multi-token prefill.  Default: per-token loop (Phase 3b safe path).
  * With DS4_CUDA_LAYER_MAJOR=1 set, dispatches to the Phase 7 layer-major
  * batched orchestrator.  Stage D will flip the default once smoke +
@@ -16381,23 +16405,27 @@ static bool cuda_graph_prefill_chunked(
 
     const char *layer_major_env = getenv("DS4_CUDA_LAYER_MAJOR");
     const bool layer_major = layer_major_env && layer_major_env[0] == '1';
+    bool ok;
     if (layer_major) {
-        return cuda_graph_prefill_layer_major(g, model, weights, prompt,
-                                              n_tokens, logits);
-    }
-
-    for (int t = 0; t < n_tokens; t++) {
-        const bool last = (t == n_tokens - 1);
-        float *out_ptr = last ? logits : NULL;
-        if (!cuda_graph_eval_token_raw_swa(g, model, weights,
-                                           (uint32_t)prompt->v[t],
-                                           (uint32_t)t,
-                                           out_ptr))
-        {
-            return false;
+        ok = cuda_graph_prefill_layer_major(g, model, weights, prompt,
+                                            n_tokens, logits);
+    } else {
+        ok = true;
+        for (int t = 0; t < n_tokens; t++) {
+            const bool last = (t == n_tokens - 1);
+            float *out_ptr = last ? logits : NULL;
+            if (!cuda_graph_eval_token_raw_swa(g, model, weights,
+                                               (uint32_t)prompt->v[t],
+                                               (uint32_t)t,
+                                               out_ptr))
+            {
+                ok = false;
+                break;
+            }
         }
     }
-    return true;
+    if (ok) cuda_graph_maybe_dump_logits(logits);
+    return ok;
 }
 
 #endif /* DS4_USE_CUDA */
