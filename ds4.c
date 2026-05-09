@@ -20946,9 +20946,25 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
 #ifdef DS4_USE_CUDA
     if (s->engine->backend == DS4_BACKEND_CUDA) {
-        (void)probe_mtp;  /* MTP/spec deferred from Phase 3c. */
+        ds4_engine *ce = s->engine;
+        const bool mtp_probe_log_cu = getenv("DS4_MTP_PROBE") != NULL;
+        const bool mtp_should_draft_cu =
+            probe_mtp && ce->mtp_ready && s->mtp_logits &&
+            (ce->mtp_draft_tokens > 1 || mtp_probe_log_cu);
+        if (probe_mtp && s->mtp_draft_valid) {
+            if (mtp_probe_log_cu) {
+                s->mtp_probe_total++;
+                if (s->mtp_draft_token == token) s->mtp_probe_hit++;
+                fprintf(stderr,
+                        "ds4: cuda mtp probe token=%d draft=%d hit=%llu/%llu\n",
+                        token, s->mtp_draft_token,
+                        (unsigned long long)s->mtp_probe_hit,
+                        (unsigned long long)s->mtp_probe_total);
+            }
+            s->mtp_draft_valid = false;
+        }
         if (!cuda_graph_eval_token_raw_swa(&s->cuda_graph,
-                                           &s->engine->model, &s->engine->weights,
+                                           &ce->model, &ce->weights,
                                            (uint32_t)token,
                                            (uint32_t)s->checkpoint.len,
                                            s->logits))
@@ -20958,6 +20974,28 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             return 1;
         }
         token_vec_push(&s->checkpoint, token);
+        /* Phase 4 Step 6: MTP probe — recursive draft chain seed for the
+         * NEXT speculative_argmax call.  cuda_graph_eval_mtp_draft uses
+         * g->cur_hc as prev (the just-committed target HC) and writes
+         * into the supplied out_hc; we use g->mtp_state_hc to mirror
+         * Metal's pattern. */
+        if (mtp_should_draft_cu) {
+            int mtp_top = -1;
+            if (cuda_graph_eval_mtp_draft(&s->cuda_graph,
+                                          &ce->model, &ce->weights,
+                                          &ce->mtp_model, &ce->mtp_weights,
+                                          s->cuda_graph.mtp_state_hc,
+                                          token,
+                                          (uint32_t)(s->checkpoint.len - 1),
+                                          getenv("DS4_MTP_FULL_LOGITS") ? s->mtp_logits : NULL,
+                                          &mtp_top)) {
+                s->mtp_draft_token = mtp_top >= 0 ? mtp_top
+                                     : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
+                s->mtp_draft_valid = true;
+            } else if (mtp_probe_log_cu) {
+                fprintf(stderr, "ds4: cuda mtp probe draft failed\n");
+            }
+        }
         return 0;
     }
 #endif
@@ -21028,17 +21066,185 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
  *    prefix and rolling back speculative Metal state on miss;
  * 4. fall back to ordinary one-token decode if the fast verifier cannot prove
  *    the target stream. */
+#ifdef DS4_USE_CUDA
+/* Phase 4 Step 6: CUDA speculative-argmax driver.  Mirrors the Metal
+ * driver's STRICT decode2_exact path only.  Non-strict margin gating and
+ * N>2 verification require code that's CUDA-portable but not yet wired:
+ *   - margin-gate fallback: deferred to a follow-up (it's a single
+ *     cuda_graph_eval_token_raw_swa re-decode, ~30 lines).
+ *   - verify_suffix_tops: requires Phase 3b batched-prefill kernels (per
+ *     README:545); not yet ported.
+ * Falls back to "commit drafts[0] only" with a log line when N>2 or
+ * non-strict mode is requested.  Always correctness-safe: drafts[0] was
+ * verified for free by the target's argmax-after-prefix check. */
+static int cuda_session_eval_speculative_argmax_impl(
+        ds4_session *s, int first_token,
+        int max_tokens, int eos_token,
+        int *accepted, int accepted_cap,
+        char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+
+    if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    int n_accept = 0;
+    accepted[n_accept++] = first_token;
+    if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
+
+    if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
+
+    int draft_cap = e->mtp_draft_tokens;
+    if (draft_cap > max_tokens - n_accept) draft_cap = max_tokens - n_accept;
+    if (draft_cap > accepted_cap - n_accept) draft_cap = accepted_cap - n_accept;
+    int room = s->ctx_size - s->checkpoint.len;
+    if (draft_cap > room - 1) draft_cap = room - 1;
+    if (draft_cap <= 0) return n_accept;
+
+    int drafts[16];
+    int draft_n = 1;
+    drafts[0] = s->mtp_draft_token;
+    s->mtp_draft_valid = false;
+    const bool strict_mtp = e->quality || getenv("DS4_MTP_STRICT") != NULL;
+
+    /* The first proposed token is verified for free against the target
+     * decode that just produced s->logits.  If MTP disagrees, return only
+     * first_token. */
+    if (sample_argmax(s->logits, DS4_N_VOCAB) != drafts[0]) {
+        if (getenv("DS4_MTP_SPEC_LOG")) {
+            fprintf(stderr, "ds4: cuda mtp spec miss first draft=%d\n", drafts[0]);
+        }
+        return n_accept;
+    }
+    if (drafts[0] == eos_token) draft_cap = 1;
+    const uint32_t mtp_base_raw = s->cuda_graph.mtp_n_raw;
+#define DS4_CUDA_MTP_KEEP_ACCEPTED(n_) do { \
+        uint32_t keep_ = mtp_base_raw + (uint32_t)(n_); \
+        if (keep_ > s->cuda_graph.raw_window) keep_ = s->cuda_graph.raw_window; \
+        s->cuda_graph.mtp_n_raw = keep_; \
+    } while (0)
+
+    /* Build the recursive draft chain. */
+    for (; draft_n < draft_cap; draft_n++) {
+        ds4_cuda_tensor *prev_hc = (draft_n & 1) ? s->cuda_graph.mtp_state_hc
+                                                  : s->cuda_graph.mtp_next_hc;
+        ds4_cuda_tensor *out_hc  = (draft_n & 1) ? s->cuda_graph.mtp_next_hc
+                                                  : s->cuda_graph.mtp_state_hc;
+        int mtp_top = -1;
+        if (!cuda_graph_eval_mtp_draft_from_hc(&s->cuda_graph,
+                                                &e->model, &e->weights,
+                                                &e->mtp_model, &e->mtp_weights,
+                                                prev_hc, out_hc,
+                                                drafts[draft_n - 1],
+                                                (uint32_t)(s->checkpoint.len + draft_n - 1),
+                                                NULL, &mtp_top))
+        {
+            return n_accept;
+        }
+        drafts[draft_n] = mtp_top >= 0 ? mtp_top : 0;
+        if (drafts[draft_n] == eos_token) {
+            draft_n++;
+            break;
+        }
+    }
+
+    /* Verifier dispatch.  This commit ships strict + N=2 only. */
+    if (!strict_mtp || draft_n != 2) {
+        if (getenv("DS4_MTP_SPEC_LOG")) {
+            fprintf(stderr,
+                    "ds4: cuda mtp spec — strict=%d draft_n=%d, only strict+N=2 verifier "
+                    "is wired on CUDA; committing drafts[0] only.\n",
+                    strict_mtp ? 1 : 0, draft_n);
+        }
+        DS4_CUDA_MTP_KEEP_ACCEPTED(0);
+        return n_accept;
+    }
+
+    /* Strict + N=2: decode2_exact verifier with prefix-1 capture. */
+    ds4_cuda_spec_frontier frontier;
+    memset(&frontier, 0, sizeof(frontier));
+    float *row_logits  = xmalloc((size_t)DS4_N_VOCAB * sizeof(*row_logits));
+    float *row0_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(*row0_logits));
+    const int start = s->checkpoint.len;
+    int row0_top = -1;
+    bool have_frontier = cuda_spec_frontier_snapshot(&frontier, &s->cuda_graph);
+    bool ok = have_frontier;
+    if (ok) {
+        ok = cuda_graph_verify_decode2_exact(&s->cuda_graph,
+                                              &e->model, &e->weights,
+                                              drafts[0], drafts[1],
+                                              (uint32_t)start,
+                                              &row0_top,
+                                              row0_logits, row_logits);
+    }
+    if (ok && row0_top == drafts[1]) {
+        /* Both drafts accepted — committing both gives the same target
+         * stream as two sequential eval calls. */
+        memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        token_vec_push(&s->checkpoint, drafts[0]);
+        token_vec_push(&s->checkpoint, drafts[1]);
+        accepted[n_accept++] = drafts[0];
+        if (n_accept < accepted_cap) accepted[n_accept++] = drafts[1];
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        DS4_CUDA_MTP_KEEP_ACCEPTED(2);
+        cuda_spec_frontier_free(&frontier);
+        free(row0_logits);
+        free(row_logits);
+        return n_accept;
+    }
+
+    /* Single-token accept (drafts[0]).  The verifier already advanced the
+     * caches through both drafts; commit_prefix1 rewinds to post-token0. */
+    if (ok) {
+        s->checkpoint.len = start;
+        ok = cuda_spec_frontier_commit_prefix1(&s->cuda_graph);
+    }
+    if (ok) memcpy(s->logits, row0_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    if (ok) {
+        token_vec_push(&s->checkpoint, drafts[0]);
+        accepted[n_accept++] = drafts[0];
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        DS4_CUDA_MTP_KEEP_ACCEPTED(1);
+        cuda_spec_frontier_free(&frontier);
+        free(row0_logits);
+        free(row_logits);
+        return n_accept;
+    }
+
+    /* Verifier failure — restore frontier and return only first_token. */
+    if (have_frontier) {
+        s->checkpoint.len = start;
+        (void)cuda_spec_frontier_restore(&frontier, &s->cuda_graph);
+    }
+    cuda_spec_frontier_free(&frontier);
+    free(row0_logits);
+    free(row_logits);
+    if (getenv("DS4_MTP_SPEC_LOG")) {
+        fprintf(stderr, "ds4: cuda mtp decode2 verifier failed; bailing.\n");
+    }
+    DS4_CUDA_MTP_KEEP_ACCEPTED(0);
+    return n_accept;
+#undef DS4_CUDA_MTP_KEEP_ACCEPTED
+}
+#endif /* DS4_USE_CUDA */
+
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
+    if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
+#ifdef DS4_USE_CUDA
+    if (s->engine->backend == DS4_BACKEND_CUDA) {
+        return cuda_session_eval_speculative_argmax_impl(
+            s, first_token, max_tokens, eos_token, accepted, accepted_cap,
+            err, errlen);
+    }
+#endif
 #ifdef DS4_NO_METAL
     (void)s; (void)first_token; (void)max_tokens; (void)eos_token;
     (void)accepted; (void)accepted_cap;
     snprintf(err, errlen, "Metal support is not compiled in");
     return -1;
 #else
-    if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
     ds4_engine *e = s->engine;
 
     /*
