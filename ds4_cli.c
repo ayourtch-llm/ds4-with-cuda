@@ -479,12 +479,11 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
     const double t_decode0 = cli_now_sec();
-    /* MTP / speculative decode is Metal-only for now (Phase 3c-5 first-light
-     * scope; CUDA MTP is a deferred follow-up).  Disable the speculative
-     * branch for the CUDA backend so greedy decode stays on the verified
-     * eval kernel. */
+    /* MTP / speculative decode is wired for both Metal and CUDA backends
+     * (Phase 4 Steps 6-8 ported the CUDA driver: strict decode2_exact +
+     * non-strict margin-gate single re-decode).  DS4_MTP_SPEC_DISABLE forces
+     * vanilla greedy decode for either backend. */
     const bool spec_eligible =
-        cfg->engine.backend != DS4_BACKEND_CUDA &&
         cfg->gen.temperature <= 0.0f &&
         ds4_engine_mtp_draft_tokens(engine) > 1 &&
         getenv("DS4_MTP_SPEC_DISABLE") == NULL;
@@ -980,9 +979,9 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         int toks[17];
         int ntok = 0;
-        /* MTP / speculative decode is Metal-only (Phase 3c-5 scope). */
-        if (cfg->engine.backend != DS4_BACKEND_CUDA &&
-            cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        /* MTP / speculative decode is wired for Metal and CUDA both (Phase 4
+         * Steps 6-8). */
+        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             ntok = ds4_session_eval_speculative_argmax(chat->session,
                                                        token,

@@ -14435,6 +14435,35 @@ static uint32_t cuda_graph_prefill_cap_for_prompt(int prompt_len) {
  * (g->layer_attn_state_*[il], g->layer_attn_comp_cache[il],
  * g->layer_index_*[il], counters g->layer_n_comp[il] /
  * g->layer_n_index_comp[il]) remain indexed by `il` from `g`. */
+
+/* Phase 4 Step 8b: type-dispatched plain matmul.  Mirrors Metal's
+ * metal_graph_matmul_plain_tensor (ds4.c:10043) — picks F16 vs F32 from
+ * the source tensor's quant type so the same encode body works for both
+ * the base model (plain weights = F16) and the MTP gguf (plain weights =
+ * F32).  Surfaced when --mtp on CUDA produced NaN logits because the
+ * encode_one_layer's hc_attn_fn / hc_ffn_fn / ffn_gate_inp call sites
+ * always called matmul_f16 — reading F32 bytes as F16. */
+static bool cuda_graph_matmul_plain_tensor(
+        ds4_cuda_tensor       *out,
+        const ds4_model       *model,
+        const ds4_tensor      *w,
+        uint64_t               in_dim,
+        uint64_t               out_dim,
+        const ds4_cuda_tensor *x,
+        uint32_t               n_tok) {
+    if (w->type == DS4_TENSOR_F16) {
+        return ds4_cuda_matmul_f16_tensor(out, model->map, model->size,
+                                          w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
+    }
+    if (w->type == DS4_TENSOR_F32) {
+        return ds4_cuda_matmul_f32_tensor(out, model->map, model->size,
+                                          w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
+    }
+    fprintf(stderr, "ds4: cuda plain matmul does not support type %s\n",
+            tensor_type_name(w->type));
+    return false;
+}
+
 static bool cuda_graph_encode_one_layer(
         ds4_cuda_graph          *g,
         const ds4_model         *model,
@@ -14492,9 +14521,8 @@ static bool cuda_graph_encode_one_layer(
     int ok = ds4_cuda_begin_commands();
     if (ok) ok = ds4_cuda_rms_norm_plain_tensor(g->flat_hc, cur_hc,
                                                  (uint32_t)hc_dim, DS4_RMS_EPS);
-    if (ok) ok = ds4_cuda_matmul_f16_tensor(g->hc_mix, model->map, model->size,
-                                             L->hc_attn_fn->abs_offset,
-                                             hc_dim, mix_dim, g->flat_hc, 1u);
+    if (ok) ok = cuda_graph_matmul_plain_tensor(g->hc_mix, model, L->hc_attn_fn,
+                                                 hc_dim, mix_dim, g->flat_hc, 1u);
     if (ok) ok = ds4_cuda_hc_split_weighted_sum_norm_tensor(
                     g->attn_cur, g->attn_norm, g->hc_split, g->hc_mix, cur_hc,
                     model->map, model->size,
@@ -14728,18 +14756,16 @@ static bool cuda_graph_encode_one_layer(
                                             DS4_N_EMBD, DS4_N_HC);
     if (ok) ok = ds4_cuda_rms_norm_plain_tensor(g->ffn_flat, g->after_attn_hc,
                                                  (uint32_t)hc_dim, DS4_RMS_EPS);
-    if (ok) ok = ds4_cuda_matmul_f16_tensor(g->ffn_mix, model->map, model->size,
-                                             L->hc_ffn_fn->abs_offset,
-                                             hc_dim, mix_dim, g->ffn_flat, 1u);
+    if (ok) ok = cuda_graph_matmul_plain_tensor(g->ffn_mix, model, L->hc_ffn_fn,
+                                                 hc_dim, mix_dim, g->ffn_flat, 1u);
     if (ok) ok = ds4_cuda_hc_split_weighted_sum_norm_tensor(
                     g->ffn_cur, g->ffn_norm, g->ffn_split, g->ffn_mix,
                     g->after_attn_hc, model->map, model->size,
                     L->hc_ffn_scale->abs_offset, L->hc_ffn_base->abs_offset,
                     L->ffn_norm->abs_offset, DS4_N_EMBD, DS4_N_HC,
                     DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS);
-    if (ok) ok = ds4_cuda_matmul_f16_tensor(g->router_logits, model->map, model->size,
-                                             L->ffn_gate_inp->abs_offset,
-                                             DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1u);
+    if (ok) ok = cuda_graph_matmul_plain_tensor(g->router_logits, model, L->ffn_gate_inp,
+                                                 DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1u);
     if (ok) ok = ds4_cuda_router_select_tensor(
                     g->router_selected, g->router_weights, g->router_probs,
                     model->map, model->size,
@@ -14796,10 +14822,8 @@ static bool cuda_graph_encode_output_head_mtp(
     int ok = ds4_cuda_begin_commands();
     if (ok) ok = ds4_cuda_rms_norm_plain_tensor(g->output_flat, cur_hc,
                                                  (uint32_t)hc_dim, DS4_RMS_EPS);
-    if (ok) ok = ds4_cuda_matmul_f16_tensor(g->output_pre,
-                                             mtp_model->map, mtp_model->size,
-                                             mtp->hc_head_fn->abs_offset,
-                                             hc_dim, DS4_N_HC, g->output_flat, 1u);
+    if (ok) ok = cuda_graph_matmul_plain_tensor(g->output_pre, mtp_model, mtp->hc_head_fn,
+                                                 hc_dim, DS4_N_HC, g->output_flat, 1u);
     if (ok) ok = ds4_cuda_output_hc_weights_tensor(
                     g->output_weights, g->output_pre,
                     mtp_model->map, mtp_model->size,
@@ -21127,6 +21151,15 @@ static int cuda_session_eval_speculative_argmax_impl(
     drafts[0] = s->mtp_draft_token;
     s->mtp_draft_valid = false;
     const bool strict_mtp = e->quality || getenv("DS4_MTP_STRICT") != NULL;
+    float mtp_margin_threshold = e->mtp_margin;
+    const char *mtp_margin_env = getenv("DS4_MTP_MIN_MARGIN");
+    if (mtp_margin_env && mtp_margin_env[0]) {
+        char *end = NULL;
+        float v = strtof(mtp_margin_env, &end);
+        if (end != mtp_margin_env && v >= 0.0f) mtp_margin_threshold = v;
+    }
+    const bool mtp_need_logits = getenv("DS4_MTP_FULL_LOGITS") != NULL ||
+        (!strict_mtp && mtp_margin_threshold > 0.0f);
 
     /* The first proposed token is verified for free against the target
      * decode that just produced s->logits.  If MTP disagrees, return only
@@ -21158,7 +21191,8 @@ static int cuda_session_eval_speculative_argmax_impl(
                                                 prev_hc, out_hc,
                                                 drafts[draft_n - 1],
                                                 (uint32_t)(s->checkpoint.len + draft_n - 1),
-                                                NULL, &mtp_top))
+                                                mtp_need_logits ? s->mtp_logits : NULL,
+                                                &mtp_top))
         {
             return n_accept;
         }
@@ -21169,30 +21203,64 @@ static int cuda_session_eval_speculative_argmax_impl(
         }
     }
 
-    /* Verifier dispatch.  This commit ships strict + N=2 only. */
-    if (!strict_mtp || draft_n != 2) {
-        /* Codex review fix (Step 6 minor): log used to say "committing
-         * drafts[0] only" but the code returns just first_token (which was
-         * already committed by ds4_session_eval at the top).  drafts[0]
-         * was verified-for-free against target's argmax-after-prefix at the
-         * sample_argmax check above, so it WOULD be safe to commit; doing
-         * so however requires re-decoding it through target (see Metal's
-         * margin-gate fallback at ds4.c:21222), which the CUDA path
-         * doesn't yet implement — that's the deferred follow-up.  Match
-         * the log to the actual safe behaviour: first_token only, no
-         * drafts committed. */
+    /* Phase 4 Step 8: margin-gate single re-decode fallback for non-strict
+     * mode.  When MTP's confidence in drafts[draft_n-1] is low (logit margin
+     * below threshold), running the full decode2_exact verifier (2× target
+     * decode) is unlikely to produce a both-drafts accept; skip it and run
+     * a single target re-decode of drafts[0] — committing one extra token
+     * at one extra target-decode cost.  Mirrors the Metal driver's
+     * margin-skip path at ds4.c:21386. */
+    if (!strict_mtp && draft_n == 2 && mtp_margin_threshold > 0.0f) {
+        float v0 = 0.0f, v1 = 0.0f;
+        int top0 = -1, top1 = -1;
+        logits_top2(s->mtp_logits, DS4_N_VOCAB, &top0, &v0, &top1, &v1);
+        const float margin = v0 - v1;
+        if (margin < mtp_margin_threshold) {
+            float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(*row_logits));
+            const int start = s->checkpoint.len;
+            if (!cuda_graph_eval_token_raw_swa(&s->cuda_graph,
+                                                &e->model, &e->weights,
+                                                (uint32_t)drafts[0],
+                                                (uint32_t)start,
+                                                row_logits)) {
+                free(row_logits);
+                snprintf(err, errlen, "CUDA decode failed");
+                s->checkpoint_valid = false;
+                return -1;
+            }
+            memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+            free(row_logits);
+            token_vec_push(&s->checkpoint, drafts[0]);
+            accepted[n_accept++] = drafts[0];
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+            DS4_CUDA_MTP_KEEP_ACCEPTED(1);
+            if (getenv("DS4_MTP_SPEC_LOG")) {
+                fprintf(stderr,
+                        "ds4: cuda mtp margin-skip drafted=2 committed=1 "
+                        "margin=%.3f threshold=%.3f\n",
+                        margin, mtp_margin_threshold);
+            }
+            return n_accept;
+        }
+    }
+
+    /* Verifier dispatch.  N != 2 has no batched verifier on CUDA yet (Phase
+     * 3b suffix_tops deferred); bail with first_token only.  N == 2 falls
+     * through to decode2_exact for both strict and non-strict-high-margin
+     * (the margin gate above already covered non-strict-low-margin). */
+    if (draft_n != 2) {
         if (getenv("DS4_MTP_SPEC_LOG")) {
             fprintf(stderr,
-                    "ds4: cuda mtp spec — strict=%d draft_n=%d, only strict+N=2 verifier "
-                    "is wired on CUDA; returning first_token only "
-                    "(no drafts committed; margin-gate re-decode fallback deferred).\n",
-                    strict_mtp ? 1 : 0, draft_n);
+                    "ds4: cuda mtp spec — draft_n=%d, only N=2 verifier "
+                    "is wired on CUDA; first_token only.\n",
+                    draft_n);
         }
         DS4_CUDA_MTP_KEEP_ACCEPTED(0);
         return n_accept;
     }
 
-    /* Strict + N=2: decode2_exact verifier with prefix-1 capture. */
+    /* N=2: decode2_exact verifier with prefix-1 capture. */
     ds4_cuda_spec_frontier frontier;
     memset(&frontier, 0, sizeof(frontier));
     float *row_logits  = xmalloc((size_t)DS4_N_VOCAB * sizeof(*row_logits));
