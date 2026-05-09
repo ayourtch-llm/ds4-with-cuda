@@ -93,26 +93,10 @@ static uint64_t g_model_register_bytes;
 static uint64_t g_kernel_stub_calls;
 static int g_kernel_stub_warned;
 
-static int8_t *g_scratch_matmul_q8_0_xq;
-static size_t  g_scratch_matmul_q8_0_xq_bytes;
-static float  *g_scratch_matmul_q8_0_xscale;
-static size_t  g_scratch_matmul_q8_0_xscale_bytes;
-static int8_t *g_scratch_shared_gate_up_q8_0_xq;
-static size_t  g_scratch_shared_gate_up_q8_0_xq_bytes;
-static float  *g_scratch_shared_gate_up_q8_0_xscale;
-static size_t  g_scratch_shared_gate_up_q8_0_xscale_bytes;
-static int8_t *g_scratch_q8_0_hc_expand_xq;
-static size_t  g_scratch_q8_0_hc_expand_xq_bytes;
-static float  *g_scratch_q8_0_hc_expand_xscale;
-static size_t  g_scratch_q8_0_hc_expand_xscale_bytes;
 static ds4_cuda_block_q8_K *g_scratch_routed_moe_xq;
 static size_t               g_scratch_routed_moe_xq_bytes;
 static ds4_cuda_block_q8_K *g_scratch_routed_moe_midq;
 static size_t               g_scratch_routed_moe_midq_bytes;
-static int8_t *g_scratch_attention_output_low_q8_heads_q;
-static size_t  g_scratch_attention_output_low_q8_heads_q_bytes;
-static float  *g_scratch_attention_output_low_q8_heads_scale;
-static size_t  g_scratch_attention_output_low_q8_heads_scale_bytes;
 
 static int ds4_cuda_check(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
@@ -650,108 +634,6 @@ static __device__ __forceinline__ float ds4_cuda_warp_vec_dot_iq2_xxs_q8_K(
         sumf += d * (float)bsum;
     }
     return 0.125f * sumf;
-}
-
-static __device__ void ds4_cuda_quantize_q8_0_activation_device(
-        const float *x,
-        int8_t      *xq,
-        float       *xscale,
-        uint32_t     in_dim) {
-    const uint32_t blocks = (in_dim + 31u) / 32u;
-    for (uint32_t b = 0; b < blocks; b++) {
-        const uint32_t i0 = b * 32u;
-        const uint32_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
-        float amax = 0.0f;
-        for (uint32_t i = 0; i < bn; i++) {
-            const float ax = fabsf(x[i0 + i]);
-            if (ax > amax) amax = ax;
-        }
-        const float d = amax / 127.0f;
-        const float id = d != 0.0f ? 1.0f / d : 0.0f;
-        xscale[b] = d;
-        for (uint32_t i = 0; i < bn; i++) {
-            int v = (int)lrintf(x[i0 + i] * id);
-            if (v > 127) v = 127;
-            if (v < -128) v = -128;
-            xq[i0 + i] = (int8_t)v;
-        }
-        for (uint32_t i = bn; i < 32u; i++) xq[i0 + i] = 0;
-    }
-}
-
-static __global__ void ds4_cuda_quantize_q8_0_activation_kernel(
-        const float *x,
-        int8_t      *xq,
-        float       *xscale,
-        uint32_t     in_dim,
-        uint32_t     n_tok) {
-    const uint32_t tok = blockIdx.x;
-    if (tok >= n_tok || threadIdx.x != 0) return;
-    const uint32_t blocks = (in_dim + 31u) / 32u;
-    ds4_cuda_quantize_q8_0_activation_device(x + (uint64_t)tok * in_dim,
-                                             xq + (uint64_t)tok * blocks * 32u,
-                                             xscale + (uint64_t)tok * blocks,
-                                             in_dim);
-}
-
-static __device__ float ds4_cuda_vec_dot_q8_0_f32(
-        const ds4_cuda_block_q8_0 *w,
-        const int8_t              *xq,
-        const float               *xscale,
-        uint32_t                   in_dim) {
-    const uint32_t blocks = (in_dim + 31u) / 32u;
-    float acc = 0.0f;
-    for (uint32_t b = 0; b < blocks; b++) {
-        const uint32_t i0 = b * 32u;
-        const uint32_t n = in_dim - i0 < 32u ? in_dim - i0 : 32u;
-        int32_t isum = 0;
-        for (uint32_t i = 0; i < n; i++) isum += (int32_t)w[b].qs[i] * (int32_t)xq[i0 + i];
-        acc += ds4_cuda_f16_to_f32(w[b].d) * xscale[b] * (float)isum;
-    }
-    return acc;
-}
-
-/* Phase 3b-4 retile companion to ds4_cuda_vec_dot_q8_0_f32.
- *
- * Same math as the 3b-1 inlined warp body in ds4_cuda_dense_q8_0_matvec_kernel:
- * for each Q8_0 block lane `i` computes one int8×int8 product, a 5-step
- * __shfl_xor_sync reduces the 32 lane partials into a bit-exact `isum`
- * (integer addition is associative), and every lane updates `acc` with the
- * same `acc += f16_to_f32(d) * xscale[b] * (float)isum` — preserving the
- * scalar helper's per-block FMA chain in lock-step under `--use_fast_math`.
- * Caller must invoke from a full warp (32 lanes participating).
- *
- * Used by 3b-4 retile of q8_0_hc_expand_kernel and
- * attention_output_low_q8_kernel.  ds4_cuda_dense_q8_0_matvec_kernel keeps its
- * inline 3b-1 body untouched (no risk to the working tol=0 fixture).  The
- * scalar helper above is now orphaned but kept in place — possible reuse for
- * future bring-up or for a future 3b-x retile of the dense matvec kernel via
- * this helper. */
-static __device__ __forceinline__ float ds4_cuda_warp_vec_dot_q8_0_f32(
-        const ds4_cuda_block_q8_0 *w,
-        const int8_t              *xq,
-        const float               *xscale,
-        uint32_t                   in_dim,
-        uint32_t                   lane) {
-    const uint32_t blocks = (in_dim + 31u) / 32u;
-    float acc = 0.0f;
-    for (uint32_t b = 0; b < blocks; b++) {
-        const uint32_t i0 = b * 32u;
-        const uint32_t n  = in_dim - i0 < 32u ? in_dim - i0 : 32u;
-
-        int32_t lane_isum = 0;
-        if (lane < n) {
-            lane_isum = (int32_t)w[b].qs[lane] * (int32_t)xq[i0 + lane];
-        }
-        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 16);
-        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 8);
-        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 4);
-        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 2);
-        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 1);
-
-        acc += ds4_cuda_f16_to_f32(w[b].d) * xscale[b] * (float)lane_isum;
-    }
-    return acc;
 }
 
 /* Phase 3b-5 fused helper: per Q8_0 K-block, perform the activation-side
@@ -1641,26 +1523,10 @@ void ds4_cuda_cleanup(void) {
     (void)cudaStreamSynchronize(g_stream);
     ds4_cuda_clear_pending_events();
     ds4_cuda_unregister_model();
-    ds4_cuda_scratch_free((void **)&g_scratch_matmul_q8_0_xscale,
-                          &g_scratch_matmul_q8_0_xscale_bytes);
-    ds4_cuda_scratch_free((void **)&g_scratch_matmul_q8_0_xq,
-                          &g_scratch_matmul_q8_0_xq_bytes);
-    ds4_cuda_scratch_free((void **)&g_scratch_shared_gate_up_q8_0_xscale,
-                          &g_scratch_shared_gate_up_q8_0_xscale_bytes);
-    ds4_cuda_scratch_free((void **)&g_scratch_shared_gate_up_q8_0_xq,
-                          &g_scratch_shared_gate_up_q8_0_xq_bytes);
-    ds4_cuda_scratch_free((void **)&g_scratch_q8_0_hc_expand_xscale,
-                          &g_scratch_q8_0_hc_expand_xscale_bytes);
-    ds4_cuda_scratch_free((void **)&g_scratch_q8_0_hc_expand_xq,
-                          &g_scratch_q8_0_hc_expand_xq_bytes);
     ds4_cuda_scratch_free((void **)&g_scratch_routed_moe_midq,
                           &g_scratch_routed_moe_midq_bytes);
     ds4_cuda_scratch_free((void **)&g_scratch_routed_moe_xq,
                           &g_scratch_routed_moe_xq_bytes);
-    ds4_cuda_scratch_free((void **)&g_scratch_attention_output_low_q8_heads_scale,
-                          &g_scratch_attention_output_low_q8_heads_scale_bytes);
-    ds4_cuda_scratch_free((void **)&g_scratch_attention_output_low_q8_heads_q,
-                          &g_scratch_attention_output_low_q8_heads_q_bytes);
     if (g_stream) {
         (void)cudaStreamDestroy(g_stream);
         g_stream = NULL;
