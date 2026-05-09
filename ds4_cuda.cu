@@ -711,6 +711,49 @@ static __device__ float ds4_cuda_vec_dot_q8_0_f32(
     return acc;
 }
 
+/* Phase 3b-4 retile companion to ds4_cuda_vec_dot_q8_0_f32.
+ *
+ * Same math as the 3b-1 inlined warp body in ds4_cuda_dense_q8_0_matvec_kernel:
+ * for each Q8_0 block lane `i` computes one int8×int8 product, a 5-step
+ * __shfl_xor_sync reduces the 32 lane partials into a bit-exact `isum`
+ * (integer addition is associative), and every lane updates `acc` with the
+ * same `acc += f16_to_f32(d) * xscale[b] * (float)isum` — preserving the
+ * scalar helper's per-block FMA chain in lock-step under `--use_fast_math`.
+ * Caller must invoke from a full warp (32 lanes participating).
+ *
+ * Used by 3b-4 retile of q8_0_hc_expand_kernel and
+ * attention_output_low_q8_kernel.  ds4_cuda_dense_q8_0_matvec_kernel keeps its
+ * inline 3b-1 body untouched (no risk to the working tol=0 fixture).  The
+ * scalar helper above is now orphaned but kept in place — possible reuse for
+ * future bring-up or for a future 3b-x retile of the dense matvec kernel via
+ * this helper. */
+static __device__ __forceinline__ float ds4_cuda_warp_vec_dot_q8_0_f32(
+        const ds4_cuda_block_q8_0 *w,
+        const int8_t              *xq,
+        const float               *xscale,
+        uint32_t                   in_dim,
+        uint32_t                   lane) {
+    const uint32_t blocks = (in_dim + 31u) / 32u;
+    float acc = 0.0f;
+    for (uint32_t b = 0; b < blocks; b++) {
+        const uint32_t i0 = b * 32u;
+        const uint32_t n  = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+
+        int32_t lane_isum = 0;
+        if (lane < n) {
+            lane_isum = (int32_t)w[b].qs[lane] * (int32_t)xq[i0 + lane];
+        }
+        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 16);
+        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 8);
+        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 4);
+        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 2);
+        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 1);
+
+        acc += ds4_cuda_f16_to_f32(w[b].d) * xscale[b] * (float)lane_isum;
+    }
+    return acc;
+}
+
 /* Phase 3b-1 retile: one warp per output row, with the per-block 32-element
  * Q8_0 dot product parallelised across the 32 lanes and the across-block FP
  * accumulation kept serial.
@@ -795,6 +838,16 @@ static __device__ float ds4_cuda_hc_expand_split_value(
     return acc;
 }
 
+/* Phase 3b-4 retile: one warp per output row.  Inner Q8_0 dot parallelised
+ * via ds4_cuda_warp_vec_dot_q8_0_f32; the per-row n_hc loop computing
+ * hc_expand_split_value stays serial in lane 0 (FP accumulator chain — same
+ * reasoning as 3b-1's "FP chain stays serial").  All 32 lanes participate in
+ * the warp dot; lane 0 alone writes the diagnostic block_out and the n_hc
+ * out_hc rows.
+ *
+ * blockDim is (32, ROWS_PER_BLOCK); each warp handles row
+ * blockIdx.x*ROWS_PER_BLOCK + threadIdx.y. */
+template<uint32_t ROWS_PER_BLOCK>
 static __global__ void ds4_cuda_q8_0_hc_expand_kernel(
         const ds4_cuda_block_q8_0 *weights,
         const int8_t              *xq,
@@ -809,21 +862,35 @@ static __global__ void ds4_cuda_q8_0_hc_expand_kernel(
         uint32_t                   n_embd,
         uint32_t                   n_hc,
         uint32_t                   has_add) {
-    const uint32_t row = blockIdx.x;
-    if (row >= out_dim || threadIdx.x != 0) return;
+    const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
+    if (row >= out_dim) return;
+    const uint32_t lane = threadIdx.x;
     const uint32_t blocks = (in_dim + 31u) / 32u;
-    const float mv = ds4_cuda_vec_dot_q8_0_f32(weights + (uint64_t)row * blocks,
-                                               xq, xscale, in_dim);
-    block_out[row] = mv;
-    if (row >= n_embd) return;
-    const float block_v = has_add ? mv + block_add[row] : mv;
-    for (uint32_t dst_hc = 0; dst_hc < n_hc; dst_hc++) {
-        out_hc[(uint64_t)dst_hc * n_embd + row] =
-            ds4_cuda_hc_expand_split_value(block_v, residual_hc, split,
-                                           row, dst_hc, n_embd, n_hc);
+
+    const float mv = ds4_cuda_warp_vec_dot_q8_0_f32(
+            weights + (uint64_t)row * blocks, xq, xscale, in_dim, lane);
+
+    if (lane == 0u) {
+        block_out[row] = mv;
+        if (row >= n_embd) return;
+        const float block_v = has_add ? mv + block_add[row] : mv;
+        for (uint32_t dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+            out_hc[(uint64_t)dst_hc * n_embd + row] =
+                ds4_cuda_hc_expand_split_value(block_v, residual_hc, split,
+                                               row, dst_hc, n_embd, n_hc);
+        }
     }
 }
 
+/* Phase 3b-4 retile: one warp per output rank.  Same q8_0 idiom as the
+ * 3b-1 dense matvec and the 3b-4 hc_expand retile; uses the shared
+ * ds4_cuda_warp_vec_dot_q8_0_f32 helper.  Only rank is tiled across
+ * threadIdx.y; group/tok stay on the y/z grid axes.
+ *
+ * blockDim is (32, ROWS_PER_BLOCK); each warp handles rank
+ * blockIdx.x*ROWS_PER_BLOCK + threadIdx.y of (group=blockIdx.y,
+ * tok=blockIdx.z). */
+template<uint32_t ROWS_PER_BLOCK>
 static __global__ void ds4_cuda_attention_output_low_q8_kernel(
         const ds4_cuda_block_q8_0 *weights,
         const int8_t              *heads_q,
@@ -833,18 +900,25 @@ static __global__ void ds4_cuda_attention_output_low_q8_kernel(
         uint32_t                   rank,
         uint32_t                   n_groups,
         uint32_t                   n_tokens) {
-    const uint32_t r = blockIdx.x;
+    const uint32_t r     = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
     const uint32_t group = blockIdx.y;
-    const uint32_t tok = blockIdx.z;
-    if (r >= rank || group >= n_groups || tok >= n_tokens || threadIdx.x != 0) return;
+    const uint32_t tok   = blockIdx.z;
+    if (r >= rank || group >= n_groups || tok >= n_tokens) return;
+    const uint32_t lane   = threadIdx.x;
     const uint32_t blocks = (group_dim + 31u) / 32u;
-    const uint64_t row = (uint64_t)group * rank + r;
-    const uint64_t qrow = ((uint64_t)tok * n_groups + group) * blocks;
-    low[(uint64_t)tok * n_groups * rank + row] =
-        ds4_cuda_vec_dot_q8_0_f32(weights + row * blocks,
-                                  heads_q + qrow * 32u,
-                                  heads_scale + qrow,
-                                  group_dim);
+    const uint64_t row    = (uint64_t)group * rank + r;
+    const uint64_t qrow   = ((uint64_t)tok * n_groups + group) * blocks;
+
+    const float v = ds4_cuda_warp_vec_dot_q8_0_f32(
+            weights + row * blocks,
+            heads_q + qrow * 32u,
+            heads_scale + qrow,
+            group_dim,
+            lane);
+
+    if (lane == 0u) {
+        low[(uint64_t)tok * n_groups * rank + row] = v;
+    }
 }
 
 static __global__ void ds4_cuda_dense_f32_matvec_kernel(
@@ -2259,7 +2333,12 @@ static int ds4_cuda_attention_output_low_q8_launch(
         if (!weights) ok = 0;
     }
     if (ok) {
-        ds4_cuda_attention_output_low_q8_kernel<<<dim3((uint32_t)rank, n_groups, n_tokens), 1, 0, g_stream>>>(
+        constexpr uint32_t ROWS_PER_BLOCK = 4u;
+        const uint32_t row_blocks = ((uint32_t)rank + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
+        ds4_cuda_attention_output_low_q8_kernel<ROWS_PER_BLOCK><<<
+                dim3(row_blocks, n_groups, n_tokens),
+                dim3(32u, ROWS_PER_BLOCK, 1),
+                0, g_stream>>>(
             weights,
             g_scratch_attention_output_low_q8_heads_q,
             g_scratch_attention_output_low_q8_heads_scale,
@@ -2782,7 +2861,12 @@ static int ds4_cuda_q8_0_hc_expand_launch(
         if (!weights) ok = 0;
     }
     if (ok) {
-        ds4_cuda_q8_0_hc_expand_kernel<<<(uint32_t)out_dim, 1, 0, g_stream>>>(
+        constexpr uint32_t ROWS_PER_BLOCK = 4u;
+        const uint32_t row_blocks = ((uint32_t)out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
+        ds4_cuda_q8_0_hc_expand_kernel<ROWS_PER_BLOCK><<<
+                dim3(row_blocks, 1, 1),
+                dim3(32u, ROWS_PER_BLOCK, 1),
+                0, g_stream>>>(
             weights,
             g_scratch_q8_0_hc_expand_xq,
             g_scratch_q8_0_hc_expand_xscale,
