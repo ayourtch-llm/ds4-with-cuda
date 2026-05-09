@@ -441,6 +441,60 @@ DS4_CUDA_PARITY_TEST(swiglu,
     .cfg = (void *)&swiglu_cfg_512);
 
 /* ---------------------------------------------------------------------------
+ * add — Phase 4 Step 1 (MTP port prerequisite, replaces DS4_CUDA_STUB).
+ *
+ * Trivial elementwise f32 add.  CPU oracle adds in-order to mirror the
+ * implementation; CUDA kernel is data-parallel but per-element addition has
+ * no cross-element dependency, so bit-exactness follows directly (each
+ * out[i] = a[i] + b[i] is a single FP add, IEEE-754 deterministic).
+ * --------------------------------------------------------------------------- */
+
+struct add_cfg {
+    uint32_t n;
+};
+
+static int add_cpu(const float *in, float *out, void *cfg) {
+    const struct add_cfg *c = cfg;
+    const float *a = in;
+    const float *b = in + c->n;
+    for (uint32_t i = 0; i < c->n; i++) out[i] = a[i] + b[i];
+    return 1;
+}
+
+static int add_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                    size_t in_elems, size_t out_elems, void *cfg) {
+    (void)out_elems;
+    const struct add_cfg *c = cfg;
+    if (in_elems != (size_t)c->n * 2u) return 0;
+    ds4_cuda_tensor *a_dev = ds4_cuda_tensor_alloc((uint64_t)c->n * sizeof(float));
+    ds4_cuda_tensor *b_dev = ds4_cuda_tensor_alloc((uint64_t)c->n * sizeof(float));
+    if (!a_dev || !b_dev) {
+        ds4_cuda_tensor_free(a_dev);
+        ds4_cuda_tensor_free(b_dev);
+        return 0;
+    }
+    int ok = ds4_cuda_tensor_write(a_dev, 0, in, (uint64_t)c->n * sizeof(float));
+    if (ok) ok = ds4_cuda_tensor_write(b_dev, 0, in + c->n, (uint64_t)c->n * sizeof(float));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_add_tensor(out_dev, a_dev, b_dev, c->n);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(a_dev);
+    ds4_cuda_tensor_free(b_dev);
+    return ok;
+}
+
+static const struct add_cfg add_cfg_512 = { .n = 512 };
+
+DS4_CUDA_PARITY_TEST(add,
+    .seed = 0xADD00,
+    .in_elems = 1024,
+    .out_elems = 512,
+    .ulp_tolerance = 0,
+    .cpu_fn = add_cpu,
+    .cuda_fn = add_cuda,
+    .cfg = (void *)&add_cfg_512);
+
+/* ---------------------------------------------------------------------------
  * repeat — Phase 1 m2.
  * --------------------------------------------------------------------------- */
 
@@ -5505,6 +5559,7 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_get_rows,
     &ds4_cuda_parity_cpy,
     &ds4_cuda_parity_swiglu,
+    &ds4_cuda_parity_add,
     &ds4_cuda_parity_repeat,
     &ds4_cuda_parity_concat,
     &ds4_cuda_parity_sum_rows,

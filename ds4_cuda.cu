@@ -353,6 +353,21 @@ static __global__ void ds4_cuda_swiglu_f32_kernel(
     if (i < n) out[i] = ds4_cuda_silu_f32(gate[i]) * up[i];
 }
 
+/* Phase 4 Step 1: elementwise f32 add, mirroring ds4_metal_add_tensor's
+ * `out[i] = a[i] + b[i]` for i ∈ [0, n).  First step toward CUDA MTP port
+ * — `add_tensor` is needed by the MTP draft chain (ds4.c:12764, fuses
+ * mtp_eproj_hc + mtp_hproj_hc into mtp_input_hc) and also live on the
+ * existing FFN combine path (ds4.c:9867, shared_out + routed_out).
+ * Bit-exact with the CPU reference by construction. */
+static __global__ void ds4_cuda_add_f32_kernel(
+        const float *a,
+        const float *b,
+        float       *out,
+        uint32_t     n) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = a[i] + b[i];
+}
+
 /* Adapted from llama.cpp 29debb3a6a4c291d66aabbc46a0bb8c17a77e267
  * ggml/src/ggml-cuda/binbcast.cu. */
 static __global__ void ds4_cuda_repeat_hc_f32_kernel(
@@ -2787,7 +2802,29 @@ int ds4_cuda_swiglu_tensor(
         (const float *)gate_ptr, (const float *)up_ptr, (float *)out_ptr, n);
     return ds4_cuda_check(cudaGetLastError(), "launch swiglu");
 }
-DS4_CUDA_STUB(ds4_cuda_add_tensor, (ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t))
+int ds4_cuda_add_tensor(
+        ds4_cuda_tensor       *out,
+        const ds4_cuda_tensor *a,
+        const ds4_cuda_tensor *b,
+        uint32_t               n) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (!out || !a || !b || n == 0) return 0;
+
+    const uint64_t bytes = (uint64_t)n * sizeof(float);
+    void *a_ptr = NULL, *b_ptr = NULL, *out_ptr = NULL;
+    if (!ds4_cuda_tensor_range(a,   bytes, "add a",   &a_ptr) ||
+        !ds4_cuda_tensor_range(b,   bytes, "add b",   &b_ptr) ||
+        !ds4_cuda_tensor_range(out, bytes, "add out", &out_ptr)) {
+        return 0;
+    }
+
+    const uint32_t block = 256;
+    const uint32_t grid = (n + block - 1u) / block;
+    ds4_cuda_add_f32_kernel<<<grid, block, 0, g_stream>>>(
+        (const float *)a_ptr, (const float *)b_ptr, (float *)out_ptr, n);
+    return ds4_cuda_check(cudaGetLastError(), "launch add");
+}
 int ds4_cuda_router_select_tensor(
         ds4_cuda_tensor       *selected,
         ds4_cuda_tensor       *weights,
