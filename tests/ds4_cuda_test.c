@@ -3812,6 +3812,24 @@ DS4_CUDA_PARITY_TEST(prod_attention_output_q8_batch_prod_shape,
     .cpu_fn = attn_output_q8_batch_cpu, .cuda_fn = attn_output_q8_batch_cuda,
     .cfg = (void *)&attn_output_q8_batch_prod_cfg);
 
+/* Phase 3a-6 multi-token prod-shape: the configuration the GPU port was
+ * landed for.  Multi-token prefill calls this kernel once per layer per
+ * token; covering n_tokens > 1 at prod dims protects the batched stage-A
+ * grid and stage-B per-token stride against regressions.  Same tolerance
+ * rationale as the n_tokens=1 prod-shape test above. */
+static struct attn_output_q8_batch_cfg attn_output_q8_batch_prod_multitok_cfg =
+    { .group_dim=4096, .rank=1024, .n_groups=8, .out_dim=4096, .n_tokens=5 };
+
+DS4_CUDA_PARITY_TEST(prod_attention_output_q8_batch_prod_shape_multitok,
+    .seed = 0xA77AC,
+    /* heads = 5*8*4096 = 163840 */
+    .in_elems  = 5*8*4096,
+    /* out (5*4096) + low (5*8*1024) = 20480 + 40960 = 61440 */
+    .out_elems = 5*4096 + 5*8*1024,
+    .ulp_tolerance = 256,
+    .cpu_fn = attn_output_q8_batch_cpu, .cuda_fn = attn_output_q8_batch_cuda,
+    .cfg = (void *)&attn_output_q8_batch_prod_multitok_cfg);
+
 struct attn_decode_cfg {
     uint32_t n_head;
     uint32_t head_dim;
@@ -5535,6 +5553,7 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_prod_shared_down_hc_expand_q8_0,
     &ds4_cuda_parity_prod_attention_output_q8_batch,
     &ds4_cuda_parity_prod_attention_output_q8_batch_prod_shape,
+    &ds4_cuda_parity_prod_attention_output_q8_batch_prod_shape_multitok,
     &ds4_cuda_parity_attention_decode_heads_no_mask,
     &ds4_cuda_parity_attention_decode_heads_mask,
     &ds4_cuda_parity_output_hc_weights,

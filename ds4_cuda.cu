@@ -1985,53 +1985,21 @@ int ds4_cuda_attention_output_q8_batch_tensor(
     }
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     if (low_dim == 0 || low_dim > UINT32_MAX || (low_dim & 31u) != 0) return 0;
-
     if ((group_dim & 31u) != 0) return 0;
-    const uint64_t row_a_blocks = group_dim / 32u;
-    const uint64_t out_a_bytes = low_dim * row_a_blocks * sizeof(ds4_cuda_block_q8_0);
-    const uint64_t row_b_blocks = low_dim / 32u;
-    const uint64_t out_b_bytes = out_dim * row_b_blocks * sizeof(ds4_cuda_block_q8_0);
-    if (out_a_offset > model_size || out_a_bytes > model_size - out_a_offset ||
-        out_b_offset > model_size || out_b_bytes > model_size - out_b_offset) return 0;
 
-    const uint64_t heads_elems = (uint64_t)n_tokens * n_groups * group_dim;
-    const uint64_t low_elems = (uint64_t)n_tokens * low_dim;
-    const uint64_t out_elems = (uint64_t)n_tokens * out_dim;
-    if (heads_elems > UINT64_MAX / sizeof(float) ||
-        low_elems > UINT64_MAX / sizeof(float) ||
-        out_elems > UINT64_MAX / sizeof(float)) return 0;
-
-    void *heads_ptr = NULL, *low_ptr = NULL, *out_ptr = NULL;
-    if (!ds4_cuda_tensor_range(heads, heads_elems * sizeof(float), "attention output heads", &heads_ptr) ||
-        !ds4_cuda_tensor_range(low,   low_elems   * sizeof(float), "attention output low",   &low_ptr) ||
-        !ds4_cuda_tensor_range(out,   out_elems   * sizeof(float), "attention output out",   &out_ptr)) {
-        return 0;
+    /* Stage A: low[t, g, :] = matvec_q8_0(wa[g], heads[t, g, :]).  The
+     * launch helper batches across (rank, n_groups, n_tokens) in a single
+     * 3D grid and shares a single quantize pass over the heads tensor. */
+    int ok = ds4_cuda_attention_output_low_q8_launch(low, model_map, model_size,
+                                                     out_a_offset, group_dim, rank,
+                                                     n_groups, heads, n_tokens);
+    /* Stage B: out[t, :] = matvec_q8_0(wb, low[t, :]).  Batched matmul
+     * helper handles the per-token loop on-device. */
+    if (ok) {
+        ok = ds4_cuda_matmul_q8_0_tensor(out, model_map, model_size, out_b_offset,
+                                         low_dim, out_dim, low, n_tokens);
     }
-
-    if (!ds4_cuda_check(cudaStreamSynchronize(g_stream), "attention output CPU fallback input sync")) {
-        return 0;
-    }
-
-    const uint8_t *wa = (const uint8_t *)model_map + out_a_offset;
-    const uint8_t *wb = (const uint8_t *)model_map + out_b_offset;
-    float *low_f = (float *)low_ptr;
-    float *out_f = (float *)out_ptr;
-    const float *heads_f = (const float *)heads_ptr;
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        for (uint32_t g = 0; g < n_groups; g++) {
-            ds4_test_dense_q8_0_matvec(low_f + (uint64_t)t * low_dim + (uint64_t)g * rank,
-                                       wa + ((uint64_t)g * rank) * row_a_blocks * sizeof(ds4_cuda_block_q8_0),
-                                       heads_f + ((uint64_t)t * n_groups + g) * group_dim,
-                                       (uint32_t)group_dim,
-                                       (uint32_t)rank);
-        }
-        ds4_test_dense_q8_0_matvec(out_f + (uint64_t)t * out_dim,
-                                   wb,
-                                   low_f + (uint64_t)t * low_dim,
-                                   (uint32_t)low_dim,
-                                   (uint32_t)out_dim);
-    }
-    return 1;
+    return ok;
 }
 
 int ds4_cuda_swiglu_tensor(
