@@ -556,6 +556,33 @@ static __device__ float ds4_cuda_vec_dot_q8_0_f32(
     return acc;
 }
 
+/* Phase 3b-1 retile: one warp per output row, with the per-block 32-element
+ * Q8_0 dot product parallelised across the 32 lanes and the across-block FP
+ * accumulation kept serial.
+ *
+ * Each iteration of the K-axis loop:
+ *   1. Lane `i` computes one int8×int8 product (`qs[i] * xq_row[i]`).
+ *   2. Five `__shfl_xor_sync` steps tree-reduce the 32 int32 partials.
+ *      Integer addition is associative, so this is bit-exact regardless of
+ *      reduction order.
+ *   3. All lanes hold the same `isum`; every lane then performs the same
+ *      `acc += f16_to_f32(d) * xscale[b] * (float)isum`.  Because the FP
+ *      arithmetic is identical across lanes (and identical to the original
+ *      one-thread kernel — same FMA chain under `--use_fast_math`), the
+ *      result is bit-exact with the prior tol=0 baseline.
+ *
+ * blockDim is (32, ROWS_PER_BLOCK); each warp handles row
+ * blockIdx.x*ROWS_PER_BLOCK + threadIdx.y.
+ *
+ * The redundant FP work in lanes 1..31 is intentional: it costs us nothing
+ * (the warp executes in lock-step), it broadcasts `acc` for free, and it
+ * preserves the FMA-per-block sequence that the prior linear kernel
+ * compiled to.  Hot work parallelised: the 32-element int dot product is
+ * now O(1) per block instead of O(32).
+ *
+ * TODO Phase 3b-x: extend to >1 warp/row if K grows past ~4K and a single
+ * warp can no longer keep the SM busy. */
+template<uint32_t ROWS_PER_BLOCK>
 static __global__ void ds4_cuda_dense_q8_0_matvec_kernel(
         const ds4_cuda_block_q8_0 *weights,
         const int8_t              *xq,
@@ -564,15 +591,35 @@ static __global__ void ds4_cuda_dense_q8_0_matvec_kernel(
         uint32_t                   in_dim,
         uint32_t                   out_dim,
         uint32_t                   n_tok) {
-    const uint32_t row = blockIdx.x;
+    const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
     const uint32_t tok = blockIdx.y;
-    if (row >= out_dim || tok >= n_tok || threadIdx.x != 0) return;
+    if (row >= out_dim || tok >= n_tok) return;
+    const uint32_t lane = threadIdx.x;
     const uint32_t blocks = (in_dim + 31u) / 32u;
-    out[(uint64_t)tok * out_dim + row] =
-        ds4_cuda_vec_dot_q8_0_f32(weights + (uint64_t)row * blocks,
-                                  xq + (uint64_t)tok * blocks * 32u,
-                                  xscale + (uint64_t)tok * blocks,
-                                  in_dim);
+
+    const ds4_cuda_block_q8_0 *wrow      = weights + (uint64_t)row * blocks;
+    const int8_t              *xqrow     = xq      + (uint64_t)tok * blocks * 32u;
+    const float               *xscalerow = xscale  + (uint64_t)tok * blocks;
+
+    float acc = 0.0f;
+    for (uint32_t b = 0; b < blocks; b++) {
+        const uint32_t i0 = b * 32u;
+        const uint32_t n  = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+
+        int32_t lane_isum = 0;
+        if (lane < n) {
+            lane_isum = (int32_t)wrow[b].qs[lane] * (int32_t)xqrow[i0 + lane];
+        }
+        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 16);
+        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 8);
+        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 4);
+        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 2);
+        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 1);
+
+        acc += ds4_cuda_f16_to_f32(wrow[b].d) * xscalerow[b] * (float)lane_isum;
+    }
+
+    if (lane == 0) out[(uint64_t)tok * out_dim + row] = acc;
 }
 
 static __device__ float ds4_cuda_hc_expand_split_value(
@@ -1665,7 +1712,12 @@ int ds4_cuda_matmul_q8_0_tensor(
         if (!weights) ok = 0;
     }
     if (ok) {
-        ds4_cuda_dense_q8_0_matvec_kernel<<<dim3((uint32_t)out_dim, (uint32_t)n_tok, 1), 1, 0, g_stream>>>(
+        constexpr uint32_t ROWS_PER_BLOCK = 4u;
+        const uint32_t row_blocks = ((uint32_t)out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
+        ds4_cuda_dense_q8_0_matvec_kernel<ROWS_PER_BLOCK><<<
+                dim3(row_blocks, (uint32_t)n_tok, 1),
+                dim3(32u, ROWS_PER_BLOCK, 1),
+                0, g_stream>>>(
             weights,
             g_scratch_matmul_q8_0_xq,
             g_scratch_matmul_q8_0_xscale,
