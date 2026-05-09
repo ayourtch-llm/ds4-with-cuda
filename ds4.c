@@ -18873,13 +18873,30 @@ int ds4_engine_cuda_session_test_vectors_test(ds4_engine *e, const char *vec_pat
         return 1;
     }
 
+    /* Optional skip-long-prompts cap.  The per-token-loop prefill is slow on
+     * 5000+ token prompts (Phase 3b is the perf phase); CI / quick-validation
+     * runs can set DS4_CUDA_VEC_MAX_TOKENS=N to skip cases whose encoded
+     * prompt exceeds N tokens.  Default: 0 (no cap, run everything). */
+    uint32_t max_prompt_tokens = 0u;
+    {
+        const char *env = getenv("DS4_CUDA_VEC_MAX_TOKENS");
+        if (env && env[0]) {
+            char *endp = NULL;
+            const long v = strtol(env, &endp, 10);
+            if (endp != env && v > 0) max_prompt_tokens = (uint32_t)v;
+        }
+    }
+
     fprintf(stderr,
-            "ds4: 3c-4 session-test-vectors — vec=%s\n"
+            "ds4: 3c-4 session-test-vectors — vec=%s%s%u\n"
             "ds4: NOTE: drives each case through ds4_session_create + sync (full\n"
             "ds4:       prefill); compares last-token argmax against API step-0.\n",
-            vec_path);
+            vec_path,
+            max_prompt_tokens ? " max_prompt_tokens=" : "",
+            max_prompt_tokens);
 
     int total_cases     = 0;
+    int skipped_cases   = 0;
     int top1_match      = 0;
     int topk_overlap_sum = 0;
     int topk_total      = 0;
@@ -18912,6 +18929,25 @@ int ds4_engine_cuda_session_test_vectors_test(ds4_engine *e, const char *vec_pat
         if (prompt.len <= 0) {
             fprintf(stderr, "ds4: 3c-4 case %s — empty prompt after encoding\n", id);
             ds4_tokens_free(&prompt);
+            continue;
+        }
+
+        if (max_prompt_tokens != 0 && (uint32_t)prompt.len > max_prompt_tokens) {
+            fprintf(stderr,
+                    "ds4: 3c-4 case %s — skip (prompt_len=%d > DS4_CUDA_VEC_MAX_TOKENS=%u; "
+                    "deferred to Phase 3b batched prefill)\n",
+                    id, prompt.len, max_prompt_tokens);
+            skipped_cases++;
+            ds4_tokens_free(&prompt);
+            /* Still drain the case's step / top / end lines so the parser
+             * stays aligned with the next case header. */
+            while (fgets(line, sizeof(line), fp)) {
+                char *q1 = line;
+                while (*q1 && isspace((unsigned char)*q1)) q1++;
+                size_t qlen = strlen(q1);
+                while (qlen && isspace((unsigned char)q1[qlen - 1])) q1[--qlen] = '\0';
+                if (!strcmp(q1, "end")) break;
+            }
             continue;
         }
 
@@ -19091,18 +19127,20 @@ int ds4_engine_cuda_session_test_vectors_test(ds4_engine *e, const char *vec_pat
         ? 100.0 * (double)topk_overlap_sum / (double)topk_total
         : 0.0;
     fprintf(stderr,
-            "ds4: 3c-4 session-test-vectors aggregate: %d cases — "
+            "ds4: 3c-4 session-test-vectors aggregate: %d cases (skipped %d) — "
             "top1 %d/%d (%.1f%%), topK overlap %d/%d (%.1f%%)\n",
-            total_cases, top1_match, total_cases, top1_pct,
+            total_cases, skipped_cases,
+            top1_match, total_cases, top1_pct,
             topk_overlap_sum, topk_total, topk_pct);
 
-    /* Acceptance gate from the 3c brief: top-1 >= 75% (matches 2.1c-5 gate;
-     * tightenable once full-prefill semantics prove out).  Pass also requires
-     * at least one case actually ran. */
+    /* Acceptance gate: top-1 >= 75% across cases that ran.  Cases skipped
+     * via DS4_CUDA_VEC_MAX_TOKENS are deferred to Phase 3b's batched
+     * prefill (per-token-loop is correct but slow on 5000-token prompts). */
     const bool pass = (total_cases > 0) && (top1_match * 4 >= total_cases * 3);
     fprintf(stderr,
-            "ds4: 3c-4 %s (top1>=75%% gate)\n",
-            pass ? "PASS" : "FAIL");
+            "ds4: 3c-4 %s (top1>=75%% gate)%s\n",
+            pass ? "PASS" : "FAIL",
+            skipped_cases > 0 ? " — long-prompt cases skipped, see Phase 3b" : "");
     return pass ? 0 : 1;
 #endif
 }
