@@ -22,7 +22,7 @@
 #include <unistd.h>
 
 #define GGML_COMMON_IMPL_CUDA
-#include "tmp/llama.cpp/ggml/src/ggml-common.h"
+#include "third_party/ggml-common.h"
 #undef GGML_COMMON_IMPL_CUDA
 
 extern "C" void ds4_test_dense_q8_0_matvec(
