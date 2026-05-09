@@ -1860,40 +1860,8 @@ DS4_CUDA_STUB(ds4_cuda_store_raw_kv_batch_tensor, (ds4_cuda_tensor *, const ds4_
  * compressor section at the bottom of this file. */
 /* ds4_cuda_compressor_store_batch_tensor implemented in the Phase 3a
  * compressor section at the bottom of this file. */
-int ds4_cuda_compressor_prefill_tensor(
-        ds4_cuda_tensor       *comp_cache,
-        ds4_cuda_tensor       *state_kv,
-        ds4_cuda_tensor       *state_score,
-        const ds4_cuda_tensor *kv,
-        const ds4_cuda_tensor *sc,
-        const void            *model_map,
-        uint64_t               model_size,
-        uint64_t               ape_offset,
-        uint32_t               ape_type,
-        uint64_t               norm_offset,
-        uint32_t               norm_type,
-        uint32_t               head_dim,
-        uint32_t               ratio,
-        uint32_t               pos0,
-        uint32_t               n_tokens,
-        uint32_t               n_rot,
-        uint32_t               n_ctx_orig,
-        bool                   quantize_fp8,
-        float                  freq_base,
-        float                  freq_scale,
-        float                  ext_factor,
-        float                  attn_factor,
-        float                  beta_fast,
-        float                  beta_slow,
-        float                  rms_eps) {
-    (void)comp_cache; (void)state_kv; (void)state_score; (void)kv; (void)sc;
-    (void)model_map; (void)model_size; (void)ape_offset; (void)ape_type;
-    (void)norm_offset; (void)norm_type; (void)head_dim; (void)ratio;
-    (void)pos0; (void)n_tokens; (void)n_rot; (void)n_ctx_orig; (void)quantize_fp8;
-    (void)freq_base; (void)freq_scale; (void)ext_factor; (void)attn_factor;
-    (void)beta_fast; (void)beta_slow; (void)rms_eps;
-    return ds4_cuda_kernel_stub("ds4_cuda_compressor_prefill_tensor");
-}
+/* ds4_cuda_compressor_prefill_tensor implemented in the Phase 3a
+ * compressor section at the bottom of this file. */
 
 int ds4_cuda_compressor_prefill_ratio4_replay_tensor(
         ds4_cuda_tensor       *comp_cache,
@@ -6282,6 +6250,345 @@ int ds4_cuda_compressor_prefill_state_ratio4_tensor(
         (const float *)kv_ptr, (const float *)sc_ptr, ape_ptr,
         width, pos0, ape_type);
     return ds4_cuda_check(cudaGetLastError(), "launch compressor_prefill_state_ratio4");
+}
+
+} /* extern "C" */
+
+/* compressor_prefill — batched generalisation of compressor_update.
+ *
+ * Spec: metal/dsv4_kv.metal + ds4_metal.m:6968-7322 (~356 LoC).  For
+ * n_tokens input rows starting at pos0, partition into n_comp = n_tokens/
+ * ratio "complete" emit segments + a remainder of `rem = n_tokens - n_comp*
+ * ratio` tail rows.  Pipeline:
+ *   1. Initialize state_kv/state_score: rows from the tail (rem != 0) and
+ *      the previous segment (ratio==4 + cutoff>=ratio) get projected
+ *      writes; the rest fill (0.0 / -INFINITY).
+ *   2. For each complete emit c in 0..n_comp:
+ *        scores[c, ...] = sc[c*ratio..(c+1)*ratio, :] +
+ *                         ape[((pos0+c*ratio+r) % ratio) * width + d]
+ *        comp_cache[c, :] = softmax_pool over (scores, kv) per emit's
+ *                           ratio source rows (ratio==4: cross-segment
+ *                           8-row pattern; otherwise direct ratio-row).
+ *   3. RMS norm (batched n_comp rows) on comp_cache.
+ *   4. RoPE per emit row at pos = pos0 + c*ratio.
+ *   5. Optional FP8 quantize on comp_cache.
+ *
+ * CUDA fuses Metal's separate score_with_ape + concat_3d + softmax_pool
+ * dispatches into one batched pool kernel; the score_with_ape and
+ * cross-segment row-pack are computed on-the-fly per (c, d) output. */
+
+/* Per-element state init for compressor_prefill.  Mirrors the Metal
+ * fill_f32_rows + set_rows_projected combination at line 7050-7137.
+ *
+ * For ratio==4 (state_rows=8):
+ *   prev_start = cutoff - ratio (only valid if cutoff >= ratio)
+ *   row r in 0..3:
+ *     if cutoff >= ratio:
+ *       state[r, d] = kv[prev_start + r, d] / sc[prev_start + r, d] + ape
+ *     else:
+ *       state[r, d] = (0, -INF)
+ *   row r in 4..7:
+ *     if (r - 4) < rem:
+ *       state[r, d] = kv[cutoff + (r-4), d] / sc[cutoff + (r-4), d] + ape
+ *     else:
+ *       state[r, d] = (0, -INF)
+ *
+ * For ratio!=4 (state_rows=ratio):
+ *   row r in 0..ratio-1:
+ *     if r < rem: state[r, d] = kv[cutoff + r, d] / sc[cutoff + r, d] + ape
+ *     else:       state[r, d] = (0, -INF) */
+static __global__ void ds4_cuda_compressor_prefill_state_init_kernel(
+        float       *state_kv,
+        float       *state_score,
+        const float *kv,
+        const float *sc,
+        const void  *ape,
+        uint32_t     width,
+        uint32_t     ratio,
+        uint32_t     pos0,
+        uint32_t     n_tokens,
+        uint32_t     ape_type) {
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t r = blockIdx.y;
+    if (d >= width) return;
+
+    const uint32_t coff = (ratio == 4u) ? 2u : 1u;
+    const uint32_t state_rows = coff * ratio;
+    if (r >= state_rows) return;
+
+    const uint32_t n_comp = n_tokens / ratio;
+    const uint32_t cutoff = n_comp * ratio;
+    const uint32_t rem = n_tokens - cutoff;
+    const uint64_t dst = (uint64_t)r * width + d;
+
+    int has_src = 0;
+    uint32_t src_token = 0;
+
+    if (ratio == 4u) {
+        if (r < ratio) {
+            if (cutoff >= ratio) {
+                src_token = cutoff - ratio + r;
+                has_src = 1;
+            }
+        } else {
+            const uint32_t r4 = r - ratio;
+            if (r4 < rem) {
+                src_token = cutoff + r4;
+                has_src = 1;
+            }
+        }
+    } else {
+        if (r < rem) {
+            src_token = cutoff + r;
+            has_src = 1;
+        }
+    }
+
+    if (has_src) {
+        const uint32_t pos_mod = (pos0 + src_token) % ratio;
+        const uint64_t ape_i = (uint64_t)pos_mod * width + d;
+        float ape_v;
+        if (ape_type == 1u) {
+            ape_v = __half2float(((const __half *)ape)[ape_i]);
+        } else {
+            ape_v = ((const float *)ape)[ape_i];
+        }
+        state_kv   [dst] = kv[(uint64_t)src_token * width + d];
+        state_score[dst] = sc[(uint64_t)src_token * width + d] + ape_v;
+    } else {
+        state_kv   [dst] = 0.0f;
+        state_score[dst] = -INFINITY;
+    }
+}
+
+/* Batched compressor pool with score_with_ape fused.  For each (comp_idx c,
+ * dim d) output element of comp_cache:
+ *   ratio == 4:  pool 8 rows
+ *     rows 0..3: previous segment, "first half" of kv/sc rows at
+ *                positions [(c-1)*ratio + r] for r in 0..3, dim d.
+ *                For c==0 (no previous segment), rows are (0, -INF).
+ *     rows 4..7: current segment, "second half" of kv/sc rows at
+ *                positions [c*ratio + r] for r in 0..3, dim head_dim+d.
+ *     scores get + ape[((pos0 + token) % 4) * width + dim] each.
+ *   ratio != 4: pool `ratio` rows from current emit segment
+ *     rows 0..ratio-1: kv/sc[c*ratio + r, d] for r in 0..ratio-1.
+ *     scores get + ape[((pos0 + c*ratio + r) % ratio) * width + d].
+ *
+ * Single fused kernel: avoids materialising the score_with_ape scratch
+ * buffer + the ratio==4 8-row pack scratch buffer that Metal uses. */
+static __global__ void ds4_cuda_compressor_prefill_pool_kernel(
+        float       *comp_cache,
+        const float *kv,
+        const float *sc,
+        const void  *ape,
+        uint32_t     head_dim,
+        uint32_t     width,
+        uint32_t     ratio,
+        uint32_t     pos0,
+        uint32_t     ape_type) {
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t c = blockIdx.y;   /* emit index */
+    if (d >= head_dim) return;
+
+    auto load_ape = [&] (uint32_t pos_mod, uint32_t dim_off) -> float {
+        const uint64_t ape_i = (uint64_t)pos_mod * width + dim_off;
+        if (ape_type == 1u) {
+            return __half2float(((const __half *)ape)[ape_i]);
+        }
+        return ((const float *)ape)[ape_i];
+    };
+
+    if (ratio == 4u) {
+        float scores[8], values[8];
+        /* rows 0..3: previous segment, first half, d. */
+        if (c == 0u) {
+            #pragma unroll
+            for (uint32_t r = 0; r < 4u; r++) {
+                scores[r] = -INFINITY;
+                values[r] = 0.0f;
+            }
+        } else {
+            const uint32_t prev_base = (c - 1u) * ratio;
+            #pragma unroll
+            for (uint32_t r = 0; r < 4u; r++) {
+                const uint32_t tok = prev_base + r;
+                const uint32_t pos_mod = (pos0 + tok) % ratio;
+                const uint64_t src = (uint64_t)tok * width + d;
+                scores[r] = sc[src] + load_ape(pos_mod, d);
+                values[r] = kv[src];
+            }
+        }
+        /* rows 4..7: current segment, second half, head_dim+d. */
+        const uint32_t cur_base = c * ratio;
+        #pragma unroll
+        for (uint32_t r = 0; r < 4u; r++) {
+            const uint32_t tok = cur_base + r;
+            const uint32_t pos_mod = (pos0 + tok) % ratio;
+            const uint64_t src = (uint64_t)tok * width + head_dim + d;
+            scores[4u + r] = sc[src] + load_ape(pos_mod, head_dim + d);
+            values[4u + r] = kv[src];
+        }
+
+        float max_s = scores[0];
+        #pragma unroll
+        for (uint32_t i = 1; i < 8u; i++) if (scores[i] > max_s) max_s = scores[i];
+        float sum = 0.0f, acc = 0.0f;
+        #pragma unroll
+        for (uint32_t i = 0; i < 8u; i++) {
+            const float w = expf(scores[i] - max_s);
+            sum += w;
+            acc += w * values[i];
+        }
+        comp_cache[(uint64_t)c * head_dim + d] = acc / sum;
+    } else {
+        /* General path: pool `ratio` rows from current emit segment,
+         * each row has direct (kv, sc+ape) at (token, d). */
+        const uint32_t cur_base = c * ratio;
+        float max_s = -INFINITY;
+        for (uint32_t r = 0; r < ratio; r++) {
+            const uint32_t tok = cur_base + r;
+            const uint32_t pos_mod = (pos0 + tok) % ratio;
+            const float s = sc[(uint64_t)tok * width + d] + load_ape(pos_mod, d);
+            if (s > max_s) max_s = s;
+        }
+        float sum = 0.0f, acc = 0.0f;
+        for (uint32_t r = 0; r < ratio; r++) {
+            const uint32_t tok = cur_base + r;
+            const uint32_t pos_mod = (pos0 + tok) % ratio;
+            const uint64_t src = (uint64_t)tok * width + d;
+            const float s = sc[src] + load_ape(pos_mod, d);
+            const float v = kv[src];
+            const float w = expf(s - max_s);
+            sum += w;
+            acc += w * v;
+        }
+        comp_cache[(uint64_t)c * head_dim + d] = acc / sum;
+    }
+}
+
+extern "C" {
+
+int ds4_cuda_compressor_prefill_tensor(
+        ds4_cuda_tensor       *comp_cache,
+        ds4_cuda_tensor       *state_kv,
+        ds4_cuda_tensor       *state_score,
+        const ds4_cuda_tensor *kv,
+        const ds4_cuda_tensor *sc,
+        const void            *model_map,
+        uint64_t               model_size,
+        uint64_t               ape_offset,
+        uint32_t               ape_type,
+        uint64_t               norm_offset,
+        uint32_t               norm_type,
+        uint32_t               head_dim,
+        uint32_t               ratio,
+        uint32_t               pos0,
+        uint32_t               n_tokens,
+        uint32_t               n_rot,
+        uint32_t               n_ctx_orig,
+        bool                   quantize_fp8,
+        float                  freq_base,
+        float                  freq_scale,
+        float                  ext_factor,
+        float                  attn_factor,
+        float                  beta_fast,
+        float                  beta_slow,
+        float                  rms_eps) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
+        head_dim == 0u || ratio == 0u || n_tokens == 0u ||
+        n_rot > head_dim || (n_rot & 1u) != 0u ||
+        (ape_type != 0u && ape_type != 1u) ||
+        norm_type != 0u) return 0;
+
+    const uint32_t coff = (ratio == 4u) ? 2u : 1u;
+    const uint32_t width = coff * head_dim;
+    const uint32_t state_rows = coff * ratio;
+    const uint32_t n_comp = n_tokens / ratio;
+    const uint64_t kv_bytes    = (uint64_t)n_tokens * width * sizeof(float);
+    const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
+    const uint64_t comp_bytes  = (uint64_t)n_comp * head_dim * sizeof(float);
+    const uint64_t elem_ape    = (ape_type == 1u) ? 2u : 4u;
+    const uint64_t ape_bytes   = (uint64_t)width * ratio * elem_ape;
+    const uint64_t norm_bytes  = (uint64_t)head_dim * sizeof(float);
+
+    if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
+        norm_offset > model_size || norm_bytes > model_size - norm_offset) {
+        fprintf(stderr,
+                "ds4: CUDA compressor_prefill tensor range outside mapped model\n");
+        return 0;
+    }
+
+    void *kv_ptr = NULL, *sc_ptr = NULL, *st_kv_ptr = NULL, *st_sc_ptr = NULL, *comp_ptr = NULL;
+    if (!ds4_cuda_tensor_range(kv,          kv_bytes,    "prefill kv",          &kv_ptr))    return 0;
+    if (!ds4_cuda_tensor_range(sc,          kv_bytes,    "prefill sc",          &sc_ptr))    return 0;
+    if (!ds4_cuda_tensor_range(state_kv,    state_bytes, "prefill state_kv",    &st_kv_ptr)) return 0;
+    if (!ds4_cuda_tensor_range(state_score, state_bytes, "prefill state_score", &st_sc_ptr)) return 0;
+    if (n_comp != 0u) {
+        if (!ds4_cuda_tensor_range(comp_cache, comp_bytes, "prefill comp_cache", &comp_ptr)) return 0;
+    }
+
+    const void *ape_ptr = (const uint8_t *)model_map + ape_offset;
+
+    /* Stage 1: state init (always — fills entire state from tail/prev). */
+    {
+        constexpr uint32_t block_x = 256u;
+        dim3 block(block_x, 1u, 1u);
+        dim3 grid((width + block_x - 1u) / block_x, state_rows, 1u);
+        ds4_cuda_compressor_prefill_state_init_kernel<<<grid, block, 0, g_stream>>>(
+            (float *)st_kv_ptr, (float *)st_sc_ptr,
+            (const float *)kv_ptr, (const float *)sc_ptr, ape_ptr,
+            width, ratio, pos0, n_tokens, ape_type);
+        if (!ds4_cuda_check(cudaGetLastError(), "launch prefill state_init")) return 0;
+    }
+
+    if (n_comp == 0u) return 1;
+
+    /* Stage 2: batched pool with score_with_ape fused. */
+    {
+        constexpr uint32_t block_x = 128u;
+        dim3 block(block_x, 1u, 1u);
+        dim3 grid((head_dim + block_x - 1u) / block_x, n_comp, 1u);
+        ds4_cuda_compressor_prefill_pool_kernel<<<grid, block, 0, g_stream>>>(
+            (float *)comp_ptr,
+            (const float *)kv_ptr, (const float *)sc_ptr, ape_ptr,
+            head_dim, width, ratio, pos0, ape_type);
+        if (!ds4_cuda_check(cudaGetLastError(), "launch prefill pool")) return 0;
+    }
+
+    /* Stage 3: batched RMS norm (n_comp rows in-place). */
+    if (!ds4_cuda_rms_norm_weight_rows_tensor(comp_cache, comp_cache,
+                                              model_map, model_size, norm_offset,
+                                              head_dim, n_comp, rms_eps)) return 0;
+
+    /* Stage 4: per-row RoPE.  Existing ds4_cuda_rope_tail_tensor uses
+     * pos = pos0_arg + tok with stride 1; compressor needs pos = pos0 +
+     * c*ratio with stride `ratio`.  Loop n_comp single-token launches
+     * (n_comp is small in production: ctx/ratio = up to a few hundred). */
+    if (n_rot != 0u) {
+        for (uint32_t c = 0; c < n_comp; c++) {
+            ds4_cuda_tensor *row_view = ds4_cuda_tensor_view(comp_cache,
+                    (uint64_t)c * head_dim * sizeof(float),
+                    (uint64_t)head_dim * sizeof(float));
+            if (!row_view) return 0;
+            const int rope_ok = ds4_cuda_rope_tail_tensor(
+                    row_view, /*n_tok=*/1, /*n_head=*/1,
+                    head_dim, n_rot, /*pos0=*/pos0 + c * ratio, n_ctx_orig,
+                    /*inverse=*/false,
+                    freq_base, freq_scale, ext_factor, attn_factor,
+                    beta_fast, beta_slow);
+            ds4_cuda_tensor_free(row_view);
+            if (!rope_ok) return 0;
+        }
+    }
+
+    /* Stage 5: optional FP8 quantize on comp_cache (n_comp rows). */
+    if (quantize_fp8) {
+        if (!ds4_cuda_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot)) return 0;
+    }
+
+    return 1;
 }
 
 } /* extern "C" */

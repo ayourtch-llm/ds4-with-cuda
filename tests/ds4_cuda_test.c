@@ -4861,6 +4861,336 @@ DS4_CUDA_PARITY_TEST(compressor_prefill_state_ratio4,
     .cfg = (void *)&compressor_prefill_state_cfg_v);
 
 /* ---------------------------------------------------------------------------
+ * Phase 3a-4 — compressor_prefill (batched generalisation of 3a-2).
+ *
+ * For n_tokens input rows, partitions into n_comp = n_tokens/ratio
+ * complete emit segments + a remainder.  Each emit triggers the same
+ * pool→rms→rope chain as compressor_update, batched across emits.
+ *
+ * CPU oracle composes existing public helpers (per emit:
+ * compressor_pool_cpu with n_comp=1 + rms_norm_weight + rope_tail_ext_inplace
+ * + optional dsv4_fp8_kv_quantize_row_inplace_cpu).  Same input shaping
+ * as 3a-2 (kv, norm_w → abs+0.5) — lesson from 3a-2 emit case.
+ * --------------------------------------------------------------------------- */
+
+struct compressor_prefill_cfg {
+    uint32_t head_dim;
+    uint32_t ratio;
+    uint32_t pos0;
+    uint32_t n_tokens;
+    uint32_t n_rot;
+    uint32_t n_ctx_orig;
+    int      ape_type;
+    int      quantize_fp8;
+    float    rms_eps;
+    float    freq_base;
+    float    freq_scale;
+    float    ext_factor;
+    float    attn_factor;
+    float    beta_fast;
+    float    beta_slow;
+};
+
+/* Layout in `in`:
+ *   kv          : n_tokens * width    (width = coff*head_dim)
+ *   sc          : n_tokens * width
+ *   ape (f32)   : ratio * width
+ *   norm_weight : head_dim
+ * Output: state_kv (state_rows * width) | state_score | comp_cache (n_comp * head_dim).
+ * If n_comp == 0, comp_cache portion is empty. */
+
+/* CPU softmax_pool over the same 8-row pattern compressor_update uses, but
+ * for emit index c with cross-segment pattern.  Uses double accumulators
+ * (Trap #4) so the oracle tracks f64 truth. */
+static void compressor_prefill_pool_one_cpu(
+        float *out_row,
+        const float *kv, const float *sc,
+        const float *ape, uint32_t width, uint32_t ratio,
+        uint32_t pos0, uint32_t c, uint32_t head_dim) {
+    if (ratio == 4u) {
+        for (uint32_t d = 0; d < head_dim; d++) {
+            double scores[8], values[8];
+            if (c == 0u) {
+                for (uint32_t r = 0; r < 4; r++) {
+                    scores[r] = -INFINITY;
+                    values[r] = 0.0;
+                }
+            } else {
+                const uint32_t prev_base = (c - 1u) * ratio;
+                for (uint32_t r = 0; r < 4; r++) {
+                    const uint32_t tok = prev_base + r;
+                    const uint32_t pos_mod = (pos0 + tok) % ratio;
+                    const size_t src = (size_t)tok * width + d;
+                    scores[r] = (double)sc[src] +
+                                (double)ape[(size_t)pos_mod * width + d];
+                    values[r] = (double)kv[src];
+                }
+            }
+            const uint32_t cur_base = c * ratio;
+            for (uint32_t r = 0; r < 4; r++) {
+                const uint32_t tok = cur_base + r;
+                const uint32_t pos_mod = (pos0 + tok) % ratio;
+                const size_t src = (size_t)tok * width + head_dim + d;
+                scores[4 + r] = (double)sc[src] +
+                                (double)ape[(size_t)pos_mod * width + head_dim + d];
+                values[4 + r] = (double)kv[src];
+            }
+            double max_s = scores[0];
+            for (uint32_t i = 1; i < 8; i++) if (scores[i] > max_s) max_s = scores[i];
+            double sum = 0.0, acc = 0.0;
+            for (uint32_t i = 0; i < 8; i++) {
+                const double w = exp(scores[i] - max_s);
+                sum += w; acc += w * values[i];
+            }
+            out_row[d] = (float)(acc / sum);
+        }
+    } else {
+        for (uint32_t d = 0; d < head_dim; d++) {
+            const uint32_t cur_base = c * ratio;
+            double max_s = -INFINITY;
+            for (uint32_t r = 0; r < ratio; r++) {
+                const uint32_t tok = cur_base + r;
+                const uint32_t pos_mod = (pos0 + tok) % ratio;
+                const double s = (double)sc[(size_t)tok * width + d] +
+                                 (double)ape[(size_t)pos_mod * width + d];
+                if (s > max_s) max_s = s;
+            }
+            double sum = 0.0, acc = 0.0;
+            for (uint32_t r = 0; r < ratio; r++) {
+                const uint32_t tok = cur_base + r;
+                const uint32_t pos_mod = (pos0 + tok) % ratio;
+                const size_t src = (size_t)tok * width + d;
+                const double s = (double)sc[src] +
+                                 (double)ape[(size_t)pos_mod * width + d];
+                const double v = (double)kv[src];
+                const double w = exp(s - max_s);
+                sum += w; acc += w * v;
+            }
+            out_row[d] = (float)(acc / sum);
+        }
+    }
+}
+
+/* Inline state-init reference matching the CUDA kernel. */
+static void compressor_prefill_state_init_cpu(
+        float *state_kv, float *state_sc,
+        const float *kv, const float *sc, const float *ape,
+        uint32_t width, uint32_t ratio, uint32_t pos0, uint32_t n_tokens) {
+    const uint32_t coff = (ratio == 4u) ? 2u : 1u;
+    const uint32_t state_rows = coff * ratio;
+    const uint32_t n_comp = n_tokens / ratio;
+    const uint32_t cutoff = n_comp * ratio;
+    const uint32_t rem = n_tokens - cutoff;
+
+    for (uint32_t r = 0; r < state_rows; r++) {
+        for (uint32_t d = 0; d < width; d++) {
+            int has_src = 0; uint32_t src_token = 0;
+            if (ratio == 4u) {
+                if (r < ratio) {
+                    if (cutoff >= ratio) { src_token = cutoff - ratio + r; has_src = 1; }
+                } else {
+                    const uint32_t r4 = r - ratio;
+                    if (r4 < rem) { src_token = cutoff + r4; has_src = 1; }
+                }
+            } else {
+                if (r < rem) { src_token = cutoff + r; has_src = 1; }
+            }
+            const size_t dst = (size_t)r * width + d;
+            if (has_src) {
+                const uint32_t pos_mod = (pos0 + src_token) % ratio;
+                state_kv[dst] = kv[(size_t)src_token * width + d];
+                state_sc[dst] = sc[(size_t)src_token * width + d] +
+                                ape[(size_t)pos_mod * width + d];
+            } else {
+                state_kv[dst] = 0.0f;
+                state_sc[dst] = -INFINITY;
+            }
+        }
+    }
+}
+
+static int compressor_prefill_cpu(const float *in, float *out, void *cfg) {
+    const struct compressor_prefill_cfg *c = cfg;
+    const uint32_t coff = (c->ratio == 4u) ? 2u : 1u;
+    const uint32_t width = coff * c->head_dim;
+    const uint32_t state_rows = coff * c->ratio;
+    const uint32_t n_comp = c->n_tokens / c->ratio;
+    const size_t kv_n      = (size_t)c->n_tokens * width;
+    const size_t ape_n     = (size_t)c->ratio * width;
+    const size_t state_n   = (size_t)state_rows * width;
+    const size_t comp_n    = (size_t)n_comp * c->head_dim;
+    const float *kv0      = in;
+    const float *sc       = kv0 + kv_n;
+    const float *ape      = sc + kv_n;
+    const float *norm_w0  = ape + ape_n;
+
+    /* Shape kv and norm_weight per the 3a-2 lesson. */
+    float *kv     = (float *)malloc(kv_n        * sizeof(float));
+    float *norm_w = (float *)malloc(c->head_dim * sizeof(float));
+    if (!kv || !norm_w) { free(kv); free(norm_w); return 0; }
+    memcpy(kv,     kv0,     kv_n        * sizeof(float));
+    memcpy(norm_w, norm_w0, c->head_dim * sizeof(float));
+    compressor_update_shape_buf(kv,     kv_n);
+    compressor_update_shape_buf(norm_w, c->head_dim);
+
+    float *state_kv  = out;
+    float *state_sc  = out + state_n;
+    float *comp      = out + 2u * state_n;
+
+    /* Stage 1: state init. */
+    compressor_prefill_state_init_cpu(state_kv, state_sc, kv, sc, ape,
+                                      width, c->ratio, c->pos0, c->n_tokens);
+
+    if (n_comp == 0) { free(kv); free(norm_w); return 1; }
+
+    /* Stage 2: per-emit pool. */
+    for (uint32_t cc = 0; cc < n_comp; cc++) {
+        compressor_prefill_pool_one_cpu(comp + (size_t)cc * c->head_dim,
+                                        kv, sc, ape,
+                                        width, c->ratio, c->pos0, cc, c->head_dim);
+    }
+
+    /* Stage 3: batched RMS norm (n_comp rows). */
+    for (uint32_t cc = 0; cc < n_comp; cc++) {
+        float *row = comp + (size_t)cc * c->head_dim;
+        rms_norm_weight(row, row, norm_w, (uint64_t)c->head_dim, c->rms_eps);
+    }
+
+    /* Stage 4: RoPE per emit row. */
+    if (c->n_rot != 0u) {
+        for (uint32_t cc = 0; cc < n_comp; cc++) {
+            float *row = comp + (size_t)cc * c->head_dim;
+            const uint32_t pos = c->pos0 + cc * c->ratio;
+            rope_tail_ext_inplace(row, /*n_head=*/1, c->head_dim, c->n_rot,
+                                  pos, (uint64_t)c->n_ctx_orig,
+                                  c->freq_base, c->freq_scale, c->ext_factor,
+                                  c->attn_factor, c->beta_fast, c->beta_slow,
+                                  /*inverse=*/false);
+        }
+    }
+
+    /* Stage 5: optional FP8 quantize on each emit row (head_dim, n_rot). */
+    if (c->quantize_fp8) {
+        for (uint32_t cc = 0; cc < n_comp; cc++) {
+            float *row = comp + (size_t)cc * c->head_dim;
+            dsv4_fp8_kv_quantize_row_inplace_cpu(row, c->head_dim, c->n_rot);
+        }
+    }
+
+    free(kv); free(norm_w);
+    (void)comp_n;
+    return 1;
+}
+
+static int compressor_prefill_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                   size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct compressor_prefill_cfg *c = cfg;
+    const uint32_t coff = (c->ratio == 4u) ? 2u : 1u;
+    const uint32_t width = coff * c->head_dim;
+    const uint32_t state_rows = coff * c->ratio;
+    const uint32_t n_comp = c->n_tokens / c->ratio;
+    const size_t kv_n      = (size_t)c->n_tokens * width;
+    const size_t ape_n     = (size_t)c->ratio * width;
+    const size_t state_n   = (size_t)state_rows * width;
+    const size_t comp_n    = (size_t)n_comp * c->head_dim;
+    const float *kv0      = in;
+    const float *sc       = kv0 + kv_n;
+    const float *ape      = sc + kv_n;
+    const float *norm_w0  = ape + ape_n;
+
+    /* Match CPU thunk's shaping. */
+    float *kv     = (float *)malloc(kv_n        * sizeof(float));
+    float *norm_w = (float *)malloc(c->head_dim * sizeof(float));
+    if (!kv || !norm_w) { free(kv); free(norm_w); return 0; }
+    memcpy(kv,     kv0,     kv_n        * sizeof(float));
+    memcpy(norm_w, norm_w0, c->head_dim * sizeof(float));
+    compressor_update_shape_buf(kv,     kv_n);
+    compressor_update_shape_buf(norm_w, c->head_dim);
+
+    /* Pack model_map: [ape (f32) | norm_weight]. */
+    const size_t model_n = ape_n + c->head_dim;
+    float *model_h = (float *)malloc(model_n * sizeof(float));
+    if (!model_h) { free(kv); free(norm_w); return 0; }
+    memcpy(model_h,         ape,    ape_n       * sizeof(float));
+    memcpy(model_h + ape_n, norm_w, c->head_dim * sizeof(float));
+
+    ds4_cuda_tensor *kv_dev    = ds4_cuda_tensor_alloc((uint64_t)kv_n     * sizeof(float));
+    ds4_cuda_tensor *sc_dev    = ds4_cuda_tensor_alloc((uint64_t)kv_n     * sizeof(float));
+    ds4_cuda_tensor *st_kv_dev = ds4_cuda_tensor_alloc((uint64_t)state_n  * sizeof(float));
+    ds4_cuda_tensor *st_sc_dev = ds4_cuda_tensor_alloc((uint64_t)state_n  * sizeof(float));
+    ds4_cuda_tensor *comp_dev  = (n_comp != 0)
+        ? ds4_cuda_tensor_alloc((uint64_t)comp_n * sizeof(float)) : NULL;
+    ds4_cuda_tensor *model_dev = ds4_cuda_tensor_alloc((uint64_t)model_n * sizeof(float));
+    if (!kv_dev || !sc_dev || !st_kv_dev || !st_sc_dev ||
+        (n_comp != 0 && !comp_dev) || !model_dev) {
+        ds4_cuda_tensor_free(kv_dev);    ds4_cuda_tensor_free(sc_dev);
+        ds4_cuda_tensor_free(st_kv_dev); ds4_cuda_tensor_free(st_sc_dev);
+        ds4_cuda_tensor_free(comp_dev);  ds4_cuda_tensor_free(model_dev);
+        free(kv); free(norm_w); free(model_h); return 0;
+    }
+    int ok = ds4_cuda_tensor_write(kv_dev,    0, kv,      (uint64_t)kv_n    * sizeof(float))
+          && ds4_cuda_tensor_write(sc_dev,    0, sc,      (uint64_t)kv_n    * sizeof(float))
+          && ds4_cuda_tensor_write(model_dev, 0, model_h, (uint64_t)model_n * sizeof(float));
+    free(model_h);
+
+    const void *fake_model_map = ds4_cuda_tensor_contents(model_dev);
+    const uint64_t fake_model_size = (uint64_t)model_n * sizeof(float);
+    const uint64_t ape_offset  = 0;
+    const uint64_t norm_offset = ape_n * sizeof(float);
+
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_compressor_prefill_tensor(
+                    comp_dev, st_kv_dev, st_sc_dev, kv_dev, sc_dev,
+                    fake_model_map, fake_model_size,
+                    ape_offset, (uint32_t)c->ape_type,
+                    norm_offset, /*norm_type=*/0u,
+                    c->head_dim, c->ratio, c->pos0, c->n_tokens,
+                    c->n_rot, c->n_ctx_orig, c->quantize_fp8 != 0,
+                    c->freq_base, c->freq_scale, c->ext_factor, c->attn_factor,
+                    c->beta_fast, c->beta_slow, c->rms_eps);
+    if (ok) {
+        ok = ds4_cuda_tensor_copy(out_dev, 0,                                       st_kv_dev, 0, (uint64_t)state_n * sizeof(float))
+          && ds4_cuda_tensor_copy(out_dev, (uint64_t)state_n * sizeof(float),       st_sc_dev, 0, (uint64_t)state_n * sizeof(float));
+        if (ok && n_comp != 0) {
+            ok = ds4_cuda_tensor_copy(out_dev, (uint64_t)(2u * state_n) * sizeof(float),
+                                      comp_dev, 0, (uint64_t)comp_n * sizeof(float));
+        }
+    }
+    if (ok) ok = ds4_cuda_end_commands();
+
+    ds4_cuda_tensor_free(kv_dev);    ds4_cuda_tensor_free(sc_dev);
+    ds4_cuda_tensor_free(st_kv_dev); ds4_cuda_tensor_free(st_sc_dev);
+    ds4_cuda_tensor_free(comp_dev);  ds4_cuda_tensor_free(model_dev);
+    free(kv); free(norm_w);
+    return ok;
+}
+
+/* DS4 production: head_dim=128, ratio=4, n_rot=64.  n_tokens=10 →
+ * n_comp=2, rem=2 (exercises both complete-emits path and tail-rem path). */
+static const struct compressor_prefill_cfg compressor_prefill_r4_cfg = {
+    .head_dim = 128, .ratio = 4, .pos0 = 0, .n_tokens = 10,
+    .n_rot = 64, .n_ctx_orig = 65536,
+    .ape_type = 0, .quantize_fp8 = 0,
+    .rms_eps = 1e-6f,
+    .freq_base = 10000.0f, .freq_scale = 1.0f,
+    .ext_factor = 0.0f, .attn_factor = 1.0f,
+    .beta_fast = 32.0f, .beta_slow = 1.0f,
+};
+
+DS4_CUDA_PARITY_TEST(compressor_prefill_r4,
+    .seed = 0xCAFE,
+    /* width=256, n_tokens=10.
+     *   kv(10*256=2560) + sc(10*256=2560) + ape(4*256=1024) + norm_w(128) = 6272 */
+    .in_elems  = 6272,
+    /* state(8*256*2=4096) + comp(2*128=256) = 4352 */
+    .out_elems = 4352,
+    /* Tolerance 32: same chain as compressor_update emit path × n_comp=2. */
+    .ulp_tolerance = 32,
+    .cpu_fn = compressor_prefill_cpu, .cuda_fn = compressor_prefill_cuda,
+    .cfg = (void *)&compressor_prefill_r4_cfg);
+
+/* ---------------------------------------------------------------------------
  * Registry — order does not matter; failures are counted globally.
  * --------------------------------------------------------------------------- */
 
@@ -4932,6 +5262,7 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_compressor_update_r4_emit,
     &ds4_cuda_parity_compressor_update_r4_no_emit,
     &ds4_cuda_parity_compressor_prefill_state_ratio4,
+    &ds4_cuda_parity_compressor_prefill_r4,
     NULL,
 };
 
