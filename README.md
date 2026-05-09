@@ -503,13 +503,31 @@ JIT for now; a native `sm_120` recompile is a small Makefile change.
 
 **What works in this alpha** (Phase 3c session backend, on top of Phase 2 and Phase 3a):
 
-- 67+ per-kernel parity tests under `./ds4_cuda_test`, all passing within the
-  documented ULP tolerances against the CPU oracle (now including the five
-  compressor kernels from Phase 3a).
-- `./ds4-cuda -p "<prompt>"` greedy generation: session-level prefill via
-  `ds4_session_create` + `ds4_session_sync` + `ds4_session_eval` produces a
-  token stream. Phase 3b batched-attention is deferred, so prefill loops the
-  single-token decode kernel (slow-but-correct).
+- **68 per-kernel parity tests under `./ds4_cuda_test`, all passing** within the
+  documented ULP tolerances against the CPU oracle (includes the five
+  compressor kernels from Phase 3a and the `attention_output_q8_batch` GPU
+  port from Phase 3a-6).
+- **First-light token stream via `./ds4-cuda --cuda -p "<prompt>"`**:
+  session-level prefill via `ds4_session_create` + `ds4_session_sync` +
+  `ds4_session_eval` produces coherent output end-to-end. Reference run:
+
+  ```sh
+  ./ds4-cuda --cuda -p "Hello world test prompt" --nothink -n 16 --temp 0
+  # -> "Hello! I'm ready to help you. It looks like you're just testing"
+  # -> prefill 1.59 t/s, generation 1.55 t/s
+  ```
+
+  Phase 3b batched-attention is deferred, so prefill loops the validated
+  single-token decode kernel (slow-but-correct); per-token-loop is the
+  body-swap site documented in `cuda_graph_prefill_chunked`.
+- **Ground-truth validation passes** on
+  `tests/test-vectors/official.vec`: with
+  `DS4_CUDA_VEC_MAX_TOKENS=512 ./ds4-cuda --cuda-session-test-vectors`, the
+  three short prompts (`short_italian_fact`, `short_code_completion`,
+  `short_reasoning_plain`) all match the recorded DeepSeek API top-1 token
+  exactly (3/3 = 100% top-1 / 100% top-K).  The two long-prompt cases
+  (~5000 tokens each) are skipped via the env var until Phase 3b lands the
+  batched prefill kernels.
 - Engine-level diagnostic `--cuda-single-layer-test "<prompt>"`: full
   `embed → 43 layers → output head → vocab logits` forward on a real GGUF,
   per-token argmax and top-K agreement reported against the CPU oracle.
