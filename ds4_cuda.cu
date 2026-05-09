@@ -97,6 +97,10 @@ static int8_t *g_scratch_matmul_q8_0_xq;
 static size_t  g_scratch_matmul_q8_0_xq_bytes;
 static float  *g_scratch_matmul_q8_0_xscale;
 static size_t  g_scratch_matmul_q8_0_xscale_bytes;
+static int8_t *g_scratch_shared_gate_up_q8_0_xq;
+static size_t  g_scratch_shared_gate_up_q8_0_xq_bytes;
+static float  *g_scratch_shared_gate_up_q8_0_xscale;
+static size_t  g_scratch_shared_gate_up_q8_0_xscale_bytes;
 
 static int ds4_cuda_check(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
@@ -1108,6 +1112,10 @@ void ds4_cuda_cleanup(void) {
                           &g_scratch_matmul_q8_0_xscale_bytes);
     ds4_cuda_scratch_free((void **)&g_scratch_matmul_q8_0_xq,
                           &g_scratch_matmul_q8_0_xq_bytes);
+    ds4_cuda_scratch_free((void **)&g_scratch_shared_gate_up_q8_0_xscale,
+                          &g_scratch_shared_gate_up_q8_0_xscale_bytes);
+    ds4_cuda_scratch_free((void **)&g_scratch_shared_gate_up_q8_0_xq,
+                          &g_scratch_shared_gate_up_q8_0_xq_bytes);
     if (g_stream) {
         (void)cudaStreamDestroy(g_stream);
         g_stream = NULL;
@@ -1680,16 +1688,26 @@ int ds4_cuda_shared_gate_up_swiglu_q8_0_tensor(
         return 0;
     }
 
-    int8_t *xq = NULL;
-    float *xscale = NULL;
-    if (!ds4_cuda_check(cudaMallocManaged((void **)&xq, (size_t)blocks * 32u), "shared q8_0 xq allocation")) return 0;
-    if (!ds4_cuda_check(cudaMallocManaged((void **)&xscale, (size_t)blocks * sizeof(*xscale)), "shared q8_0 scale allocation")) {
-        (void)cudaFree(xq);
+    const uint64_t xq_bytes = blocks * 32u;
+    const uint64_t xscale_bytes = blocks * sizeof(*g_scratch_shared_gate_up_q8_0_xscale);
+    if (xq_bytes > SIZE_MAX || xscale_bytes > SIZE_MAX) return 0;
+    if (!ds4_cuda_scratch_reserve((void **)&g_scratch_shared_gate_up_q8_0_xq,
+                                  &g_scratch_shared_gate_up_q8_0_xq_bytes,
+                                  (size_t)xq_bytes,
+                                  "shared q8_0 xq scratch allocation") ||
+        !ds4_cuda_scratch_reserve((void **)&g_scratch_shared_gate_up_q8_0_xscale,
+                                  &g_scratch_shared_gate_up_q8_0_xscale_bytes,
+                                  (size_t)xscale_bytes,
+                                  "shared q8_0 scale scratch allocation")) {
         return 0;
     }
 
     ds4_cuda_quantize_q8_0_activation_kernel<<<1, 1, 0, g_stream>>>(
-        (const float *)x_ptr, xq, xscale, (uint32_t)in_dim, 1);
+        (const float *)x_ptr,
+        g_scratch_shared_gate_up_q8_0_xq,
+        g_scratch_shared_gate_up_q8_0_xscale,
+        (uint32_t)in_dim,
+        1);
     int ok = ds4_cuda_check(cudaGetLastError(), "launch shared q8_0 input quantize");
     const ds4_cuda_block_q8_0 *gate_w = NULL;
     const ds4_cuda_block_q8_0 *up_w = NULL;
@@ -1702,14 +1720,14 @@ int ds4_cuda_shared_gate_up_swiglu_q8_0_tensor(
     }
     if (ok) {
         ds4_cuda_shared_gate_up_swiglu_q8_0_kernel<<<(uint32_t)out_dim, 1, 0, g_stream>>>(
-            gate_w, up_w, xq, xscale,
+            gate_w,
+            up_w,
+            g_scratch_shared_gate_up_q8_0_xq,
+            g_scratch_shared_gate_up_q8_0_xscale,
             (float *)gate_ptr, (float *)up_ptr, (float *)mid_ptr,
             (uint32_t)in_dim, (uint32_t)out_dim);
         ok = ds4_cuda_check(cudaGetLastError(), "launch shared gate/up swiglu q8_0");
     }
-    if (ok) ok = ds4_cuda_check(cudaStreamSynchronize(g_stream), "shared q8_0 scratch lifetime");
-    (void)cudaFree(xscale);
-    (void)cudaFree(xq);
     return ok;
 }
 int ds4_cuda_matmul_f16_tensor(
