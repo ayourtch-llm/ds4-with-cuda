@@ -13864,6 +13864,420 @@ static int metal_graph_prompt_logits_test(
 
 #endif
 
+#ifdef DS4_USE_CUDA
+/* =========================================================================
+ * CUDA Release Graph State.
+ * =========================================================================
+ *
+ * Peer of ds4_metal_graph above.  Holds the persistent KV/compressor state
+ * and per-token decode work tensors for the CUDA backend session.  Phase 3c
+ * scope is single-token decode and per-token-loop prefill (Phase 3b deferred);
+ * the batch_* and MTP/spec_* tensors that the Metal graph maintains are not
+ * allocated here.  When 3b lands the per-token loops in cuda_graph_eval_token
+ * paths can be body-swapped without touching this struct.
+ */
+
+typedef struct {
+    /* One-token decode tensors.  cur_hc / next_hc ping-pong across the 43
+     * residual layers; see cuda_graph_eval_token_raw_swa for the swap.  hc_pre
+     * / hc_post / hc_comb are non-owning views over hc_split, matching Metal. */
+    ds4_cuda_tensor *cur_hc;
+    ds4_cuda_tensor *next_hc;
+    ds4_cuda_tensor *flat_hc;
+    ds4_cuda_tensor *hc_mix;
+    ds4_cuda_tensor *hc_split;
+    ds4_cuda_tensor *hc_pre;
+    ds4_cuda_tensor *hc_post;
+    ds4_cuda_tensor *hc_comb;
+    ds4_cuda_tensor *attn_cur;
+    ds4_cuda_tensor *attn_norm;
+    ds4_cuda_tensor *qr;
+    ds4_cuda_tensor *qr_norm;
+    ds4_cuda_tensor *q;
+    ds4_cuda_tensor *kv_raw;
+    ds4_cuda_tensor *kv;
+
+    /* Persistent KV state per layer.  See ds4_metal_graph for the geometry
+     * notes; the CUDA graph allocates the same shapes. */
+    ds4_cuda_tensor *layer_raw_cache[DS4_N_LAYER];
+    ds4_cuda_tensor *layer_attn_comp_cache[DS4_N_LAYER];
+    ds4_cuda_tensor *layer_attn_state_kv[DS4_N_LAYER];
+    ds4_cuda_tensor *layer_attn_state_score[DS4_N_LAYER];
+    ds4_cuda_tensor *layer_index_comp_cache[DS4_N_LAYER];
+    ds4_cuda_tensor *layer_index_state_kv[DS4_N_LAYER];
+    ds4_cuda_tensor *layer_index_state_score[DS4_N_LAYER];
+    uint32_t layer_n_comp[DS4_N_LAYER];
+    uint32_t layer_n_index_comp[DS4_N_LAYER];
+    uint32_t raw_cap;
+    uint32_t comp_cap;
+    uint32_t prefill_cap;
+    uint32_t raw_window;
+
+    /* Per-layer work tensors (reused in place every layer). */
+    ds4_cuda_tensor *comp_kv_cur;
+    ds4_cuda_tensor *comp_sc_cur;
+    ds4_cuda_tensor *indexer_q;
+    ds4_cuda_tensor *indexer_weights;
+    ds4_cuda_tensor *indexer_scores;
+    ds4_cuda_tensor *comp_mask;
+    ds4_cuda_tensor *comp_selected;
+    ds4_cuda_tensor *heads;
+    ds4_cuda_tensor *attn_low;
+    ds4_cuda_tensor *attn_out;
+    ds4_cuda_tensor *attn_group_tmp;
+    ds4_cuda_tensor *attn_low_tmp;
+    ds4_cuda_tensor *after_attn_hc;
+    ds4_cuda_tensor *ffn_flat;
+    ds4_cuda_tensor *ffn_mix;
+    ds4_cuda_tensor *ffn_split;
+    ds4_cuda_tensor *ffn_cur;
+    ds4_cuda_tensor *ffn_norm;
+    ds4_cuda_tensor *shared_gate;
+    ds4_cuda_tensor *shared_up;
+    ds4_cuda_tensor *shared_mid;
+    ds4_cuda_tensor *shared_out;
+    ds4_cuda_tensor *router_logits;
+    ds4_cuda_tensor *router_probs;
+    ds4_cuda_tensor *router_selected;
+    ds4_cuda_tensor *router_weights;
+    ds4_cuda_tensor *routed_gate;
+    ds4_cuda_tensor *routed_up;
+    ds4_cuda_tensor *routed_mid;
+    ds4_cuda_tensor *routed_down;
+    ds4_cuda_tensor *routed_out;
+    ds4_cuda_tensor *after_ffn_hc;
+
+    /* Output head. */
+    ds4_cuda_tensor *output_flat;
+    ds4_cuda_tensor *output_pre;
+    ds4_cuda_tensor *output_weights;
+    ds4_cuda_tensor *output_embd;
+    ds4_cuda_tensor *output_norm;
+    ds4_cuda_tensor *logits;
+
+    bool quality;
+} ds4_cuda_graph;
+
+static bool cuda_tensor_fill_f32(ds4_cuda_tensor *t, float v, uint64_t n) {
+    if (!t) return false;
+    if (ds4_cuda_tensor_bytes(t) < n * sizeof(float)) return false;
+    /* Managed allocations are host-addressable on GB10; no kernels have run
+     * yet at allocation time, so writing through the contents pointer is
+     * safe (no batch open). */
+    float *p = (float *)ds4_cuda_tensor_contents(t);
+    if (!p) return false;
+    for (uint64_t i = 0; i < n; i++) p[i] = v;
+    return true;
+}
+
+/* Release every CUDA tensor owned by the graph.  Caller contract: only invoke
+ * after ds4_cuda_synchronize() (no in-flight kernels) and outside an open
+ * command batch.  Views are freed before the bases they alias. */
+static void cuda_graph_free(ds4_cuda_graph *g) {
+    ds4_cuda_tensor_free(g->logits);
+    ds4_cuda_tensor_free(g->output_norm);
+    ds4_cuda_tensor_free(g->output_embd);
+    ds4_cuda_tensor_free(g->output_weights);
+    ds4_cuda_tensor_free(g->output_pre);
+    ds4_cuda_tensor_free(g->output_flat);
+    ds4_cuda_tensor_free(g->after_ffn_hc);
+    ds4_cuda_tensor_free(g->routed_out);
+    ds4_cuda_tensor_free(g->routed_down);
+    ds4_cuda_tensor_free(g->routed_mid);
+    ds4_cuda_tensor_free(g->routed_up);
+    ds4_cuda_tensor_free(g->routed_gate);
+    ds4_cuda_tensor_free(g->router_weights);
+    ds4_cuda_tensor_free(g->router_selected);
+    ds4_cuda_tensor_free(g->router_probs);
+    ds4_cuda_tensor_free(g->router_logits);
+    ds4_cuda_tensor_free(g->shared_out);
+    ds4_cuda_tensor_free(g->shared_mid);
+    ds4_cuda_tensor_free(g->shared_up);
+    ds4_cuda_tensor_free(g->shared_gate);
+    ds4_cuda_tensor_free(g->ffn_norm);
+    ds4_cuda_tensor_free(g->ffn_cur);
+    ds4_cuda_tensor_free(g->ffn_split);
+    ds4_cuda_tensor_free(g->ffn_mix);
+    ds4_cuda_tensor_free(g->ffn_flat);
+    ds4_cuda_tensor_free(g->after_attn_hc);
+    ds4_cuda_tensor_free(g->attn_low_tmp);
+    ds4_cuda_tensor_free(g->attn_group_tmp);
+    ds4_cuda_tensor_free(g->attn_out);
+    ds4_cuda_tensor_free(g->attn_low);
+    ds4_cuda_tensor_free(g->heads);
+    ds4_cuda_tensor_free(g->comp_selected);
+    ds4_cuda_tensor_free(g->comp_mask);
+    ds4_cuda_tensor_free(g->indexer_scores);
+    ds4_cuda_tensor_free(g->indexer_weights);
+    ds4_cuda_tensor_free(g->indexer_q);
+    ds4_cuda_tensor_free(g->comp_sc_cur);
+    ds4_cuda_tensor_free(g->comp_kv_cur);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_cuda_tensor_free(g->layer_index_state_score[il]);
+        ds4_cuda_tensor_free(g->layer_index_state_kv[il]);
+        ds4_cuda_tensor_free(g->layer_index_comp_cache[il]);
+        ds4_cuda_tensor_free(g->layer_attn_state_score[il]);
+        ds4_cuda_tensor_free(g->layer_attn_state_kv[il]);
+        ds4_cuda_tensor_free(g->layer_attn_comp_cache[il]);
+        ds4_cuda_tensor_free(g->layer_raw_cache[il]);
+    }
+    ds4_cuda_tensor_free(g->kv);
+    ds4_cuda_tensor_free(g->kv_raw);
+    ds4_cuda_tensor_free(g->q);
+    ds4_cuda_tensor_free(g->qr_norm);
+    ds4_cuda_tensor_free(g->qr);
+    ds4_cuda_tensor_free(g->attn_norm);
+    ds4_cuda_tensor_free(g->attn_cur);
+    ds4_cuda_tensor_free(g->hc_comb);
+    ds4_cuda_tensor_free(g->hc_post);
+    ds4_cuda_tensor_free(g->hc_pre);
+    ds4_cuda_tensor_free(g->hc_split);
+    ds4_cuda_tensor_free(g->hc_mix);
+    ds4_cuda_tensor_free(g->flat_hc);
+    ds4_cuda_tensor_free(g->next_hc);
+    ds4_cuda_tensor_free(g->cur_hc);
+    memset(g, 0, sizeof(*g));
+}
+
+/* Allocate the CUDA graph state for a chosen raw-cache capacity.  Mirrors
+ * metal_graph_alloc_raw_cap minus MTP, speculative, and batched-prefill
+ * tensors (Phase 3b deferred).  Model weights are referenced via the registered
+ * GGUF mmap range; this function does not copy them. */
+static bool cuda_graph_alloc_raw_cap(
+        ds4_cuda_graph          *g,
+        const ds4_weights       *weights,
+        const ds4_layer_weights *layer,
+        uint32_t                 raw_cap,
+        uint32_t                 ctx_size,
+        uint32_t                 prefill_cap) {
+    memset(g, 0, sizeof(*g));
+    if (raw_cap == 0) raw_cap = 1;
+    if (ctx_size == 0) ctx_size = raw_cap;
+    if (prefill_cap == 0) prefill_cap = 1;
+    uint32_t raw_window = DS4_N_SWA;
+    if (raw_window > ctx_size) raw_window = ctx_size;
+    if (raw_window == 0) raw_window = 1;
+    if (raw_cap < raw_window) raw_cap = raw_window;
+    if (raw_cap > ctx_size) raw_cap = ctx_size;
+    if (raw_cap == 0) raw_cap = 1;
+    g->raw_cap = raw_cap;
+    g->raw_window = raw_window;
+    g->prefill_cap = prefill_cap;
+
+    uint32_t min_ratio = UINT32_MAX;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
+    }
+    if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
+    g->comp_cap = ctx_size / min_ratio + 2u;
+    if (g->comp_cap < 2u) g->comp_cap = 2u;
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t q_rank = layer->attn_q_a->dim[1];
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
+    const uint64_t group_dim = (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP);
+    const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
+    const uint64_t routed_mid_dim = layer->ffn_gate_exps->dim[1];
+    const uint64_t vocab_dim = weights->output->dim[1];
+    const uint64_t comp_width_max = 2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM
+        ? DS4_N_HEAD_DIM
+        : DS4_N_INDEXER_HEAD_DIM);
+    const uint64_t indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+    const uint64_t pc = prefill_cap;
+
+    g->cur_hc = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+    g->next_hc = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+    g->flat_hc = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+    g->hc_mix = ds4_cuda_tensor_alloc(mix_hc * sizeof(float));
+    g->hc_split = ds4_cuda_tensor_alloc(mix_hc * sizeof(float));
+    if (g->hc_split) {
+        g->hc_pre = ds4_cuda_tensor_view(g->hc_split, 0,
+                                         (uint64_t)DS4_N_HC * sizeof(float));
+        g->hc_post = ds4_cuda_tensor_view(g->hc_split,
+                                          (uint64_t)DS4_N_HC * sizeof(float),
+                                          (uint64_t)DS4_N_HC * sizeof(float));
+        g->hc_comb = ds4_cuda_tensor_view(g->hc_split,
+                                          2ull * DS4_N_HC * sizeof(float),
+                                          (uint64_t)DS4_N_HC * DS4_N_HC * sizeof(float));
+    }
+    g->attn_cur = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->attn_norm = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->qr = ds4_cuda_tensor_alloc(q_rank * sizeof(float));
+    g->qr_norm = ds4_cuda_tensor_alloc(q_rank * sizeof(float));
+    g->q = ds4_cuda_tensor_alloc(q_dim * sizeof(float));
+    g->kv_raw = ds4_cuda_tensor_alloc(kv_dim * sizeof(float));
+    g->kv = ds4_cuda_tensor_alloc(kv_dim * sizeof(float));
+
+    bool state_init_ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->layer_raw_cache[il] = ds4_cuda_tensor_alloc(
+            (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio != 0) {
+            const uint32_t coff = ratio == 4 ? 2u : 1u;
+            const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
+            const uint64_t attn_rows = (uint64_t)coff * ratio;
+            g->layer_attn_comp_cache[il] = ds4_cuda_tensor_alloc(
+                (uint64_t)g->comp_cap * DS4_N_HEAD_DIM * sizeof(float));
+            g->layer_attn_state_kv[il] = ds4_cuda_tensor_alloc(
+                attn_width * attn_rows * sizeof(float));
+            g->layer_attn_state_score[il] = ds4_cuda_tensor_alloc(
+                attn_width * attn_rows * sizeof(float));
+            if (g->layer_attn_state_kv[il]) {
+                state_init_ok = state_init_ok &&
+                    cuda_tensor_fill_f32(g->layer_attn_state_kv[il], 0.0f,
+                                         attn_width * attn_rows);
+            }
+            if (g->layer_attn_state_score[il]) {
+                state_init_ok = state_init_ok &&
+                    cuda_tensor_fill_f32(g->layer_attn_state_score[il],
+                                         DS4_NEG_INF, attn_width * attn_rows);
+            }
+            if (ratio == 4) {
+                const uint64_t index_width = (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM;
+                const uint64_t index_rows = (uint64_t)coff * ratio;
+                g->layer_index_comp_cache[il] = ds4_cuda_tensor_alloc(
+                    (uint64_t)g->comp_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+                g->layer_index_state_kv[il] = ds4_cuda_tensor_alloc(
+                    index_width * index_rows * sizeof(float));
+                g->layer_index_state_score[il] = ds4_cuda_tensor_alloc(
+                    index_width * index_rows * sizeof(float));
+                if (g->layer_index_state_kv[il]) {
+                    state_init_ok = state_init_ok &&
+                        cuda_tensor_fill_f32(g->layer_index_state_kv[il], 0.0f,
+                                             index_width * index_rows);
+                }
+                if (g->layer_index_state_score[il]) {
+                    state_init_ok = state_init_ok &&
+                        cuda_tensor_fill_f32(g->layer_index_state_score[il],
+                                             DS4_NEG_INF, index_width * index_rows);
+                }
+            }
+        }
+    }
+    g->comp_kv_cur = ds4_cuda_tensor_alloc(comp_width_max * sizeof(float));
+    g->comp_sc_cur = ds4_cuda_tensor_alloc(comp_width_max * sizeof(float));
+    g->indexer_q = ds4_cuda_tensor_alloc(indexer_q_dim * sizeof(float));
+    g->indexer_weights = ds4_cuda_tensor_alloc(
+        (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
+    g->indexer_scores = ds4_cuda_tensor_alloc(
+        (uint64_t)g->comp_cap * pc * sizeof(float));
+    g->comp_mask = ds4_cuda_tensor_alloc(
+        (uint64_t)g->comp_cap * pc * sizeof(float));
+    g->comp_selected = ds4_cuda_tensor_alloc(
+        (uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u) *
+        pc * sizeof(uint32_t));
+    g->heads = ds4_cuda_tensor_alloc(q_dim * sizeof(float));
+    g->attn_low = ds4_cuda_tensor_alloc(low_dim * sizeof(float));
+    g->attn_out = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->attn_group_tmp = ds4_cuda_tensor_alloc(group_dim * sizeof(float));
+    g->attn_low_tmp = ds4_cuda_tensor_alloc((uint64_t)DS4_N_LORA_O * sizeof(float));
+    g->after_attn_hc = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+    g->ffn_flat = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+    g->ffn_mix = ds4_cuda_tensor_alloc(mix_hc * sizeof(float));
+    g->ffn_split = ds4_cuda_tensor_alloc(mix_hc * sizeof(float));
+    g->ffn_cur = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->ffn_norm = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->shared_gate = ds4_cuda_tensor_alloc(shared_dim * sizeof(float));
+    g->shared_up = ds4_cuda_tensor_alloc(shared_dim * sizeof(float));
+    g->shared_mid = ds4_cuda_tensor_alloc(shared_dim * sizeof(float));
+    g->shared_out = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->router_logits = ds4_cuda_tensor_alloc(DS4_N_EXPERT * sizeof(float));
+    g->router_probs = ds4_cuda_tensor_alloc(DS4_N_EXPERT * sizeof(float));
+    g->router_selected = ds4_cuda_tensor_alloc(DS4_N_EXPERT_USED * sizeof(int));
+    g->router_weights = ds4_cuda_tensor_alloc(DS4_N_EXPERT_USED * sizeof(float));
+    g->routed_gate = ds4_cuda_tensor_alloc(
+        (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+    g->routed_up = ds4_cuda_tensor_alloc(
+        (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+    g->routed_mid = ds4_cuda_tensor_alloc(
+        (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+    g->routed_down = ds4_cuda_tensor_alloc(
+        (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
+    g->routed_out = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->after_ffn_hc = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+    g->output_flat = ds4_cuda_tensor_alloc(hc_dim * sizeof(float));
+    g->output_pre = ds4_cuda_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
+    g->output_weights = ds4_cuda_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
+    g->output_embd = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->output_norm = ds4_cuda_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->logits = ds4_cuda_tensor_alloc(vocab_dim * sizeof(float));
+
+    bool layer_cache_ok = true;
+    for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
+        layer_cache_ok = g->layer_raw_cache[il] != NULL;
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (layer_cache_ok && ratio != 0) {
+            layer_cache_ok = g->layer_attn_comp_cache[il] != NULL &&
+                             g->layer_attn_state_kv[il] != NULL &&
+                             g->layer_attn_state_score[il] != NULL;
+        }
+        if (layer_cache_ok && ratio == 4) {
+            layer_cache_ok = g->layer_index_comp_cache[il] != NULL &&
+                             g->layer_index_state_kv[il] != NULL &&
+                             g->layer_index_state_score[il] != NULL;
+        }
+    }
+
+    const bool ok = state_init_ok && layer_cache_ok &&
+                    g->cur_hc && g->next_hc && g->flat_hc &&
+                    g->hc_mix && g->hc_split &&
+                    g->hc_pre && g->hc_post && g->hc_comb &&
+                    g->attn_cur && g->attn_norm && g->qr && g->qr_norm &&
+                    g->q && g->kv_raw && g->kv &&
+                    g->comp_kv_cur && g->comp_sc_cur &&
+                    g->indexer_q && g->indexer_weights && g->indexer_scores &&
+                    g->comp_mask && g->comp_selected &&
+                    g->heads && g->attn_low && g->attn_out &&
+                    g->attn_group_tmp && g->attn_low_tmp &&
+                    g->after_attn_hc &&
+                    g->ffn_flat && g->ffn_mix && g->ffn_split &&
+                    g->ffn_cur && g->ffn_norm &&
+                    g->shared_gate && g->shared_up && g->shared_mid &&
+                    g->shared_out &&
+                    g->router_logits && g->router_probs &&
+                    g->router_selected && g->router_weights &&
+                    g->routed_gate && g->routed_up && g->routed_mid &&
+                    g->routed_down && g->routed_out &&
+                    g->after_ffn_hc &&
+                    g->output_flat && g->output_pre && g->output_weights &&
+                    g->output_embd && g->output_norm && g->logits;
+    if (!ok) cuda_graph_free(g);
+    return ok;
+}
+
+/* CUDA per-token-loop prefill (Phase 3b deferred) does not need a padded SWA
+ * cache the way Metal's batched flash-attention does.  We still keep at least
+ * one raw_window plus headroom for the loop so the physical row layout matches
+ * the Metal path's invariants and a future 3b batched kernel slot-replaces. */
+static uint32_t cuda_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_cap) {
+    uint32_t raw_window = DS4_N_SWA;
+    if (raw_window > (uint32_t)ctx_size) raw_window = (uint32_t)ctx_size;
+    if (raw_window == 0) raw_window = 1;
+
+    uint64_t wanted = (uint64_t)raw_window + prefill_cap;
+    if (wanted > (uint32_t)ctx_size) wanted = (uint32_t)ctx_size;
+    if (wanted == 0) wanted = 1;
+    wanted = align_up(wanted, 256u);
+    if (wanted > 8192u) wanted = 8192u;
+    uint32_t raw_cap = (uint32_t)wanted;
+    if (raw_cap < raw_window) raw_cap = raw_window;
+    if (raw_cap > (uint32_t)ctx_size) raw_cap = (uint32_t)ctx_size;
+    if (raw_cap < raw_window) raw_cap = raw_window;
+    return raw_cap;
+}
+
+static uint32_t cuda_graph_prefill_cap_for_prompt(int prompt_len) {
+    if (prompt_len <= 0) return 1;
+    return (uint32_t)prompt_len;
+}
+
+#endif /* DS4_USE_CUDA */
+
 typedef struct ds4_vocab ds4_vocab;
 
 static void embed_prompt(
@@ -15248,6 +15662,10 @@ struct ds4_session {
     ds4_engine *engine;
 #ifndef DS4_NO_METAL
     ds4_metal_graph graph;
+#endif
+#ifdef DS4_USE_CUDA
+    ds4_cuda_graph cuda_graph;
+    bool cuda_graph_ready;
 #endif
     token_vec checkpoint;
     float *logits;
@@ -17990,6 +18408,51 @@ int ds4_engine_cuda_test_vectors_test(ds4_engine *e, const char *vec_path) {
 #endif
 }
 
+/* Phase 3c-1: create+free a CUDA session for ctx_size and report managed-
+ * memory live bytes around it.  Validates the graph allocator and the new
+ * CUDA branches in ds4_session_create / ds4_session_free without running any
+ * forward pass.  A leak shows up as "after-free" live bytes higher than
+ * "before-session" live bytes. */
+int ds4_engine_cuda_session_test(ds4_engine *e, int ctx_size) {
+#ifndef DS4_USE_CUDA
+    (void)e;
+    (void)ctx_size;
+    fprintf(stderr, "ds4: cuda_session_test requires a build with DS4_USE_CUDA\n");
+    return 1;
+#else
+    if (!e->cuda_ready) {
+        fprintf(stderr, "ds4: cuda_session_test requires the CUDA backend\n");
+        return 1;
+    }
+    if (ctx_size <= 0) ctx_size = 4096;
+
+    fprintf(stderr, "ds4: cuda_session_test ctx=%d\n", ctx_size);
+    ds4_cuda_print_memory_report("cuda_session_test before");
+
+    ds4_session *s = NULL;
+    if (ds4_session_create(&s, e, ctx_size) != 0) {
+        fprintf(stderr, "ds4: cuda_session_test failed to create session\n");
+        return 1;
+    }
+    fprintf(stderr,
+            "ds4: cuda_session_test session created "
+            "(raw_cap=%u comp_cap=%u prefill_cap=%u raw_window=%u)\n",
+            s->cuda_graph.raw_cap, s->cuda_graph.comp_cap,
+            s->cuda_graph.prefill_cap, s->cuda_graph.raw_window);
+    fprintf(stderr,
+            "ds4: cuda_session_test getters pos=%d ctx=%d tokens.len=%d\n",
+            ds4_session_pos(s), ds4_session_ctx(s),
+            ds4_session_tokens(s)->len);
+    ds4_cuda_print_memory_report("cuda_session_test after-create");
+
+    ds4_session_free(s);
+    ds4_cuda_print_memory_report("cuda_session_test after-free");
+
+    fprintf(stderr, "ds4: cuda_session_test PASS (create+free with no forward)\n");
+    return 0;
+#endif
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -18133,6 +18596,32 @@ void ds4_engine_close(ds4_engine *e) {
 }
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+#ifdef DS4_USE_CUDA
+    if (e->backend == DS4_BACKEND_CUDA) {
+        if (!e->cuda_ready) return 1;
+
+        ds4_session *s = xcalloc(1, sizeof(*s));
+        s->engine = e;
+        s->ctx_size = ctx_size;
+        s->prefill_cap = cuda_graph_prefill_cap_for_prompt(ctx_size);
+        const uint32_t raw_cap = cuda_graph_raw_cap_for_context(
+            ctx_size, s->prefill_cap);
+        if (!cuda_graph_alloc_raw_cap(&s->cuda_graph, &e->weights,
+                                      &e->weights.layer[0],
+                                      raw_cap, (uint32_t)ctx_size, s->prefill_cap))
+        {
+            free(s);
+            return 1;
+        }
+        s->cuda_graph.quality = e->quality;
+        s->cuda_graph_ready = true;
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        /* MTP and speculative decode are deferred from Phase 3c (per the
+         * session-backend brief); s->mtp_logits stays NULL. */
+        *out = s;
+        return 0;
+    }
+#endif
 #ifdef DS4_NO_METAL
     (void)out;
     (void)e;
@@ -18165,6 +18654,14 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
+#ifdef DS4_USE_CUDA
+    if (s->cuda_graph_ready) {
+        /* Drain any in-flight CUDA work before freeing managed allocations. */
+        ds4_cuda_synchronize();
+        cuda_graph_free(&s->cuda_graph);
+        s->cuda_graph_ready = false;
+    }
+#endif
 #ifndef DS4_NO_METAL
     metal_graph_free(&s->graph);
 #endif

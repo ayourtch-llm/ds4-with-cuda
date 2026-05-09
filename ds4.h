@@ -118,6 +118,12 @@ int ds4_engine_cuda_single_layer_test(ds4_engine *e, const ds4_tokens *prompt);
  * session APIs (Option A path).  Informational; does not gate. */
 int ds4_engine_cuda_test_vectors_test(ds4_engine *e, const char *vec_path);
 
+/* Phase 3c-1 (session lifecycle skeleton): create + free a CUDA session for
+ * the given context size and report cudaMallocManaged live bytes before /
+ * during / after.  No forward pass; this just exercises the new graph
+ * allocator + ds4_session_create / _free CUDA dispatch.  Returns 0 on success. */
+int ds4_engine_cuda_session_test(ds4_engine *e, int ctx_size);
+
 void ds4_tokens_push(ds4_tokens *tv, int token);
 void ds4_tokens_free(ds4_tokens *tv);
 void ds4_tokens_copy(ds4_tokens *dst, const ds4_tokens *src);
