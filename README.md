@@ -578,3 +578,4 @@ make test                  # ./ds4_test --all
 ./ds4_test --logprob-vectors
 ./ds4_test --server
 ```
+# ds4-with-cuda
