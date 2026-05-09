@@ -13975,6 +13975,8 @@ typedef struct {
     ds4_cuda_tensor *batch_q;
     ds4_cuda_tensor *batch_kv_raw;
     ds4_cuda_tensor *batch_kv;
+    ds4_cuda_tensor *batch_comp_kv;
+    ds4_cuda_tensor *batch_comp_sc;
     ds4_cuda_tensor *batch_indexer_q;
     ds4_cuda_tensor *batch_indexer_weights;
     ds4_cuda_tensor *batch_heads;
@@ -14105,6 +14107,8 @@ static void cuda_graph_free(ds4_cuda_graph *g) {
     ds4_cuda_tensor_free(g->batch_heads);
     ds4_cuda_tensor_free(g->batch_indexer_weights);
     ds4_cuda_tensor_free(g->batch_indexer_q);
+    ds4_cuda_tensor_free(g->batch_comp_sc);
+    ds4_cuda_tensor_free(g->batch_comp_kv);
     ds4_cuda_tensor_free(g->batch_kv);
     ds4_cuda_tensor_free(g->batch_kv_raw);
     ds4_cuda_tensor_free(g->batch_q);
@@ -14373,6 +14377,8 @@ static bool cuda_graph_alloc_raw_cap(
         g->batch_q                = ds4_cuda_tensor_alloc(pc_u64 * q_dim * sizeof(float));
         g->batch_kv_raw           = ds4_cuda_tensor_alloc(pc_u64 * DS4_N_HEAD_DIM * sizeof(float));
         g->batch_kv               = ds4_cuda_tensor_alloc(pc_u64 * DS4_N_HEAD_DIM * sizeof(float));
+        g->batch_comp_kv          = ds4_cuda_tensor_alloc(pc_u64 * comp_width_max * sizeof(float));
+        g->batch_comp_sc          = ds4_cuda_tensor_alloc(pc_u64 * comp_width_max * sizeof(float));
         g->batch_indexer_q        = ds4_cuda_tensor_alloc(pc_u64 * indexer_q_dim * sizeof(float));
         g->batch_indexer_weights  = ds4_cuda_tensor_alloc(pc_u64 * DS4_N_INDEXER_HEAD * sizeof(float));
         g->batch_heads            = ds4_cuda_tensor_alloc(pc_u64 * q_dim * sizeof(float));
@@ -14401,6 +14407,7 @@ static bool cuda_graph_alloc_raw_cap(
                          g->batch_flat_hc && g->batch_hc_mix && g->batch_hc_split &&
                          g->batch_qr && g->batch_qr_norm &&
                          g->batch_q && g->batch_kv_raw && g->batch_kv &&
+                         g->batch_comp_kv && g->batch_comp_sc &&
                          g->batch_indexer_q && g->batch_indexer_weights &&
                          g->batch_heads && g->batch_attn_low && g->batch_attn_out &&
                          g->batch_group_tmp && g->batch_low_tmp &&
@@ -15544,16 +15551,766 @@ static bool cuda_graph_eval_token_raw_swa(
     return true;
 }
 
-/* Multi-token prefill via per-token loop.  Mirrors metal_graph_prefill_raw_swa
- * at the API level but is intentionally slow-and-simple inside: each token
- * runs a full single-token decode through cuda_graph_eval_token_raw_swa,
- * stepping pos and the per-layer KV+compressor caches.
+/* =========================================================================
+ * Phase 7 C2 — layer-major batched prefill (CUDA).
+ * =========================================================================
  *
- * TODO 3b: this loop is the body-swap site for batched prefill.  When
- * ds4_cuda_attention_prefill_static_mixed_heads_tensor and friends land we
- * can replace the inner per-token kernel sequence with their batched
- * equivalents and emit the layer-major schedule Metal uses, without changing
- * this function's signature or the session-level contract above. */
+ * Mirrors Metal's metal_graph_prefill_layer_major (ds4.c:12840) +
+ * encode_layer_batch / encode_layer_attention_batch / encode_layer_ffn_batch
+ * stack.  Replaces the per-token loop in cuda_graph_prefill_chunked when
+ * DS4_CUDA_LAYER_MAJOR=1 (env-gated for the safety rollout — Stage D will
+ * flip the default).
+ *
+ * Scope: zero_prefix (pos0=0, fresh prefill chunk).  Non-zero-prefix paths
+ * (resumed-session prefill, multi-chunk prefill at pos0>0) fall back to the
+ * per-token loop — masked_mixed (Stage E / Phase 7b) is the kernel they
+ * need and remains stubbed.
+ *
+ * Helpers (existing CUDA APIs re-used here):
+ *   - matmul_f16/q8_0_tensor with n_tok param   (Phase 1.5/3 already batched)
+ *   - rms_norm_*_rows_tensor, head_rms_norm     (already batched)
+ *   - rope_tail_tensor                          (already batched)
+ *   - dsv4_qkv_rms_norm_rows                    (already batched)
+ *   - dsv4_fp8_kv_quantize_tensor               (batched via n_tokens param)
+ *   - hc_split_weighted_sum / hc_expand_*_split (already batched)
+ *   - router_select_batch                       (already batched)
+ *   - routed_moe_batch                          (already batched)
+ *   - swiglu                                    (operates over total elems)
+ *   - attention_output_q8_batch                 (already batched)
+ *   - compressor_prefill                        (Phase 3a, already batched)
+ *   - compressor_prefill_state_ratio4           (Phase 3a, already batched)
+ *   - indexer_scores_decode_batch / topk        (already batched)
+ *   - attention_prefill_raw_heads               (Phase 1m3, batched n_tokens)
+ *   - attention_prefill_static_mixed_heads      (Phase 7 B1, NEW)
+ *   - attention_indexed_mixed_batch_heads       (already batched)
+ *   - embed_tokens_hc                           (Phase 7 C1, NEW)
+ *   - store_raw_kv_batch                        (Phase 7 C1, NEW)
+ * ========================================================================= */
+
+/* Inline analog of metal_graph_tensor_row_view: a non-owning view at a
+ * specific row offset within a contiguous batched tensor.  Caller frees. */
+static ds4_cuda_tensor *cuda_graph_tensor_row_view(
+        const ds4_cuda_tensor *base,
+        uint32_t               row,
+        uint64_t               row_floats) {
+    const uint64_t row_bytes = row_floats * sizeof(float);
+    return ds4_cuda_tensor_view(base, (uint64_t)row * row_bytes, row_bytes);
+}
+
+/* Mirror of metal_graph_refresh_ratio4_compressor_state (ds4.c:10815).
+ * After compressor_prefill produces all the comp emits for a chunk, the
+ * recurrent state_kv/state_score at the tail is rebuilt from the last 4
+ * tokens via the small-batch projection kernel — keeps FP8 rounding
+ * decisions consistent with the per-token decode path that runs after this
+ * prefill.  Only fires for ratio==4 paths. */
+static bool cuda_graph_refresh_ratio4_compressor_state(
+        ds4_cuda_graph    *g,
+        const ds4_model   *model,
+        ds4_cuda_tensor   *state_kv,
+        ds4_cuda_tensor   *state_score,
+        const ds4_tensor  *kv_weight,
+        const ds4_tensor  *score_weight,
+        const ds4_tensor  *ape,
+        uint32_t           head_dim,
+        uint32_t           width,
+        uint32_t           pos0,
+        uint32_t           n_tokens) {
+    if (!g || !model || !state_kv || !state_score || !kv_weight ||
+        !score_weight || !ape || head_dim == 0 || width == 0 || n_tokens < 4) {
+        return false;
+    }
+    /* batch_ffn_norm is the scratch buffer where attention_batch stashed
+     * the post-attn-norm rows (we re-purposed it from FFN since the FFN
+     * pass hasn't run yet for this layer). */
+    ds4_cuda_tensor *tail_hc = ds4_cuda_tensor_view(
+            g->batch_ffn_norm,
+            (uint64_t)(n_tokens - 4u) * DS4_N_EMBD * sizeof(float),
+            4ull * DS4_N_EMBD * sizeof(float));
+    bool ok = tail_hc != NULL;
+    if (ok) ok = ds4_cuda_matmul_f16_tensor(g->batch_comp_kv,
+                                            model->map, model->size,
+                                            kv_weight->abs_offset,
+                                            DS4_N_EMBD, width, tail_hc, 4) != 0;
+    /* batch_comp_kv / batch_comp_sc are reused by the compressor_prefill
+     * call upstream — we re-use the same scratch buffers because they're
+     * sized pc * comp_width which always exceeds 4 * width. */
+    if (ok) ok = ds4_cuda_matmul_f16_tensor(g->batch_comp_sc,
+                                            model->map, model->size,
+                                            score_weight->abs_offset,
+                                            DS4_N_EMBD, width, tail_hc, 4) != 0;
+    if (ok) ok = ds4_cuda_compressor_prefill_state_ratio4_tensor(
+                    state_kv, state_score,
+                    g->batch_comp_kv,
+                    g->batch_comp_sc,
+                    model->map, model->size,
+                    ape->abs_offset, ape->type,
+                    head_dim, pos0 + n_tokens - 4u) != 0;
+    ds4_cuda_tensor_free(tail_hc);
+    return ok;
+}
+
+/* Encode the batched prefill attention half for one layer.  Mirrors
+ * metal_graph_encode_layer_attention_batch (ds4.c:11070).  Zero-prefix
+ * only — non-zero-prefix returns false to signal the caller to fall back
+ * to the per-token path.
+ *
+ * Caller contract: g_batch_open is true (a CUDA command batch is open).
+ * On return, batch_heads is the inverse-roped attention output projected
+ * through the Q8 output stack; batch_after_attn_hc is the HC-expanded
+ * residual ready for ffn_batch. */
+static bool cuda_graph_encode_layer_attention_batch(
+        ds4_cuda_graph          *g,
+        const ds4_model         *model,
+        const ds4_layer_weights *layer,
+        uint32_t                 il,
+        uint32_t                 pos0,
+        uint32_t                 n_tokens) {
+    if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
+    if (pos0 != 0) return false;  /* C2 scope: zero_prefix only. */
+
+    const uint64_t hc_dim    = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t mix_hc    = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t q_rank    = layer->attn_q_a->dim[1];
+    const uint64_t q_dim     = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint32_t n_groups  = DS4_N_OUT_GROUP;
+    const uint32_t group_heads = DS4_N_HEAD / n_groups;
+    const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
+    const uint32_t rank      = DS4_N_LORA_O;
+    const uint32_t ratio     = ds4_layer_compress_ratio(il);
+    const bool     compressed = ratio != 0;
+    const float    freq_base  = layer_rope_freq_base(il);
+    const float    freq_scale = layer_rope_freq_scale(il);
+    const float    ext_factor = compressed && DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
+    float          attn_factor = 1.0f;
+    if (ext_factor != 0.0f && freq_scale > 0.0f) {
+        attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+
+    bool ok = true;
+
+    /* ---- HC-PRE: rms_norm_plain_rows → HC mixer matmul → fused
+     *      hc_split_weighted_sum (Sinkhorn split + weighted reduce). ---- */
+    if (ok) ok = ds4_cuda_rms_norm_plain_rows_tensor(
+                    g->batch_flat_hc, g->batch_cur_hc,
+                    (uint32_t)hc_dim, n_tokens, DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_cuda_matmul_f16_tensor(
+                    g->batch_hc_mix, model->map, model->size,
+                    layer->hc_attn_fn->abs_offset,
+                    hc_dim, mix_hc,
+                    g->batch_flat_hc, n_tokens) != 0;
+    /* Use the fused split+weighted-sum path (path B in Metal at 12423).
+     * Output goes into a per-token-shape scratch — we re-use batch_attn_out
+     * as a temporary since it's sized pc*DS4_N_EMBD and is only consumed
+     * after attention by the FFN path which overwrites it. */
+    if (ok) ok = ds4_cuda_hc_split_weighted_sum_tensor(
+                    g->batch_attn_out, g->batch_hc_split,
+                    g->batch_hc_mix, g->batch_cur_hc,
+                    model->map, model->size,
+                    layer->hc_attn_scale->abs_offset,
+                    layer->hc_attn_base->abs_offset,
+                    DS4_N_EMBD, DS4_N_HC,
+                    DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS) != 0;
+
+    /* ---- attn_norm: rms_norm_weight_rows. ---- */
+    if (ok) ok = ds4_cuda_rms_norm_weight_rows_tensor(
+                    g->batch_ffn_norm /* re-used as attn_norm scratch */,
+                    g->batch_attn_out,
+                    model->map, model->size,
+                    layer->attn_norm->abs_offset,
+                    DS4_N_EMBD, n_tokens, DS4_RMS_EPS) != 0;
+
+    /* ---- Q path: matmul_q8 q_a → fused qkv_rms_norm_rows → matmul_q8 q_b
+     *              → head_rms_norm → rope_tail. ---- */
+    if (ok) ok = ds4_cuda_matmul_q8_0_tensor(
+                    g->batch_qr, model->map, model->size,
+                    layer->attn_q_a->abs_offset,
+                    DS4_N_EMBD, q_rank,
+                    g->batch_ffn_norm, n_tokens) != 0;
+    /* Fused: produce batch_qr_norm AND batch_kv (kv = rms_norm_weight_rows
+     * applied to kv_raw produced inline).  Mirrors the qkv_rms_fused
+     * Metal path at ds4.c:11189. */
+    if (ok) ok = ds4_cuda_matmul_q8_0_tensor(
+                    g->batch_kv_raw, model->map, model->size,
+                    layer->attn_kv->abs_offset,
+                    DS4_N_EMBD, DS4_N_HEAD_DIM,
+                    g->batch_ffn_norm, n_tokens) != 0;
+    if (ok) ok = ds4_cuda_dsv4_qkv_rms_norm_rows_tensor(
+                    g->batch_qr_norm, g->batch_qr,
+                    model->map, model->size,
+                    layer->attn_q_a_norm->abs_offset, (uint32_t)q_rank,
+                    g->batch_kv, g->batch_kv_raw,
+                    layer->attn_kv_a_norm->abs_offset, DS4_N_HEAD_DIM,
+                    n_tokens, DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_cuda_matmul_q8_0_tensor(
+                    g->batch_q, model->map, model->size,
+                    layer->attn_q_b->abs_offset,
+                    q_rank, q_dim,
+                    g->batch_qr_norm, n_tokens) != 0;
+    if (ok) ok = ds4_cuda_head_rms_norm_tensor(
+                    g->batch_q, n_tokens,
+                    DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_cuda_rope_tail_tensor(
+                    g->batch_q, n_tokens, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                    DS4_N_ROT, pos0,
+                    compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                    /*inverse=*/0,
+                    freq_base, freq_scale, ext_factor, attn_factor,
+                    DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+
+    /* ---- KV path: rope on (already-normed) batch_kv → fp8 quantize. ---- */
+    if (ok) ok = ds4_cuda_rope_tail_tensor(
+                    g->batch_kv, n_tokens, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+                    DS4_N_ROT, pos0,
+                    compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                    /*inverse=*/0,
+                    freq_base, freq_scale, ext_factor, attn_factor,
+                    DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+    if (ok) ok = ds4_cuda_dsv4_fp8_kv_quantize_tensor(
+                    g->batch_kv, n_tokens, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+
+    /* ---- store full batch into raw cache (zero_prefix path). ---- */
+    if (ok) ok = ds4_cuda_store_raw_kv_batch_tensor(
+                    g->layer_raw_cache[il], g->batch_kv,
+                    g->raw_cap, pos0, n_tokens, DS4_N_HEAD_DIM) != 0;
+
+    bool batch_attention_done = false;
+    uint32_t n_comp = 0;
+
+    /* ---- ratio==0: batched raw-only attention. ---- */
+    if (ok && ratio == 0) {
+        ok = ds4_cuda_attention_prefill_raw_heads_tensor(
+                g->batch_heads, model->map, model->size,
+                layer->attn_sinks->abs_offset,
+                g->batch_q, g->batch_kv,
+                n_tokens, g->raw_window,
+                DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+        if (ok) batch_attention_done = true;
+    }
+
+    /* ---- ratio>0: compressor + indexer + dispatch attention path. ---- */
+    if (ok && compressed) {
+        const uint32_t coff = ratio == 4 ? 2u : 1u;
+        const uint32_t comp_width = coff * DS4_N_HEAD_DIM;
+
+        /* Compressor projections: kv + score, both into batch_comp_kv /
+         * batch_comp_sc (we re-use batch_attn_low / batch_attn_out / etc.
+         * as scratch since the layer-major schedule has them dormant
+         * here).  See note below: we add dedicated batch_comp_{kv,sc}
+         * fields if scratch reuse becomes ambiguous. */
+        if (!layer->attn_compressor_kv || !layer->attn_compressor_gate ||
+            !layer->attn_compressor_ape || !layer->attn_compressor_norm) {
+            fprintf(stderr, "ds4: CUDA layer-major prefill needs attention compressor weights\n");
+            ok = false;
+        }
+        if (ok) ok = ds4_cuda_matmul_f16_tensor(
+                        g->batch_comp_kv,
+                        model->map, model->size,
+                        layer->attn_compressor_kv->abs_offset,
+                        DS4_N_EMBD, comp_width,
+                        g->batch_ffn_norm, n_tokens) != 0;
+        if (ok) ok = ds4_cuda_matmul_f16_tensor(
+                        g->batch_comp_sc,
+                        model->map, model->size,
+                        layer->attn_compressor_gate->abs_offset,
+                        DS4_N_EMBD, comp_width,
+                        g->batch_ffn_norm, n_tokens) != 0;
+
+        n_comp = n_tokens / ratio;
+        if (ok && n_comp > g->comp_cap) {
+            fprintf(stderr, "ds4: CUDA layer-major compressed KV cache capacity exceeded at layer %u\n", il);
+            ok = false;
+        }
+        if (ok) ok = ds4_cuda_compressor_prefill_tensor(
+                        g->layer_attn_comp_cache[il],
+                        g->layer_attn_state_kv[il],
+                        g->layer_attn_state_score[il],
+                        g->batch_comp_kv,
+                        g->batch_comp_sc,
+                        model->map, model->size,
+                        layer->attn_compressor_ape->abs_offset,
+                        layer->attn_compressor_ape->type,
+                        layer->attn_compressor_norm->abs_offset,
+                        layer->attn_compressor_norm->type,
+                        DS4_N_HEAD_DIM, ratio, pos0, n_tokens,
+                        DS4_N_ROT,
+                        compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                        /*quantize_fp8=*/true,
+                        freq_base, freq_scale, ext_factor, attn_factor,
+                        DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW,
+                        DS4_RMS_EPS) != 0;
+        if (ok && ratio == 4) {
+            ok = cuda_graph_refresh_ratio4_compressor_state(
+                    g, model,
+                    g->layer_attn_state_kv[il],
+                    g->layer_attn_state_score[il],
+                    layer->attn_compressor_kv,
+                    layer->attn_compressor_gate,
+                    layer->attn_compressor_ape,
+                    DS4_N_HEAD_DIM, comp_width, pos0, n_tokens);
+        }
+        if (ok) g->layer_n_comp[il] = n_comp;
+
+        /* Indexer setup (ratio==4 only). */
+        if (ok && ratio == 4) {
+            const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
+            if (!layer->indexer_compressor_kv || !layer->indexer_compressor_gate ||
+                !layer->indexer_compressor_ape || !layer->indexer_compressor_norm ||
+                !layer->indexer_attn_q_b || !layer->indexer_proj) {
+                fprintf(stderr, "ds4: CUDA layer-major prefill needs indexer weights\n");
+                ok = false;
+            }
+            if (ok) ok = ds4_cuda_matmul_f16_tensor(
+                            g->batch_comp_kv,
+                            model->map, model->size,
+                            layer->indexer_compressor_kv->abs_offset,
+                            DS4_N_EMBD, index_width,
+                            g->batch_ffn_norm, n_tokens) != 0;
+            if (ok) ok = ds4_cuda_matmul_f16_tensor(
+                            g->batch_comp_sc,
+                            model->map, model->size,
+                            layer->indexer_compressor_gate->abs_offset,
+                            DS4_N_EMBD, index_width,
+                            g->batch_ffn_norm, n_tokens) != 0;
+            if (ok) ok = ds4_cuda_matmul_f16_tensor(
+                            g->batch_indexer_q,
+                            model->map, model->size,
+                            layer->indexer_attn_q_b->abs_offset,
+                            q_rank,
+                            (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM,
+                            g->batch_qr_norm, n_tokens) != 0;
+            if (ok) ok = ds4_cuda_rope_tail_tensor(
+                            g->batch_indexer_q, n_tokens,
+                            DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
+                            DS4_N_ROT, pos0,
+                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                            /*inverse=*/0,
+                            freq_base, freq_scale, ext_factor, attn_factor,
+                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+            if (ok) ok = ds4_cuda_matmul_f16_tensor(
+                            g->batch_indexer_weights,
+                            model->map, model->size,
+                            layer->indexer_proj->abs_offset,
+                            DS4_N_EMBD, DS4_N_INDEXER_HEAD,
+                            g->batch_ffn_norm, n_tokens) != 0;
+            if (ok) ok = ds4_cuda_compressor_prefill_tensor(
+                            g->layer_index_comp_cache[il],
+                            g->layer_index_state_kv[il],
+                            g->layer_index_state_score[il],
+                            g->batch_comp_kv,
+                            g->batch_comp_sc,
+                            model->map, model->size,
+                            layer->indexer_compressor_ape->abs_offset,
+                            layer->indexer_compressor_ape->type,
+                            layer->indexer_compressor_norm->abs_offset,
+                            layer->indexer_compressor_norm->type,
+                            DS4_N_INDEXER_HEAD_DIM, ratio, pos0, n_tokens,
+                            DS4_N_ROT,
+                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                            /*quantize_fp8=*/false,
+                            freq_base, freq_scale, ext_factor, attn_factor,
+                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW,
+                            DS4_RMS_EPS) != 0;
+            if (ok) ok = cuda_graph_refresh_ratio4_compressor_state(
+                            g, model,
+                            g->layer_index_state_kv[il],
+                            g->layer_index_state_score[il],
+                            layer->indexer_compressor_kv,
+                            layer->indexer_compressor_gate,
+                            layer->indexer_compressor_ape,
+                            DS4_N_INDEXER_HEAD_DIM, index_width,
+                            pos0, n_tokens);
+            if (ok) g->layer_n_index_comp[il] = n_comp;
+        }
+
+        /* Attention dispatch on the compressed path.  Metal uses a per-token
+         * decode_heads tail loop with topk masking when topk_prefill_needed
+         * fires (ds4.c:12203-12281); the batched indexed_mixed kernel is
+         * only invoked from the non-zero-prefix branch.  Mirror Metal here:
+         * for zero_prefix + topk_prefill_needed, loop per-token using the
+         * single-token indexer_score_one + topk + topk_mask + decode_heads
+         * pipeline.  The tail-loop attention launches are amortized against
+         * the batched matmul / compressor / HC stages above. */
+        const bool topk_prefill_needed = ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K;
+        if (ok && topk_prefill_needed) {
+            const float index_scale = 1.0f / sqrtf(
+                (float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
+            const uint64_t indexer_q_dim_local =
+                (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+            for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                const uint32_t pos = pos0 + t;
+                /* For zero_prefix raw cache holds slots [0..n_tokens);
+                 * each token sees its causal SWA window. */
+                const uint32_t n_raw_t = (pos + 1u > g->raw_window)
+                                         ? g->raw_window : (pos + 1u);
+                const uint32_t raw_start_t = (pos + 1u - n_raw_t) % g->raw_cap;
+                const uint32_t cur_comp = (pos + 1u) / ratio < n_comp
+                                          ? (pos + 1u) / ratio : n_comp;
+                ds4_cuda_tensor *q_view = cuda_graph_tensor_row_view(
+                        g->batch_q, t, q_dim);
+                ds4_cuda_tensor *heads_view = cuda_graph_tensor_row_view(
+                        g->batch_heads, t, q_dim);
+                ds4_cuda_tensor *indexer_q_view = cuda_graph_tensor_row_view(
+                        g->batch_indexer_q, t, indexer_q_dim_local);
+                ds4_cuda_tensor *indexer_w_view = cuda_graph_tensor_row_view(
+                        g->batch_indexer_weights, t, DS4_N_INDEXER_HEAD);
+                if (!q_view || !heads_view || !indexer_q_view || !indexer_w_view) {
+                    ds4_cuda_tensor_free(indexer_w_view);
+                    ds4_cuda_tensor_free(indexer_q_view);
+                    ds4_cuda_tensor_free(heads_view);
+                    ds4_cuda_tensor_free(q_view);
+                    ok = false;
+                    break;
+                }
+
+                ds4_cuda_tensor *cm = NULL;
+                uint32_t use_cm = 0;
+                uint32_t n_selected = 0;
+                if (cur_comp > DS4_N_INDEXER_TOP_K) {
+                    ok = ds4_cuda_indexer_score_one_tensor(
+                            g->indexer_scores,
+                            indexer_q_view, indexer_w_view,
+                            g->layer_index_comp_cache[il],
+                            cur_comp,
+                            DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
+                            index_scale) != 0;
+                    if (ok) ok = ds4_cuda_indexer_topk_tensor(
+                                    g->comp_selected, g->indexer_scores,
+                                    cur_comp, 1, DS4_N_INDEXER_TOP_K) != 0;
+                    if (ok) ok = ds4_cuda_dsv4_topk_mask_tensor(
+                                    g->comp_mask, g->comp_selected,
+                                    cur_comp, 1, DS4_N_INDEXER_TOP_K) != 0;
+                    if (ok) {
+                        cm = g->comp_mask;
+                        use_cm = 1;
+                        n_selected = (DS4_N_INDEXER_TOP_K < cur_comp)
+                                     ? DS4_N_INDEXER_TOP_K : cur_comp;
+                    }
+                }
+                (void)n_selected;
+                if (ok) ok = ds4_cuda_attention_decode_heads_tensor(
+                                heads_view,
+                                model->map, model->size,
+                                layer->attn_sinks->abs_offset,
+                                q_view,
+                                g->layer_raw_cache[il],
+                                n_raw_t, g->raw_cap, raw_start_t,
+                                cur_comp ? g->layer_attn_comp_cache[il] : NULL,
+                                cur_comp,
+                                cm, use_cm,
+                                DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+                ds4_cuda_tensor_free(indexer_w_view);
+                ds4_cuda_tensor_free(indexer_q_view);
+                ds4_cuda_tensor_free(heads_view);
+                ds4_cuda_tensor_free(q_view);
+            }
+            if (ok) batch_attention_done = true;
+        } else if (ok && n_comp != 0) {
+            ok = ds4_cuda_attention_prefill_static_mixed_heads_tensor(
+                    g->batch_heads, model->map, model->size,
+                    layer->attn_sinks->abs_offset,
+                    g->batch_q, g->batch_kv,
+                    g->layer_attn_comp_cache[il],
+                    n_tokens, n_comp,
+                    g->raw_window, ratio,
+                    DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+            if (ok) batch_attention_done = true;
+        } else if (ok) {
+            /* n_comp == 0 path (very short prompt, ratio>0): all tokens
+             * see only raw — same kernel as ratio==0. */
+            ok = ds4_cuda_attention_prefill_raw_heads_tensor(
+                    g->batch_heads, model->map, model->size,
+                    layer->attn_sinks->abs_offset,
+                    g->batch_q, g->batch_kv,
+                    n_tokens, g->raw_window,
+                    DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+            if (ok) batch_attention_done = true;
+        }
+    }
+
+    if (!batch_attention_done) {
+        fprintf(stderr, "ds4: CUDA layer-major prefill no attention path matched at layer %u\n", il);
+        return false;
+    }
+
+    /* ---- inverse rope on heads, attention output projection, HC expand. ---- */
+    if (ok) ok = ds4_cuda_rope_tail_tensor(
+                    g->batch_heads, n_tokens,
+                    DS4_N_HEAD, DS4_N_HEAD_DIM,
+                    DS4_N_ROT, pos0,
+                    compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                    /*inverse=*/1,
+                    freq_base, freq_scale, ext_factor, attn_factor,
+                    DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+    if (ok) ok = ds4_cuda_attention_output_q8_batch_tensor(
+                    g->batch_attn_out, g->batch_attn_low,
+                    g->batch_group_tmp, g->batch_low_tmp,
+                    model->map, model->size,
+                    layer->attn_output_a->abs_offset,
+                    layer->attn_output_b->abs_offset,
+                    group_dim, rank, n_groups, DS4_N_EMBD,
+                    g->batch_heads, n_tokens) != 0;
+    if (ok) ok = ds4_cuda_hc_expand_split_tensor(
+                    g->batch_after_attn_hc,
+                    g->batch_attn_out,
+                    g->batch_cur_hc,
+                    g->batch_hc_split,
+                    DS4_N_EMBD, DS4_N_HC) != 0;
+
+    return ok;
+}
+
+/* Encode the batched prefill FFN half for one layer.  Mirrors
+ * metal_graph_encode_layer_ffn_batch (ds4.c:12357). */
+static bool cuda_graph_encode_layer_ffn_batch(
+        ds4_cuda_graph          *g,
+        const ds4_model         *model,
+        const ds4_layer_weights *layer,
+        uint32_t                 il,
+        uint32_t                 pos0,
+        uint32_t                 n_tokens) {
+    (void)il; (void)pos0;
+    if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
+
+    const uint64_t hc_dim         = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t shared_dim     = layer->ffn_gate_shexp->dim[1];
+    const uint64_t expert_in_dim  = layer->ffn_gate_exps->dim[0];
+    const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
+    const uint64_t down_in_dim    = layer->ffn_down_exps->dim[0];
+    const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
+    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
+    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+    const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+
+    bool ok = true;
+
+    /* HC pre + Sinkhorn + weighted-sum (fused) → batch_ffn_cur. */
+    if (ok) ok = ds4_cuda_rms_norm_plain_rows_tensor(
+                    g->batch_flat_hc, g->batch_after_attn_hc,
+                    (uint32_t)hc_dim, n_tokens, DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_cuda_matmul_f16_tensor(
+                    g->batch_hc_mix, model->map, model->size,
+                    layer->hc_ffn_fn->abs_offset,
+                    hc_dim, 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC,
+                    g->batch_flat_hc, n_tokens) != 0;
+    if (ok) ok = ds4_cuda_hc_split_weighted_sum_tensor(
+                    g->batch_ffn_cur, g->batch_hc_split,
+                    g->batch_hc_mix, g->batch_after_attn_hc,
+                    model->map, model->size,
+                    layer->hc_ffn_scale->abs_offset,
+                    layer->hc_ffn_base->abs_offset,
+                    DS4_N_EMBD, DS4_N_HC,
+                    DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS) != 0;
+
+    /* ffn_norm. */
+    if (ok) ok = ds4_cuda_rms_norm_weight_rows_tensor(
+                    g->batch_ffn_norm, g->batch_ffn_cur,
+                    model->map, model->size,
+                    layer->ffn_norm->abs_offset,
+                    DS4_N_EMBD, n_tokens, DS4_RMS_EPS) != 0;
+
+    /* Router. */
+    if (ok) ok = ds4_cuda_matmul_f16_tensor(
+                    g->batch_router_logits, model->map, model->size,
+                    layer->ffn_gate_inp->abs_offset,
+                    DS4_N_EMBD, DS4_N_EXPERT,
+                    g->batch_ffn_norm, n_tokens) != 0;
+    if (ok) ok = ds4_cuda_router_select_batch_tensor(
+                    g->batch_router_selected,
+                    g->batch_router_weights,
+                    g->batch_router_probs,
+                    model->map, model->size,
+                    layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
+                    layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
+                    layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
+                    /*group_count=*/0u, /*group_size=*/0u,
+                    layer->ffn_exp_probs_b != NULL,
+                    layer->ffn_gate_tid2eid != NULL,
+                    g->batch_router_logits,
+                    g->prefill_tokens, n_tokens) != 0;
+
+    /* Routed MoE. */
+    if (ok) ok = ds4_cuda_routed_moe_batch_tensor(
+                    g->batch_routed_out,
+                    g->batch_routed_gate,
+                    g->batch_routed_up,
+                    g->batch_routed_mid,
+                    g->batch_routed_down,
+                    model->map, model->size,
+                    layer->ffn_gate_exps->abs_offset,
+                    layer->ffn_up_exps->abs_offset,
+                    layer->ffn_down_exps->abs_offset,
+                    layer->ffn_gate_exps->type,
+                    layer->ffn_down_exps->type,
+                    gate_expert_bytes, gate_row_bytes,
+                    down_expert_bytes, down_row_bytes,
+                    (uint32_t)expert_in_dim,
+                    (uint32_t)down_in_dim,
+                    (uint32_t)routed_out_dim,
+                    g->batch_router_selected,
+                    g->batch_router_weights,
+                    DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP,
+                    g->batch_ffn_norm, n_tokens) != 0;
+
+    /* Shared expert. */
+    if (ok) ok = ds4_cuda_matmul_q8_0_tensor(
+                    g->batch_shared_gate, model->map, model->size,
+                    layer->ffn_gate_shexp->abs_offset,
+                    DS4_N_EMBD, shared_dim,
+                    g->batch_ffn_norm, n_tokens) != 0;
+    if (ok) ok = ds4_cuda_matmul_q8_0_tensor(
+                    g->batch_shared_up, model->map, model->size,
+                    layer->ffn_up_shexp->abs_offset,
+                    DS4_N_EMBD, shared_dim,
+                    g->batch_ffn_norm, n_tokens) != 0;
+    if (ok) ok = ds4_cuda_swiglu_tensor(
+                    g->batch_shared_mid,
+                    g->batch_shared_gate,
+                    g->batch_shared_up,
+                    (uint32_t)((uint64_t)n_tokens * shared_dim),
+                    0.0f, 1.0f) != 0;
+    if (ok) ok = ds4_cuda_matmul_q8_0_tensor(
+                    g->batch_shared_out, model->map, model->size,
+                    layer->ffn_down_shexp->abs_offset,
+                    shared_dim, DS4_N_EMBD,
+                    g->batch_shared_mid, n_tokens) != 0;
+
+    /* HC post: expand routed + shared back into HC streams via comb. */
+    if (ok) ok = ds4_cuda_hc_expand_add_split_tensor(
+                    g->batch_next_hc,
+                    g->batch_routed_out,
+                    g->batch_shared_out,
+                    g->batch_after_attn_hc,
+                    g->batch_hc_split,
+                    DS4_N_EMBD, DS4_N_HC) != 0;
+
+    return ok;
+}
+
+/* Encode one complete layer for prefill.  Mirrors
+ * metal_graph_encode_layer_batch (ds4.c:12604) including the HC ping-pong. */
+static bool cuda_graph_encode_layer_batch(
+        ds4_cuda_graph          *g,
+        const ds4_model         *model,
+        const ds4_layer_weights *layer,
+        uint32_t                 il,
+        uint32_t                 pos0,
+        uint32_t                 n_tokens) {
+    bool ok = cuda_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
+    if (ok) ok = cuda_graph_encode_layer_ffn_batch(g, model, layer, il, pos0, n_tokens);
+    if (ok) {
+        ds4_cuda_tensor *tmp = g->batch_cur_hc;
+        g->batch_cur_hc = g->batch_next_hc;
+        g->batch_next_hc = tmp;
+    }
+    return ok;
+}
+
+/* Layer-major batched prefill orchestrator.  Mirrors
+ * metal_graph_prefill_layer_major (ds4.c:12840) — embed all tokens into
+ * batch_cur_hc, run 43 layers in order, then run the output head on the
+ * last token's HC row only.  Zero-prefix only (pos0=0). */
+static bool cuda_graph_prefill_layer_major(
+        ds4_cuda_graph    *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        const ds4_tokens  *prompt,
+        int                n_tokens,
+        float             *logits) {
+    if (n_tokens <= 0 || n_tokens > prompt->len ||
+        (uint32_t)n_tokens > g->prefill_cap) return false;
+
+    /* Upload token IDs to prefill_tokens (int32 device buffer). */
+    if (!ds4_cuda_tensor_write(g->prefill_tokens, 0, prompt->v,
+                               (uint64_t)n_tokens * sizeof(int32_t))) {
+        return false;
+    }
+
+    if (!ds4_cuda_begin_commands()) return false;
+
+    /* Embed all tokens at once into batch_cur_hc. */
+    bool ok = ds4_cuda_embed_tokens_hc_tensor(
+                g->batch_cur_hc, g->prefill_tokens,
+                model->map, model->size,
+                weights->token_embd->abs_offset,
+                (uint32_t)weights->token_embd->dim[1],
+                (uint32_t)n_tokens, DS4_N_EMBD, DS4_N_HC) != 0;
+
+    /* Run 43 layers. */
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ok = cuda_graph_encode_layer_batch(g, model, &weights->layer[il],
+                                           il, 0u, (uint32_t)n_tokens);
+    }
+
+    /* Output head on the last token's row of batch_cur_hc.  We point the
+     * graph's single-token cur_hc at that row view, run the existing
+     * output head code, then restore. */
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    ds4_cuda_tensor *last_hc = NULL;
+    ds4_cuda_tensor *saved_cur = g->cur_hc;
+    if (ok) {
+        last_hc = cuda_graph_tensor_row_view(g->batch_cur_hc,
+                                             (uint32_t)n_tokens - 1u, hc_dim);
+        ok = last_hc != NULL;
+    }
+    if (ok) {
+        g->cur_hc = last_hc;
+
+        /* Output head: same 6-step sequence as cuda_graph_eval_token_raw_swa
+         * (ds4.c:15517-15539): rms_norm_plain → matmul_f16(output_hc_fn) →
+         * output_hc_weights → hc_weighted_sum → rms_norm_weight → matmul_q8_0
+         * over vocab. */
+        const uint64_t hc_dim_local = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+        ok = ds4_cuda_rms_norm_plain_tensor(
+                g->output_flat, g->cur_hc,
+                (uint32_t)hc_dim_local, DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_cuda_matmul_f16_tensor(
+                        g->output_pre, model->map, model->size,
+                        weights->output_hc_fn->abs_offset,
+                        hc_dim_local, DS4_N_HC,
+                        g->output_flat, 1u) != 0;
+        if (ok) ok = ds4_cuda_output_hc_weights_tensor(
+                        g->output_weights, g->output_pre,
+                        model->map, model->size,
+                        weights->output_hc_scale->abs_offset,
+                        weights->output_hc_base->abs_offset,
+                        DS4_N_HC, DS4_HC_EPS) != 0;
+        if (ok) ok = ds4_cuda_hc_weighted_sum_tensor(
+                        g->output_embd, g->cur_hc, g->output_weights,
+                        DS4_N_EMBD, DS4_N_HC) != 0;
+        if (ok) ok = ds4_cuda_rms_norm_weight_tensor(
+                        g->output_norm, g->output_embd,
+                        model->map, model->size,
+                        weights->output_norm->abs_offset,
+                        DS4_N_EMBD, DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_cuda_matmul_q8_0_tensor(
+                        g->logits, model->map, model->size,
+                        weights->output->abs_offset,
+                        DS4_N_EMBD, DS4_N_VOCAB,
+                        g->output_norm, 1u) != 0;
+    }
+
+    if (ok) ok = ds4_cuda_end_commands_async();
+    else (void)ds4_cuda_synchronize();
+
+    g->cur_hc = saved_cur;
+    if (last_hc) ds4_cuda_tensor_free(last_hc);
+
+    if (!ok) return false;
+
+    if (logits) {
+        if (!ds4_cuda_tensor_read(g->logits, 0, logits,
+                                  (size_t)DS4_N_VOCAB * sizeof(float))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Multi-token prefill.  Default: per-token loop (Phase 3b safe path).
+ * With DS4_CUDA_LAYER_MAJOR=1 set, dispatches to the Phase 7 layer-major
+ * batched orchestrator.  Stage D will flip the default once smoke +
+ * long-prompt validation lock in. */
 static bool cuda_graph_prefill_chunked(
         ds4_cuda_graph    *g,
         const ds4_model   *model,
@@ -15562,13 +16319,17 @@ static bool cuda_graph_prefill_chunked(
         int                n_tokens,
         float             *logits) {
     if (n_tokens <= 0 || n_tokens > prompt->len) return false;
+
+    const char *layer_major_env = getenv("DS4_CUDA_LAYER_MAJOR");
+    const bool layer_major = layer_major_env && layer_major_env[0] == '1';
+    if (layer_major) {
+        return cuda_graph_prefill_layer_major(g, model, weights, prompt,
+                                              n_tokens, logits);
+    }
+
     for (int t = 0; t < n_tokens; t++) {
         const bool last = (t == n_tokens - 1);
-        /* eval skips the entire output head when logits_out is NULL (vocab
-         * matmul is the most expensive single step per token). */
         float *out_ptr = last ? logits : NULL;
-        /* TODO 3b: collapse this per-token loop into a batched-attention
-         * prefill orchestrator (layer-major schedule, one logits readback). */
         if (!cuda_graph_eval_token_raw_swa(g, model, weights,
                                            (uint32_t)prompt->v[t],
                                            (uint32_t)t,
