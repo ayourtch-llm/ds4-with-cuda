@@ -396,6 +396,96 @@ static __device__ int32_t ds4_cuda_dot_q2_16(
     return sum;
 }
 
+/* Phase 3b-3 retile companion to ds4_cuda_vec_dot_q2_K_q8_K below.
+ *
+ * Same math, but the per-outer-block work is parallelised across the 32 lanes
+ * of the calling warp:
+ *   1. `summs` (16 i16×i4 products): lanes 0..15 each compute one product;
+ *      5-step __shfl_xor_sync int-tree reduces to a bit-exact int32.
+ *   2. `isum`  (256 i8×i2 products, each scaled by a 4-bit per-chunk weight):
+ *      each lane handles 8 elements (stride 32 across the 256), summing
+ *      `scale * q2 * q8` per element into a private accumulator; another
+ *      5-step __shfl_xor_sync reduces to a bit-exact int32.
+ *
+ * Integer addition is associative so both reductions are bit-exact regardless
+ * of order.  All lanes then run the two FP fmafs:
+ *     sumf = fmaf(dmin, (float)summs, sumf);
+ *     sumf = fmaf(d,    (float)isum,  sumf);
+ * — preserving the original FMA chain (and the carefully-ordered NEON-matched
+ * dmin-then-d sequence the existing helper relies on for prod_dense_q2_k
+ * bit-exactness).
+ *
+ * Lane-mapping for `isum` mirrors the chunk layout the scalar helper uses
+ * (chunk 0..7 in q2[0..31] across shifts 0,2,4,6; chunk 8..15 in q2[32..63]
+ * with the same shift sweep).  See the inline comments below.
+ *
+ * Caller must invoke this from a full warp (32 lanes participating). */
+static __device__ __forceinline__ float ds4_cuda_warp_vec_dot_q2_K_q8_K(
+        const ds4_cuda_block_q2_K *x,
+        const ds4_cuda_block_q8_K *y,
+        uint32_t                   nb,
+        uint32_t                   lane) {
+    float sumf = 0.0f;
+    for (uint32_t i = 0; i < nb; i++) {
+        const uint8_t *q2 = x[i].qs;       /*  64 bytes, packs 4× 2-bit quants per byte */
+        const int8_t  *q8 = y[i].qs;       /* 256 int8 activation quants */
+        const uint8_t *sc = x[i].scales;   /*  16 bytes, low nibble = inner-scale, high = block-min scale */
+
+        /* ---- summs: y[i].bsums[j] * (sc[j] >> 4), j ∈ [0,16) ---- */
+        int32_t lane_summ = 0;
+        if (lane < 16u) {
+            lane_summ = (int32_t)y[i].bsums[lane] * (int32_t)((uint32_t)sc[lane] >> 4u);
+        }
+        lane_summ += __shfl_xor_sync(0xffffffffu, lane_summ, 16);
+        lane_summ += __shfl_xor_sync(0xffffffffu, lane_summ, 8);
+        lane_summ += __shfl_xor_sync(0xffffffffu, lane_summ, 4);
+        lane_summ += __shfl_xor_sync(0xffffffffu, lane_summ, 2);
+        lane_summ += __shfl_xor_sync(0xffffffffu, lane_summ, 1);
+        const int32_t summs = lane_summ;
+
+        const float d    =  y[i].d * ds4_cuda_f16_to_f32(x[i].d);
+        const float dmin = -y[i].d * ds4_cuda_f16_to_f32(x[i].dmin);
+        sumf = fmaf(dmin, (float)summs, sumf);
+
+        /* ---- isum: 256 element products, 8 per lane (stride 32) ----
+         * Element index e ∈ [0,256) maps to:
+         *   chunk = e >> 4         ∈ [0,16)   one of the 16 dot_q2_16 calls
+         *   pos   = e & 15         ∈ [0,16)   element within that chunk
+         *   block = chunk >> 3     ∈ [0,2)    selects q2[0..31] vs q2[32..63]
+         *   inner = chunk & 1                 second q2 half within the block
+         *   jj    = (chunk >> 1) & 3 ∈ [0,4)  shift index
+         *   shift = jj * 2          ∈ {0,2,4,6}
+         *   q2_idx = block*32 + inner*16 + pos
+         *   scale  = sc[chunk] & 0x0f
+         */
+        int32_t lane_isum = 0;
+        #pragma unroll
+        for (uint32_t step = 0; step < 8u; step++) {
+            const uint32_t e      = step * 32u + lane;
+            const uint32_t chunk  = e >> 4;
+            const uint32_t pos    = e & 15u;
+            const uint32_t block  = chunk >> 3;
+            const uint32_t inner  = chunk & 1u;
+            const uint32_t jj     = (chunk >> 1) & 3u;
+            const uint32_t shift  = jj * 2u;
+            const uint32_t q2_idx = block * 32u + inner * 16u + pos;
+            const int32_t  scale  = (int32_t)((uint32_t)sc[chunk] & 0x0fu);
+            const int32_t  q2v    = (int32_t)(((uint32_t)q2[q2_idx] >> shift) & 3u);
+            const int32_t  q8v    = (int32_t)q8[e];
+            lane_isum += scale * q2v * q8v;
+        }
+        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 16);
+        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 8);
+        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 4);
+        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 2);
+        lane_isum += __shfl_xor_sync(0xffffffffu, lane_isum, 1);
+        const int32_t isum = lane_isum;
+
+        sumf = fmaf(d, (float)isum, sumf);
+    }
+    return sumf;
+}
+
 static __device__ float ds4_cuda_vec_dot_q2_K_q8_K(
         const ds4_cuda_block_q2_K *x,
         const ds4_cuda_block_q8_K *y,
@@ -1042,6 +1132,18 @@ static __global__ void ds4_cuda_routed_moe_mid_iq2_xxs_kernel(
     }
 }
 
+/* Phase 3b-3 retile: one warp per output row.  Inner Q2_K dot parallelised
+ * across the 32 lanes via ds4_cuda_warp_vec_dot_q2_K_q8_K (integer reductions
+ * → bit-exact).  The outer loop over n_expert slots stays serial in lock-step
+ * across all lanes — same reasoning as 3b-1's "FP chain stays serial":
+ * `sum += v` is exactly an FP accumulator chain, and parallelising it would
+ * re-introduce the FMA-ordering parity risk.  All lanes converge to the same
+ * `sum`; lane 0 writes.  n_expert ≈ 6 in DS4 Flash so the serial outer loop
+ * is small.
+ *
+ * blockDim is (32, ROWS_PER_BLOCK); each warp handles row
+ * blockIdx.x*ROWS_PER_BLOCK + threadIdx.y of token blockIdx.y. */
+template<uint32_t ROWS_PER_BLOCK>
 static __global__ void ds4_cuda_routed_moe_down_q2_k_kernel(
         const ds4_cuda_block_q2_K *down_w,
         const ds4_cuda_block_q8_K *midq,
@@ -1054,9 +1156,10 @@ static __global__ void ds4_cuda_routed_moe_down_q2_k_kernel(
         uint32_t                   out_dim,
         uint64_t                   down_expert_bytes,
         uint64_t                   down_row_bytes) {
-    const uint32_t row = blockIdx.x;
+    const uint32_t row   = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
     const uint32_t token = blockIdx.y;
-    if (row >= out_dim || token >= n_tokens || threadIdx.x != 0) return;
+    if (row >= out_dim || token >= n_tokens) return;
+    const uint32_t lane = threadIdx.x;
 
     const uint32_t midq_blocks = expert_mid_dim / 256u;
     float sum = 0.0f;
@@ -1068,11 +1171,13 @@ static __global__ void ds4_cuda_routed_moe_down_q2_k_kernel(
             (const ds4_cuda_block_q2_K *)(down_base + (uint64_t)row * down_row_bytes);
         const ds4_cuda_block_q8_K *slot_midq =
             midq + ((uint64_t)token * n_expert + slot) * midq_blocks;
-        const float v = ds4_cuda_vec_dot_q2_K_q8_K(down_row, slot_midq, midq_blocks);
-        if (experts) experts[((uint64_t)token * n_expert + slot) * out_dim + row] = v;
+        const float v = ds4_cuda_warp_vec_dot_q2_K_q8_K(down_row, slot_midq, midq_blocks, lane);
+        if (lane == 0u && experts) {
+            experts[((uint64_t)token * n_expert + slot) * out_dim + row] = v;
+        }
         sum += v;
     }
-    out[(uint64_t)token * out_dim + row] = sum;
+    if (lane == 0u) out[(uint64_t)token * out_dim + row] = sum;
 }
 
 static __global__ void ds4_cuda_router_select_kernel(
@@ -2500,7 +2605,12 @@ static int ds4_cuda_routed_moe_impl(
         ok = ds4_cuda_check(cudaGetLastError(), "launch routed MoE mid quantize");
     }
     if (ok) {
-        ds4_cuda_routed_moe_down_q2_k_kernel<<<dim3(out_dim, n_tokens, 1), 1, 0, g_stream>>>(
+        constexpr uint32_t ROWS_PER_BLOCK = 4u;
+        const uint32_t row_blocks = (out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
+        ds4_cuda_routed_moe_down_q2_k_kernel<ROWS_PER_BLOCK><<<
+                dim3(row_blocks, n_tokens, 1),
+                dim3(32u, ROWS_PER_BLOCK, 1),
+                0, g_stream>>>(
             down_w,
             g_scratch_routed_moe_midq,
             (const int32_t *)selected_ptr,
