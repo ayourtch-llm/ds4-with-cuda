@@ -761,7 +761,12 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
             fprintf(stderr, "ds4: diagnostic run completed on the native %s path.\n",
                     ds4_backend_name(cfg->engine.backend));
         }
-    } else if (cfg->gen.temperature > 0.0f || ds4_engine_mtp_draft_tokens(engine) > 1) {
+    } else if (cfg->gen.temperature > 0.0f ||
+               ds4_engine_mtp_draft_tokens(engine) > 1 ||
+               cfg->engine.backend == DS4_BACKEND_CUDA) {
+        /* CUDA greedy goes through run_sampled_generation because that's the
+         * session-API path (Phase 3c).  ds4_engine_generate_argmax has no
+         * CUDA branch yet — it'd fall through to the CPU reference path. */
         rc = run_sampled_generation(engine, cfg, &prompt);
     } else {
         token_printer printer = {
