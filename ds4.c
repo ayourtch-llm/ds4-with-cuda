@@ -14949,6 +14949,326 @@ static bool cuda_graph_eval_mtp_draft(
                                               token, pos, logits, top_id);
 }
 
+/* Phase 4 Step 5a: per-layer prefix-1 capture invoked mid-verifier
+ * between the encode_one_layer call for draft[0] and the call for
+ * draft[1].  When g->spec_capture_prefix1 is set, the per-layer
+ * compressor / indexer state at the post-draft[0] point is copied into
+ * spec_prefix1_* scratch so a partial accept can rewind without
+ * replaying.  No-op when spec_capture_prefix1 is false (regular decode)
+ * or when the spec scratch wasn't allocated (mtp_ready=false at graph
+ * alloc time).  Mirrors metal_graph_capture_prefix1_attn_state at
+ * ds4.c:8997 and _index_state at ds4.c:9007. */
+static bool cuda_graph_capture_prefix1_attn_state(ds4_cuda_graph *g, uint32_t il) {
+    if (!g->spec_capture_prefix1 || !g->spec_prefix1_attn_state_kv[il]) return true;
+    const uint64_t bytes = ds4_cuda_tensor_bytes(g->layer_attn_state_kv[il]);
+    g->spec_prefix1_n_comp[il] = g->layer_n_comp[il];
+    return ds4_cuda_tensor_copy(g->spec_prefix1_attn_state_kv[il], 0,
+                                 g->layer_attn_state_kv[il], 0, bytes) != 0 &&
+           ds4_cuda_tensor_copy(g->spec_prefix1_attn_state_score[il], 0,
+                                 g->layer_attn_state_score[il], 0, bytes) != 0;
+}
+
+static bool cuda_graph_capture_prefix1_index_state(ds4_cuda_graph *g, uint32_t il) {
+    if (!g->spec_capture_prefix1 || !g->spec_prefix1_index_state_kv[il]) return true;
+    const uint64_t bytes = ds4_cuda_tensor_bytes(g->layer_index_state_kv[il]);
+    g->spec_prefix1_n_index_comp[il] = g->layer_n_index_comp[il];
+    return ds4_cuda_tensor_copy(g->spec_prefix1_index_state_kv[il], 0,
+                                 g->layer_index_state_kv[il], 0, bytes) != 0 &&
+           ds4_cuda_tensor_copy(g->spec_prefix1_index_state_score[il], 0,
+                                 g->layer_index_state_score[il], 0, bytes) != 0;
+}
+
+/* Phase 4 Step 5a: speculative-frontier snapshot/restore/commit.  The
+ * frontier is the PRE-DRAFT compressor / indexer state — captured
+ * before drafts are speculatively encoded so a full reject can rewind
+ * in O(layer * tensor_copy) time.  commit_prefix1 is the partial-accept
+ * fast path that uses the mid-verifier prefix1 captures (above) instead
+ * of restoring the full pre-draft frontier.  Mirrors Metal's pattern at
+ * ds4.c:16357-16455. */
+typedef struct {
+    uint32_t mtp_n_raw;
+    uint32_t n_comp[DS4_N_LAYER];
+    uint32_t n_index_comp[DS4_N_LAYER];
+} ds4_cuda_spec_frontier;
+
+static void cuda_spec_frontier_free(ds4_cuda_spec_frontier *f) {
+    if (!f) return;
+    memset(f, 0, sizeof(*f));
+}
+
+static bool cuda_spec_frontier_snapshot(ds4_cuda_spec_frontier *f, ds4_cuda_graph *g) {
+    memset(f, 0, sizeof(*f));
+    f->mtp_n_raw = g->mtp_n_raw;
+
+    int ok = ds4_cuda_begin_commands();
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        f->n_comp[il]       = g->layer_n_comp[il];
+        f->n_index_comp[il] = g->layer_n_index_comp[il];
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0 || !g->spec_attn_state_kv[il]) continue;
+        const uint64_t ab = ds4_cuda_tensor_bytes(g->layer_attn_state_kv[il]);
+        ok = ds4_cuda_tensor_copy(g->spec_attn_state_kv[il], 0,
+                                   g->layer_attn_state_kv[il], 0, ab) != 0 &&
+             ds4_cuda_tensor_copy(g->spec_attn_state_score[il], 0,
+                                   g->layer_attn_state_score[il], 0, ab) != 0;
+        if (ok && ratio == 4u && g->spec_index_state_kv[il]) {
+            const uint64_t ib = ds4_cuda_tensor_bytes(g->layer_index_state_kv[il]);
+            ok = ds4_cuda_tensor_copy(g->spec_index_state_kv[il], 0,
+                                       g->layer_index_state_kv[il], 0, ib) != 0 &&
+                 ds4_cuda_tensor_copy(g->spec_index_state_score[il], 0,
+                                       g->layer_index_state_score[il], 0, ib) != 0;
+        }
+    }
+    if (ok) ok = ds4_cuda_end_commands();   /* sync — caller may inspect */
+    else (void)ds4_cuda_synchronize();
+    if (ok) return true;
+    cuda_spec_frontier_free(f);
+    return false;
+}
+
+static bool cuda_spec_frontier_restore(ds4_cuda_spec_frontier *f, ds4_cuda_graph *g) {
+    int ok = ds4_cuda_begin_commands();
+    g->mtp_n_raw = f->mtp_n_raw;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        g->layer_n_comp[il]       = f->n_comp[il];
+        g->layer_n_index_comp[il] = f->n_index_comp[il];
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0 || !g->spec_attn_state_kv[il]) continue;
+        const uint64_t ab = ds4_cuda_tensor_bytes(g->layer_attn_state_kv[il]);
+        ok = ds4_cuda_tensor_copy(g->layer_attn_state_kv[il], 0,
+                                   g->spec_attn_state_kv[il], 0, ab) != 0 &&
+             ds4_cuda_tensor_copy(g->layer_attn_state_score[il], 0,
+                                   g->spec_attn_state_score[il], 0, ab) != 0;
+        if (ok && ratio == 4u && g->spec_index_state_kv[il]) {
+            const uint64_t ib = ds4_cuda_tensor_bytes(g->layer_index_state_kv[il]);
+            ok = ds4_cuda_tensor_copy(g->layer_index_state_kv[il], 0,
+                                       g->spec_index_state_kv[il], 0, ib) != 0 &&
+                 ds4_cuda_tensor_copy(g->layer_index_state_score[il], 0,
+                                       g->spec_index_state_score[il], 0, ib) != 0;
+        }
+    }
+    if (ok) ok = ds4_cuda_end_commands();
+    else (void)ds4_cuda_synchronize();
+    return ok ? true : false;
+}
+
+static bool cuda_spec_frontier_commit_prefix1(ds4_cuda_graph *g) {
+    int ok = ds4_cuda_begin_commands();
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0 || !g->spec_prefix1_attn_state_kv[il]) continue;
+        g->layer_n_comp[il] = g->spec_prefix1_n_comp[il];
+        const uint64_t ab = ds4_cuda_tensor_bytes(g->layer_attn_state_kv[il]);
+        ok = ds4_cuda_tensor_copy(g->layer_attn_state_kv[il], 0,
+                                   g->spec_prefix1_attn_state_kv[il], 0, ab) != 0 &&
+             ds4_cuda_tensor_copy(g->layer_attn_state_score[il], 0,
+                                   g->spec_prefix1_attn_state_score[il], 0, ab) != 0;
+        if (ok && ratio == 4u && g->spec_prefix1_index_state_kv[il]) {
+            g->layer_n_index_comp[il] = g->spec_prefix1_n_index_comp[il];
+            const uint64_t ib = ds4_cuda_tensor_bytes(g->layer_index_state_kv[il]);
+            ok = ds4_cuda_tensor_copy(g->layer_index_state_kv[il], 0,
+                                       g->spec_prefix1_index_state_kv[il], 0, ib) != 0 &&
+                 ds4_cuda_tensor_copy(g->layer_index_state_score[il], 0,
+                                       g->spec_prefix1_index_state_score[il], 0, ib) != 0;
+        }
+    }
+    if (ok) ok = ds4_cuda_end_commands();
+    else (void)ds4_cuda_synchronize();
+    return ok ? true : false;
+}
+
+/* Phase 4 Step 5b: exact N=2 target verifier for MTP.  Mirrors
+ * metal_graph_verify_decode2_exact at ds4.c:13423.
+ *
+ * Encodes the two proposed tokens layer-by-layer in one command stream,
+ * with mid-flight prefix-1 capture so a partial accept (token0 only)
+ * can rewind to just-after-token0 without replaying.  Each (token, il)
+ * call advances the same per-layer caches the regular single-token
+ * decode would, so the resulting logits are bit-equivalent to two
+ * sequential cuda_graph_eval_token_raw_swa calls.
+ *
+ * Output:
+ *   - top0 = target's argmax-after-token0 (used by the caller to
+ *     compare against drafts[1] and decide accept/reject).
+ *   - logits0 (optional) = full target logits row after token0.
+ *   - logits1 (always) = full target logits row after token1, used to
+ *     refresh s->logits when the verifier accepts both. */
+static bool cuda_graph_verify_decode2_exact(
+        ds4_cuda_graph    *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        int                token0,
+        int                token1,
+        uint32_t           start,
+        int               *top0,
+        float             *logits0,
+        float             *logits1) {
+    if (!g || !top0 || !logits1 || g->raw_cap == 0) return false;
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+    const uint64_t hc_bytes = hc_dim * sizeof(float);
+
+    /* Two HC ping-pong pairs — one stream per draft token.  The decode
+     * loop reuses g->cur_hc / g->next_hc; we need separate buffers so
+     * token1's encode doesn't clobber token0's mid-verifier state.  We
+     * borrow g->cur_hc / g->next_hc for token0 and allocate token1's
+     * pair from the spec_prefix1 hc-shaped tensors... but those don't
+     * exist.  Simplest: embed both into one pair of hc-sized tensors
+     * via the after_attn_hc + after_ffn_hc work tensors which are
+     * hc-shaped and idle outside the per-layer body.  Actually those
+     * are also reused inside encode_one_layer — would clobber.
+     *
+     * Instead: allocate two transient hc-sized tensors for the verifier
+     * (token1's cur and next) on the spot.  hc_bytes ≈ 1 MB; transient
+     * cost is acceptable for a 2-token verifier path. */
+    ds4_cuda_tensor *cur1 = ds4_cuda_tensor_alloc(hc_bytes);
+    ds4_cuda_tensor *next1 = ds4_cuda_tensor_alloc(hc_bytes);
+    if (!cur1 || !next1) {
+        ds4_cuda_tensor_free(cur1);
+        ds4_cuda_tensor_free(next1);
+        return false;
+    }
+    ds4_cuda_tensor *cur0 = g->cur_hc;
+    ds4_cuda_tensor *next0 = g->next_hc;
+
+    /* Embed both tokens.  token0 → cur0 (full N_HC stream), token1 → cur1. */
+    bool ok = ds4_cuda_begin_commands() != 0;
+    if (ok) ok = ds4_cuda_embed_token_hc_tensor(cur0, model->map, model->size,
+                                                 weights->token_embd->abs_offset,
+                                                 (uint32_t)weights->token_embd->dim[1],
+                                                 (uint32_t)token0, DS4_N_EMBD, DS4_N_HC) != 0;
+    if (ok) ok = ds4_cuda_embed_token_hc_tensor(cur1, model->map, model->size,
+                                                 weights->token_embd->abs_offset,
+                                                 (uint32_t)weights->token_embd->dim[1],
+                                                 (uint32_t)token1, DS4_N_EMBD, DS4_N_HC) != 0;
+    if (ok) ok = ds4_cuda_end_commands_async() != 0;
+    if (!ok) {
+        (void)ds4_cuda_synchronize();
+        ds4_cuda_tensor_free(cur1);
+        ds4_cuda_tensor_free(next1);
+        return false;
+    }
+
+    const bool saved_capture = g->spec_capture_prefix1;
+    g->spec_capture_prefix1 = true;
+
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        const uint32_t pos0 = start;
+        const uint32_t pos1 = start + 1u;
+
+        /* token0 advances per-layer state. */
+        const uint32_t raw_row0 = pos0 % g->raw_cap;
+        uint32_t n_raw0 = pos0 + 1u;
+        if (n_raw0 > g->raw_window) n_raw0 = g->raw_window;
+        if (n_raw0 > g->raw_cap)    n_raw0 = g->raw_cap;
+        const uint32_t raw_start0 = ((pos0 + 1u) - n_raw0) % g->raw_cap;
+        ok = cuda_graph_encode_one_layer(g, model, &weights->layer[il], il, pos0,
+                                          g->layer_raw_cache[il], g->raw_cap,
+                                          raw_row0, n_raw0, raw_start0,
+                                          token0, cur0, next0);
+        if (!ok) break;
+
+        /* Capture post-token0 prefix1 state for partial-accept rollback. */
+        ok = cuda_graph_capture_prefix1_attn_state(g, il) &&
+             cuda_graph_capture_prefix1_index_state(g, il);
+        if (!ok) break;
+
+        /* token1 advances per-layer state on top of token0. */
+        const uint32_t raw_row1 = pos1 % g->raw_cap;
+        uint32_t n_raw1 = pos1 + 1u;
+        if (n_raw1 > g->raw_window) n_raw1 = g->raw_window;
+        if (n_raw1 > g->raw_cap)    n_raw1 = g->raw_cap;
+        const uint32_t raw_start1 = ((pos1 + 1u) - n_raw1) % g->raw_cap;
+        ok = cuda_graph_encode_one_layer(g, model, &weights->layer[il], il, pos1,
+                                          g->layer_raw_cache[il], g->raw_cap,
+                                          raw_row1, n_raw1, raw_start1,
+                                          token1, cur1, next1);
+        if (!ok) break;
+
+        /* Swap each draft's HC ping-pong locals for the next layer. */
+        ds4_cuda_tensor *tmp = cur0; cur0 = next0; next0 = tmp;
+        tmp = cur1; cur1 = next1; next1 = tmp;
+    }
+    g->spec_capture_prefix1 = saved_capture;
+    if (!ok) {
+        (void)ds4_cuda_synchronize();
+        ds4_cuda_tensor_free(cur1);
+        ds4_cuda_tensor_free(next1);
+        return false;
+    }
+
+    /* After all layers: cur0 holds post-token0 HC, cur1 holds post-token1.
+     * Run the regular (non-MTP) output head twice — once on cur0 to get
+     * top0 + (optional) logits0; once on cur1 for logits1. */
+    const uint64_t vocab_dim = weights->output->dim[1];
+
+    /* Output head on cur0. */
+    ok = ds4_cuda_begin_commands() != 0;
+    if (ok) ok = ds4_cuda_rms_norm_plain_tensor(g->output_flat, cur0,
+                                                 (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_cuda_matmul_f16_tensor(g->output_pre, model->map, model->size,
+                                             weights->output_hc_fn->abs_offset,
+                                             hc_dim, DS4_N_HC, g->output_flat, 1u) != 0;
+    if (ok) ok = ds4_cuda_output_hc_weights_tensor(
+                    g->output_weights, g->output_pre,
+                    model->map, model->size,
+                    weights->output_hc_scale->abs_offset,
+                    weights->output_hc_base->abs_offset,
+                    DS4_N_HC, DS4_HC_EPS) != 0;
+    if (ok) ok = ds4_cuda_hc_weighted_sum_tensor(g->output_embd, cur0,
+                                                  g->output_weights,
+                                                  DS4_N_EMBD, DS4_N_HC) != 0;
+    if (ok) ok = ds4_cuda_rms_norm_weight_tensor(g->output_norm, g->output_embd,
+                                                  model->map, model->size,
+                                                  weights->output_norm->abs_offset,
+                                                  DS4_N_EMBD, DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_cuda_matmul_q8_0_tensor(g->logits, model->map, model->size,
+                                              weights->output->abs_offset,
+                                              DS4_N_EMBD, vocab_dim,
+                                              g->output_norm, 1u) != 0;
+    /* On-device argmax for top0. */
+    if (ok) ok = ds4_cuda_indexer_topk_tensor(g->comp_selected, g->logits,
+                                               DS4_N_VOCAB, 1u, 1u) != 0;
+    if (ok) ok = ds4_cuda_end_commands_async() != 0;
+    if (ok) ok = ds4_cuda_tensor_read(g->comp_selected, 0, top0, sizeof(*top0)) != 0;
+    if (ok && logits0) {
+        ok = ds4_cuda_tensor_read(g->logits, 0, logits0,
+                                   (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+
+    /* Output head on cur1. */
+    if (ok) ok = ds4_cuda_begin_commands() != 0;
+    if (ok) ok = ds4_cuda_rms_norm_plain_tensor(g->output_flat, cur1,
+                                                 (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_cuda_matmul_f16_tensor(g->output_pre, model->map, model->size,
+                                             weights->output_hc_fn->abs_offset,
+                                             hc_dim, DS4_N_HC, g->output_flat, 1u) != 0;
+    if (ok) ok = ds4_cuda_output_hc_weights_tensor(
+                    g->output_weights, g->output_pre,
+                    model->map, model->size,
+                    weights->output_hc_scale->abs_offset,
+                    weights->output_hc_base->abs_offset,
+                    DS4_N_HC, DS4_HC_EPS) != 0;
+    if (ok) ok = ds4_cuda_hc_weighted_sum_tensor(g->output_embd, cur1,
+                                                  g->output_weights,
+                                                  DS4_N_EMBD, DS4_N_HC) != 0;
+    if (ok) ok = ds4_cuda_rms_norm_weight_tensor(g->output_norm, g->output_embd,
+                                                  model->map, model->size,
+                                                  weights->output_norm->abs_offset,
+                                                  DS4_N_EMBD, DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_cuda_matmul_q8_0_tensor(g->logits, model->map, model->size,
+                                              weights->output->abs_offset,
+                                              DS4_N_EMBD, vocab_dim,
+                                              g->output_norm, 1u) != 0;
+    if (ok) ok = ds4_cuda_end_commands_async() != 0;
+    if (ok) ok = ds4_cuda_tensor_read(g->logits, 0, logits1,
+                                       (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+
+    ds4_cuda_tensor_free(cur1);
+    ds4_cuda_tensor_free(next1);
+    return ok;
+}
+
 static bool cuda_graph_eval_token_raw_swa(
         ds4_cuda_graph    *g,
         const ds4_model   *model,
