@@ -4020,6 +4020,153 @@ DS4_CUDA_PARITY_TEST(attention_decode_heads_mask,
     .cfg = (void *)&attn_decode_mask_cfg);
 
 /* ---------------------------------------------------------------------------
+ * Phase 7 — batched static-mixed prefill (raw causal window + static comp).
+ * ---------------------------------------------------------------------------
+ * Multi-token batched flash-attention with sinks.  Per-token visible KV =
+ * raw_kv[max(0,t+1-window) .. t+1) ∪ comp_kv[0..n_comp).  CPU oracle assembles
+ * the visible stream per token and calls attention_rows_raw_cpu for the
+ * sinks-aware softmax.  Same input shaping as m4 flash_attn (q*=8, kv=abs+0.5)
+ * to keep softmax magnitudes away from zero. */
+
+struct attn_prefill_static_mixed_cfg {
+    uint32_t n_tokens;
+    uint32_t n_head;
+    uint32_t head_dim;
+    uint32_t n_comp;
+    uint32_t window;
+    uint32_t ratio;
+};
+
+static void attn_prefill_static_mixed_prep(const float *in_raw,
+                                           const struct attn_prefill_static_mixed_cfg *c,
+                                           float *q_buf, float *raw_buf, float *comp_buf,
+                                           float *sinks_buf) {
+    const size_t q_n    = (size_t)c->n_tokens * c->n_head * c->head_dim;
+    const size_t raw_n  = (size_t)c->n_tokens * c->head_dim;
+    const size_t comp_n = (size_t)c->n_comp * c->head_dim;
+    const float *src = in_raw;
+    for (size_t i = 0; i < q_n; i++)    q_buf[i]    = src[i] * 8.0f;
+    src += q_n;
+    for (size_t i = 0; i < raw_n; i++)  raw_buf[i]  = fabsf(src[i]) + 0.5f;
+    src += raw_n;
+    for (size_t i = 0; i < comp_n; i++) comp_buf[i] = fabsf(src[i]) + 0.5f;
+    src += comp_n;
+    for (uint32_t i = 0; i < c->n_head; i++) sinks_buf[i] = src[i];
+}
+
+static int attn_prefill_static_mixed_cpu(const float *in, float *out, void *cfg) {
+    const struct attn_prefill_static_mixed_cfg *c = cfg;
+    const size_t q_n    = (size_t)c->n_tokens * c->n_head * c->head_dim;
+    const size_t raw_n  = (size_t)c->n_tokens * c->head_dim;
+    const size_t comp_n = (size_t)c->n_comp * c->head_dim;
+    float *q     = (float *)malloc(q_n * sizeof(float));
+    float *raw   = (float *)malloc(raw_n * sizeof(float));
+    float *comp  = c->n_comp ? (float *)malloc(comp_n * sizeof(float)) : NULL;
+    float *sinks = (float *)malloc((size_t)c->n_head * sizeof(float));
+    const size_t max_visible = (size_t)c->window + c->n_comp;
+    float *visible = (float *)malloc(max_visible * c->head_dim * sizeof(float));
+    if (!q || !raw || (c->n_comp && !comp) || !sinks || !visible) {
+        free(q); free(raw); free(comp); free(sinks); free(visible); return 0;
+    }
+    attn_prefill_static_mixed_prep(in, c, q, raw, comp, sinks);
+
+    for (uint32_t t = 0; t < c->n_tokens; t++) {
+        const uint32_t kv_start = (t + 1u > c->window) ? (t + 1u - c->window) : 0u;
+        const uint32_t n_raw    = t + 1u - kv_start;
+        size_t kv_count = 0;
+        for (uint32_t r = 0; r < n_raw; r++) {
+            memcpy(visible + kv_count * c->head_dim,
+                   raw + (size_t)(kv_start + r) * c->head_dim,
+                   (size_t)c->head_dim * sizeof(float));
+            kv_count++;
+        }
+        for (uint32_t cc = 0; cc < c->n_comp; cc++) {
+            memcpy(visible + kv_count * c->head_dim,
+                   comp + (size_t)cc * c->head_dim,
+                   (size_t)c->head_dim * sizeof(float));
+            kv_count++;
+        }
+        const float *qt = q + (size_t)t * c->n_head * c->head_dim;
+        float *out_t    = out + (size_t)t * c->n_head * c->head_dim;
+        attention_rows_raw_cpu(out_t, qt, visible, (uint32_t)kv_count, sinks,
+                               c->n_head, c->head_dim);
+    }
+    free(q); free(raw); free(comp); free(sinks); free(visible);
+    return 1;
+}
+
+static int attn_prefill_static_mixed_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                          size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct attn_prefill_static_mixed_cfg *c = cfg;
+    const size_t q_n    = (size_t)c->n_tokens * c->n_head * c->head_dim;
+    const size_t raw_n  = (size_t)c->n_tokens * c->head_dim;
+    const size_t comp_n = (size_t)c->n_comp * c->head_dim;
+    float *q_h     = (float *)malloc(q_n * sizeof(float));
+    float *raw_h   = (float *)malloc(raw_n * sizeof(float));
+    float *comp_h  = c->n_comp ? (float *)malloc(comp_n * sizeof(float)) : NULL;
+    float *sinks_h = (float *)malloc((size_t)c->n_head * sizeof(float));
+    if (!q_h || !raw_h || (c->n_comp && !comp_h) || !sinks_h) {
+        free(q_h); free(raw_h); free(comp_h); free(sinks_h); return 0;
+    }
+    attn_prefill_static_mixed_prep(in, c, q_h, raw_h, comp_h, sinks_h);
+
+    ds4_cuda_tensor *q_dev    = ds4_cuda_tensor_alloc((uint64_t)q_n   * sizeof(float));
+    ds4_cuda_tensor *raw_dev  = ds4_cuda_tensor_alloc((uint64_t)raw_n * sizeof(float));
+    ds4_cuda_tensor *comp_dev = c->n_comp ? ds4_cuda_tensor_alloc((uint64_t)comp_n * sizeof(float)) : NULL;
+    ds4_cuda_tensor *sinks_dev = ds4_cuda_tensor_alloc((uint64_t)c->n_head * sizeof(float));
+
+    int ok = q_dev && raw_dev && (c->n_comp == 0 || comp_dev) && sinks_dev;
+    if (ok) ok = ds4_cuda_tensor_write(q_dev,     0, q_h,     (uint64_t)q_n   * sizeof(float))
+              && ds4_cuda_tensor_write(raw_dev,   0, raw_h,   (uint64_t)raw_n * sizeof(float))
+              && ds4_cuda_tensor_write(sinks_dev, 0, sinks_h, (uint64_t)c->n_head * sizeof(float));
+    if (ok && c->n_comp) ok = ds4_cuda_tensor_write(comp_dev, 0, comp_h, (uint64_t)comp_n * sizeof(float));
+
+    /* Use sinks_dev's contents as a fake model_map (matches m4 flash_attn pattern). */
+    const void *fake_model_map = sinks_dev ? ds4_cuda_tensor_contents(sinks_dev) : NULL;
+    const uint64_t fake_model_size = (uint64_t)c->n_head * sizeof(float);
+
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_attention_prefill_static_mixed_heads_tensor(
+                    out_dev, fake_model_map, fake_model_size, /*sinks_offset=*/0,
+                    q_dev, raw_dev, comp_dev,
+                    c->n_tokens, c->n_comp, c->window, c->ratio,
+                    c->n_head, c->head_dim);
+    if (ok) ok = ds4_cuda_end_commands();
+
+    ds4_cuda_tensor_free(q_dev); ds4_cuda_tensor_free(raw_dev);
+    ds4_cuda_tensor_free(comp_dev); ds4_cuda_tensor_free(sinks_dev);
+    free(q_h); free(raw_h); free(comp_h); free(sinks_h);
+    return ok;
+}
+
+/* Fixture A: n_tokens=5, window=8 — all tokens fit in window (no truncation). */
+static const struct attn_prefill_static_mixed_cfg attn_prefill_static_mixed_unwindowed_cfg = {
+    .n_tokens=5, .n_head=2, .head_dim=128, .n_comp=4, .window=8, .ratio=4,
+};
+DS4_CUDA_PARITY_TEST(attention_prefill_static_mixed_heads_unwindowed,
+    .seed = 0x57A71,
+    /* q(5*2*128=1280) + raw(5*128=640) + comp(4*128=512) + sinks(2) = 2434 */
+    .in_elems = 2434,
+    .out_elems = 5*2*128,
+    .ulp_tolerance = 32,
+    .cpu_fn = attn_prefill_static_mixed_cpu, .cuda_fn = attn_prefill_static_mixed_cuda,
+    .cfg = (void *)&attn_prefill_static_mixed_unwindowed_cfg);
+
+/* Fixture B: n_tokens=12, window=4 — exercises kv_start = tok+1-window truncation. */
+static const struct attn_prefill_static_mixed_cfg attn_prefill_static_mixed_windowed_cfg = {
+    .n_tokens=12, .n_head=2, .head_dim=128, .n_comp=2, .window=4, .ratio=4,
+};
+DS4_CUDA_PARITY_TEST(attention_prefill_static_mixed_heads_windowed,
+    .seed = 0x57A72,
+    /* q(12*2*128=3072) + raw(12*128=1536) + comp(2*128=256) + sinks(2) = 4866 */
+    .in_elems = 4866,
+    .out_elems = 12*2*128,
+    .ulp_tolerance = 32,
+    .cpu_fn = attn_prefill_static_mixed_cpu, .cuda_fn = attn_prefill_static_mixed_cuda,
+    .cfg = (void *)&attn_prefill_static_mixed_windowed_cfg);
+
+/* ---------------------------------------------------------------------------
  * Phase 1.5b — HC Sinkhorn family (3 sequenced APIs, all DS4-original).
  * --------------------------------------------------------------------------- */
 
@@ -5611,6 +5758,8 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_prod_attention_output_q8_batch_prod_shape_multitok,
     &ds4_cuda_parity_attention_decode_heads_no_mask,
     &ds4_cuda_parity_attention_decode_heads_mask,
+    &ds4_cuda_parity_attention_prefill_static_mixed_heads_unwindowed,
+    &ds4_cuda_parity_attention_prefill_static_mixed_heads_windowed,
     &ds4_cuda_parity_output_hc_weights,
     &ds4_cuda_parity_hc_split_sinkhorn,
     &ds4_cuda_parity_hc_split_weighted_sum,

@@ -2915,7 +2915,9 @@ DS4_CUDA_STUB(ds4_cuda_attention_decode_raw_batch_heads_tensor, (ds4_cuda_tensor
 DS4_CUDA_STUB(ds4_cuda_attention_decode_mixed_batch_heads_tensor, (ds4_cuda_tensor *, const void *, uint64_t, uint64_t, const ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))
 /* ds4_cuda_attention_indexed_mixed_batch_heads_tensor is implemented in the
  * m5b section at the bottom of this file. */
-DS4_CUDA_STUB(ds4_cuda_attention_prefill_static_mixed_heads_tensor, (ds4_cuda_tensor *, const void *, uint64_t, uint64_t, const ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))
+/* ds4_cuda_attention_prefill_static_mixed_heads_tensor implemented in the m3
+ * section, alongside attention_prefill_raw_heads_tensor (Phase 7 batched
+ * prefill port). */
 DS4_CUDA_STUB(ds4_cuda_attention_prefill_masked_mixed_heads_tensor, (ds4_cuda_tensor *, const void *, uint64_t, uint64_t, const ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, const ds4_cuda_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))
 static int ds4_cuda_attention_output_low_q8_launch(
         ds4_cuda_tensor       *low,
@@ -4016,6 +4018,197 @@ int ds4_cuda_attention_prefill_raw_heads_tensor(
         (float *)heads_ptr, (const float *)q_ptr, (const float *)kv_ptr,
         sinks_ptr, n_tokens, window, n_head, head_dim);
     return ds4_cuda_check(cudaGetLastError(), "launch flash_attn raw");
+}
+
+} /* extern "C" */
+
+/* =========================================================================
+ * Phase 7 — batched prefill, static-mixed (raw causal window + static comp).
+ * =========================================================================
+ *
+ * Multi-token extension of decode_heads (cu:5935) with the causal raw-window
+ * indexing of flash_attn_raw_kernel (cu:3884).  Each (token, head) block:
+ *   - Phase 1a: scores for raw_kv[max(0,t+1-window) .. t+1) (causal, contiguous);
+ *   - Phase 1b: scores for comp_kv[0..n_comp) (all comp rows visible to all
+ *     tokens — the "static" in the name; see masked variant for grow-during-
+ *     batch comp cache);
+ *   - Phase 2/2.5/3: same 2-pass softmax shape as the rest of the family.
+ *
+ * Sinks-aware softmax matches both peers.  ratio is unused here (no causal
+ * mask on comp_kv); kept in the signature for API symmetry with the masked
+ * variant.
+ * ========================================================================= */
+
+template <int block_size>
+static __global__ void ds4_cuda_attention_prefill_static_mixed_kernel(
+        float       *heads,
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        const float *sinks,
+        uint32_t     n_tokens,
+        uint32_t     n_comp,
+        uint32_t     window,
+        uint32_t     n_head,
+        uint32_t     head_dim,
+        uint32_t     max_n_kv) {
+    const uint32_t tok = blockIdx.x;
+    const uint32_t h   = blockIdx.y;
+    if (tok >= n_tokens || h >= n_head) return;
+
+    extern __shared__ float shmem[];
+    float *score_shmem  = shmem;
+    float *reduce_shmem = shmem + max_n_kv;
+
+    const uint32_t tid = threadIdx.x;
+    const float kq_scale = rsqrtf((float)head_dim);
+    const float *qh = q + ((uint64_t)tok * n_head + h) * head_dim;
+
+    const uint32_t kv_start = (tok + 1u > window) ? (tok + 1u - window) : 0u;
+    const uint32_t n_raw    = tok + 1u - kv_start;
+
+    /* Phase 1a: raw rows in causal range. */
+    uint32_t out_idx = 0;
+    for (uint32_t r = 0; r < n_raw; r++) {
+        const float *kvr = raw_kv + (uint64_t)(kv_start + r) * head_dim;
+        float partial = 0.0f;
+        for (uint32_t i = tid; i < head_dim; i += block_size) {
+            partial += qh[i] * kvr[i];
+        }
+        reduce_shmem[tid] = partial;
+        __syncthreads();
+        for (uint32_t s = block_size / 2u; s > 0u; s >>= 1) {
+            if (tid < s) reduce_shmem[tid] += reduce_shmem[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) score_shmem[out_idx] = reduce_shmem[0] * kq_scale;
+        __syncthreads();
+        out_idx++;
+    }
+    const uint32_t n_raw_out = out_idx;
+
+    /* Phase 1b: compressed rows.  All n_comp visible (no top-k, no mask). */
+    for (uint32_t c = 0; c < n_comp; c++) {
+        const float *kvr = comp_kv + (uint64_t)c * head_dim;
+        float partial = 0.0f;
+        for (uint32_t i = tid; i < head_dim; i += block_size) {
+            partial += qh[i] * kvr[i];
+        }
+        reduce_shmem[tid] = partial;
+        __syncthreads();
+        for (uint32_t s = block_size / 2u; s > 0u; s >>= 1) {
+            if (tid < s) reduce_shmem[tid] += reduce_shmem[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) score_shmem[out_idx] = reduce_shmem[0] * kq_scale;
+        __syncthreads();
+        out_idx++;
+    }
+    const uint32_t n_kv = out_idx;
+
+    /* Phase 2: max(sinks[h], scores). */
+    __shared__ float smax;
+    if (tid == 0) {
+        float m = sinks[h];
+        for (uint32_t r = 0; r < n_kv; r++) {
+            const float s = score_shmem[r];
+            if (s > m) m = s;
+        }
+        smax = m;
+    }
+    __syncthreads();
+    const float max_score = smax;
+
+    /* Phase 2.5: scores → weights, denom. */
+    float my_denom = 0.0f;
+    for (uint32_t r = tid; r < n_kv; r += block_size) {
+        const float w = expf(score_shmem[r] - max_score);
+        score_shmem[r] = w;
+        my_denom += w;
+    }
+    reduce_shmem[tid] = my_denom;
+    __syncthreads();
+    for (uint32_t s = block_size / 2u; s > 0u; s >>= 1) {
+        if (tid < s) reduce_shmem[tid] += reduce_shmem[tid + s];
+        __syncthreads();
+    }
+    const float denom = reduce_shmem[0] + expf(sinks[h] - max_score);
+    const float inv_denom = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+
+    /* Phase 3: weighted-sum output. */
+    float *oh = heads + ((uint64_t)tok * n_head + h) * head_dim;
+    for (uint32_t i = tid; i < head_dim; i += block_size) {
+        float acc = 0.0f;
+        for (uint32_t r = 0; r < n_raw_out; r++) {
+            acc += score_shmem[r] * raw_kv[(uint64_t)(kv_start + r) * head_dim + i];
+        }
+        for (uint32_t c = 0; c < n_comp; c++) {
+            acc += score_shmem[n_raw_out + c] * comp_kv[(uint64_t)c * head_dim + i];
+        }
+        oh[i] = acc * inv_denom;
+    }
+}
+
+extern "C" {
+
+int ds4_cuda_attention_prefill_static_mixed_heads_tensor(
+        ds4_cuda_tensor       *heads,
+        const void            *model_map,
+        uint64_t               model_size,
+        uint64_t               sinks_offset,
+        const ds4_cuda_tensor *q,
+        const ds4_cuda_tensor *raw_kv,
+        const ds4_cuda_tensor *comp_kv,
+        uint32_t               n_tokens,
+        uint32_t               n_comp,
+        uint32_t               window,
+        uint32_t               ratio,
+        uint32_t               n_head,
+        uint32_t               head_dim) {
+    (void)ratio;
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (!model_map || !heads || !q || !raw_kv ||
+        n_tokens == 0u || n_head == 0u || head_dim == 0u || window == 0u) return 0;
+    if (n_comp != 0u && !comp_kv) return 0;
+
+    const uint64_t sinks_bytes = (uint64_t)n_head * sizeof(float);
+    if (sinks_offset > model_size || sinks_bytes > model_size - sinks_offset) {
+        fprintf(stderr, "ds4: CUDA prefill_static_mixed sinks range outside mapped model\n");
+        return 0;
+    }
+
+    const uint64_t row_bytes   = (uint64_t)head_dim * sizeof(float);
+    const uint64_t q_bytes     = (uint64_t)n_tokens * n_head * row_bytes;
+    const uint64_t raw_bytes   = (uint64_t)n_tokens * row_bytes;
+    const uint64_t comp_bytes  = (uint64_t)n_comp * row_bytes;
+    const uint64_t heads_bytes = q_bytes;
+
+    void *q_ptr = NULL, *raw_ptr = NULL, *comp_ptr = NULL, *heads_ptr = NULL;
+    if (!ds4_cuda_tensor_range(q,      q_bytes,     "prefill_static_mixed q",      &q_ptr))     return 0;
+    if (!ds4_cuda_tensor_range(raw_kv, raw_bytes,   "prefill_static_mixed raw_kv", &raw_ptr))   return 0;
+    if (!ds4_cuda_tensor_range(heads,  heads_bytes, "prefill_static_mixed heads",  &heads_ptr)) return 0;
+    if (n_comp != 0u) {
+        if (!ds4_cuda_tensor_range(comp_kv, comp_bytes, "prefill_static_mixed comp_kv", &comp_ptr)) return 0;
+    }
+
+    const float *sinks_ptr = (const float *)((const uint8_t *)model_map + sinks_offset);
+
+    const uint32_t max_n_kv = window + n_comp;
+    constexpr int block_size = 256;
+    const uint32_t shmem_floats = max_n_kv + (uint32_t)block_size;
+    const size_t shmem_bytes = (size_t)shmem_floats * sizeof(float);
+
+    dim3 grid(n_tokens, n_head, 1u);
+    dim3 block((uint32_t)block_size, 1u, 1u);
+    ds4_cuda_attention_prefill_static_mixed_kernel<block_size>
+        <<<grid, block, shmem_bytes, g_stream>>>(
+            (float *)heads_ptr, (const float *)q_ptr,
+            (const float *)raw_ptr,
+            n_comp != 0u ? (const float *)comp_ptr : (const float *)NULL,
+            sinks_ptr,
+            n_tokens, n_comp, window, n_head, head_dim, max_n_kv);
+    return ds4_cuda_check(cudaGetLastError(), "launch attention_prefill_static_mixed");
 }
 
 } /* extern "C" */
