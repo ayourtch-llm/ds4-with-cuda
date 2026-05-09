@@ -820,6 +820,61 @@ static __device__ __forceinline__ float ds4_cuda_warp_quantize_and_dot_q8_0_f32(
     return acc;
 }
 
+static __device__ __forceinline__ void ds4_cuda_warp_quantize_and_dot_q8_0_pair_f32(
+        const float                *x_row,
+        const ds4_cuda_block_q8_0  *w0_row,
+        const ds4_cuda_block_q8_0  *w1_row,
+        uint32_t                    in_dim,
+        uint32_t                    lane,
+        float                     *acc0_out,
+        float                     *acc1_out) {
+    const uint32_t blocks = (in_dim + 31u) / 32u;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint32_t b = 0; b < blocks; b++) {
+        const uint32_t i0 = b * 32u;
+        const uint32_t n  = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+
+        const float x_i = (lane < n) ? x_row[i0 + lane] : 0.0f;
+        const float ax  = (lane < n) ? fabsf(x_i)       : 0.0f;
+
+        float amax = ax;
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 16));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 8));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+
+        const float d  = amax / 127.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+
+        int32_t qv = 0;
+        if (lane < n) {
+            qv = (int32_t)lrintf(x_i * id);
+            if (qv > 127)  qv = 127;
+            if (qv < -128) qv = -128;
+        }
+
+        int32_t isum0 = (lane < n) ? qv * (int32_t)w0_row[b].qs[lane] : 0;
+        int32_t isum1 = (lane < n) ? qv * (int32_t)w1_row[b].qs[lane] : 0;
+        isum0 += __shfl_xor_sync(0xffffffffu, isum0, 16);
+        isum1 += __shfl_xor_sync(0xffffffffu, isum1, 16);
+        isum0 += __shfl_xor_sync(0xffffffffu, isum0, 8);
+        isum1 += __shfl_xor_sync(0xffffffffu, isum1, 8);
+        isum0 += __shfl_xor_sync(0xffffffffu, isum0, 4);
+        isum1 += __shfl_xor_sync(0xffffffffu, isum1, 4);
+        isum0 += __shfl_xor_sync(0xffffffffu, isum0, 2);
+        isum1 += __shfl_xor_sync(0xffffffffu, isum1, 2);
+        isum0 += __shfl_xor_sync(0xffffffffu, isum0, 1);
+        isum1 += __shfl_xor_sync(0xffffffffu, isum1, 1);
+
+        acc0 += ds4_cuda_f16_to_f32(w0_row[b].d) * d * (float)isum0;
+        acc1 += ds4_cuda_f16_to_f32(w1_row[b].d) * d * (float)isum1;
+    }
+    *acc0_out = acc0;
+    *acc1_out = acc1;
+}
+
 /* Phase 3b-5: fused quantize+matvec.  One warp per output row; the prior
  * 3b-1 retile's int-dot body now lives inside the fused helper above
  * alongside the on-the-fly activation quantize, eliminating the
@@ -889,8 +944,7 @@ static __device__ float ds4_cuda_hc_expand_split_value(
 template<uint32_t ROWS_PER_BLOCK>
 static __global__ void ds4_cuda_q8_0_hc_expand_kernel(
         const ds4_cuda_block_q8_0 *weights,
-        const int8_t              *xq,
-        const float               *xscale,
+        const float               *x,
         const float               *block_add,
         const float               *residual_hc,
         const float               *split,
@@ -906,8 +960,8 @@ static __global__ void ds4_cuda_q8_0_hc_expand_kernel(
     const uint32_t lane = threadIdx.x;
     const uint32_t blocks = (in_dim + 31u) / 32u;
 
-    const float mv = ds4_cuda_warp_vec_dot_q8_0_f32(
-            weights + (uint64_t)row * blocks, xq, xscale, in_dim, lane);
+    const float mv = ds4_cuda_warp_quantize_and_dot_q8_0_f32(
+            x, weights + (uint64_t)row * blocks, in_dim, lane);
 
     if (lane == 0u) {
         block_out[row] = mv;
@@ -932,8 +986,7 @@ static __global__ void ds4_cuda_q8_0_hc_expand_kernel(
 template<uint32_t ROWS_PER_BLOCK>
 static __global__ void ds4_cuda_attention_output_low_q8_kernel(
         const ds4_cuda_block_q8_0 *weights,
-        const int8_t              *heads_q,
-        const float               *heads_scale,
+        const float               *heads,
         float                     *low,
         uint32_t                   group_dim,
         uint32_t                   rank,
@@ -946,12 +999,11 @@ static __global__ void ds4_cuda_attention_output_low_q8_kernel(
     const uint32_t lane   = threadIdx.x;
     const uint32_t blocks = (group_dim + 31u) / 32u;
     const uint64_t row    = (uint64_t)group * rank + r;
-    const uint64_t qrow   = ((uint64_t)tok * n_groups + group) * blocks;
+    const float *head_row = heads + ((uint64_t)tok * n_groups + group) * group_dim;
 
-    const float v = ds4_cuda_warp_vec_dot_q8_0_f32(
+    const float v = ds4_cuda_warp_quantize_and_dot_q8_0_f32(
+            head_row,
             weights + row * blocks,
-            heads_q + qrow * 32u,
-            heads_scale + qrow,
             group_dim,
             lane);
 
@@ -1041,24 +1093,35 @@ static __global__ void ds4_cuda_dense_f16_pair_matvec_kernel(
     out1[(uint64_t)tok * out_dim + row] = s1;
 }
 
+template<uint32_t ROWS_PER_BLOCK>
 static __global__ void ds4_cuda_shared_gate_up_swiglu_q8_0_kernel(
         const ds4_cuda_block_q8_0 *gate_w,
         const ds4_cuda_block_q8_0 *up_w,
-        const int8_t              *xq,
-        const float               *xscale,
+        const float               *x,
         float                     *gate,
         float                     *up,
         float                     *mid,
         uint32_t                   in_dim,
         uint32_t                   out_dim) {
-    const uint32_t row = blockIdx.x;
-    if (row >= out_dim || threadIdx.x != 0) return;
+    const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
+    if (row >= out_dim) return;
+    const uint32_t lane = threadIdx.x;
     const uint32_t blocks = (in_dim + 31u) / 32u;
-    const float g = ds4_cuda_vec_dot_q8_0_f32(gate_w + (uint64_t)row * blocks, xq, xscale, in_dim);
-    const float u = ds4_cuda_vec_dot_q8_0_f32(up_w + (uint64_t)row * blocks, xq, xscale, in_dim);
-    gate[row] = g;
-    up[row] = u;
-    mid[row] = ds4_cuda_silu_f32(g) * u;
+    float g = 0.0f;
+    float u = 0.0f;
+    ds4_cuda_warp_quantize_and_dot_q8_0_pair_f32(
+        x,
+        gate_w + (uint64_t)row * blocks,
+        up_w + (uint64_t)row * blocks,
+        in_dim,
+        lane,
+        &g,
+        &u);
+    if (lane == 0u) {
+        gate[row] = g;
+        up[row] = u;
+        mid[row] = ds4_cuda_silu_f32(g) * u;
+    }
 }
 
 static __global__ void ds4_cuda_dense_f16_matvec_kernel(
@@ -2051,45 +2114,30 @@ int ds4_cuda_shared_gate_up_swiglu_q8_0_tensor(
         return 0;
     }
 
-    const uint64_t xq_bytes = blocks * 32u;
-    const uint64_t xscale_bytes = blocks * sizeof(*g_scratch_shared_gate_up_q8_0_xscale);
-    if (xq_bytes > SIZE_MAX || xscale_bytes > SIZE_MAX) return 0;
-    if (!ds4_cuda_scratch_reserve((void **)&g_scratch_shared_gate_up_q8_0_xq,
-                                  &g_scratch_shared_gate_up_q8_0_xq_bytes,
-                                  (size_t)xq_bytes,
-                                  "shared q8_0 xq scratch allocation") ||
-        !ds4_cuda_scratch_reserve((void **)&g_scratch_shared_gate_up_q8_0_xscale,
-                                  &g_scratch_shared_gate_up_q8_0_xscale_bytes,
-                                  (size_t)xscale_bytes,
-                                  "shared q8_0 scale scratch allocation")) {
-        return 0;
-    }
+    /* Phase 3b-6: activation quantize fused inside the kernel via the
+     * dual-row warp helper (single block-scale shared between gate and up
+     * dots — same activation quant for both, identical math to the un-fused
+     * "quantize once, two separate dots" path).  No scratch round-trip. */
 
-    ds4_cuda_quantize_q8_0_activation_kernel<<<1, 1, 0, g_stream>>>(
-        (const float *)x_ptr,
-        g_scratch_shared_gate_up_q8_0_xq,
-        g_scratch_shared_gate_up_q8_0_xscale,
-        (uint32_t)in_dim,
-        1);
-    int ok = ds4_cuda_check(cudaGetLastError(), "launch shared q8_0 input quantize");
-    const ds4_cuda_block_q8_0 *gate_w = NULL;
-    const ds4_cuda_block_q8_0 *up_w = NULL;
+    int ok = 1;
+    const ds4_cuda_block_q8_0 *gate_w = (const ds4_cuda_block_q8_0 *)
+        ds4_cuda_model_range_ptr(model_map, model_size, gate_offset, weight_bytes, "shared q8_0 gate weights");
+    const ds4_cuda_block_q8_0 *up_w = (const ds4_cuda_block_q8_0 *)
+        ds4_cuda_model_range_ptr(model_map, model_size, up_offset,   weight_bytes, "shared q8_0 up weights");
+    if (!gate_w || !up_w) ok = 0;
     if (ok) {
-        gate_w = (const ds4_cuda_block_q8_0 *)
-            ds4_cuda_model_range_ptr(model_map, model_size, gate_offset, weight_bytes, "shared q8_0 gate weights");
-        up_w = (const ds4_cuda_block_q8_0 *)
-            ds4_cuda_model_range_ptr(model_map, model_size, up_offset, weight_bytes, "shared q8_0 up weights");
-        if (!gate_w || !up_w) ok = 0;
-    }
-    if (ok) {
-        ds4_cuda_shared_gate_up_swiglu_q8_0_kernel<<<(uint32_t)out_dim, 1, 0, g_stream>>>(
+        constexpr uint32_t ROWS_PER_BLOCK = 4u;
+        const uint32_t row_blocks = ((uint32_t)out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
+        ds4_cuda_shared_gate_up_swiglu_q8_0_kernel<ROWS_PER_BLOCK><<<
+                dim3(row_blocks, 1, 1),
+                dim3(32u, ROWS_PER_BLOCK, 1),
+                0, g_stream>>>(
             gate_w,
             up_w,
-            g_scratch_shared_gate_up_q8_0_xq,
-            g_scratch_shared_gate_up_q8_0_xscale,
+            (const float *)x_ptr,
             (float *)gate_ptr, (float *)up_ptr, (float *)mid_ptr,
             (uint32_t)in_dim, (uint32_t)out_dim);
-        ok = ds4_cuda_check(cudaGetLastError(), "launch shared gate/up swiglu q8_0");
+        ok = ds4_cuda_check(cudaGetLastError(), "launch shared gate/up swiglu q8_0 fused");
     }
     return ok;
 }
@@ -2328,36 +2376,15 @@ static int ds4_cuda_attention_output_low_q8_launch(
         return 0;
     }
 
-    const uint64_t qrows = (uint64_t)n_tokens * n_groups;
-    const uint64_t heads_q_bytes = qrows * blocks * 32u;
-    const uint64_t heads_scale_bytes =
-        qrows * blocks * sizeof(*g_scratch_attention_output_low_q8_heads_scale);
-    if (heads_q_bytes > SIZE_MAX || heads_scale_bytes > SIZE_MAX) return 0;
-    if (!ds4_cuda_scratch_reserve((void **)&g_scratch_attention_output_low_q8_heads_q,
-                                  &g_scratch_attention_output_low_q8_heads_q_bytes,
-                                  (size_t)heads_q_bytes,
-                                  "attention output low q scratch allocation") ||
-        !ds4_cuda_scratch_reserve((void **)&g_scratch_attention_output_low_q8_heads_scale,
-                                  &g_scratch_attention_output_low_q8_heads_scale_bytes,
-                                  (size_t)heads_scale_bytes,
-                                  "attention output low scale scratch allocation")) {
-        return 0;
-    }
+    /* Phase 3b-6: activation quantize fused inside the kernel; the pre-launch
+     * quantize_q8_0_activation_kernel and its g_scratch_attention_output_low_q8_*
+     * scratch buffers are no longer used on this call path. */
 
-    ds4_cuda_quantize_q8_0_activation_kernel<<<(uint32_t)qrows, 1, 0, g_stream>>>(
-        (const float *)heads_ptr,
-        g_scratch_attention_output_low_q8_heads_q,
-        g_scratch_attention_output_low_q8_heads_scale,
-        (uint32_t)group_dim,
-        (uint32_t)qrows);
-    int ok = ds4_cuda_check(cudaGetLastError(), "launch attention output low input quantize");
-    const ds4_cuda_block_q8_0 *weights = NULL;
-    if (ok) {
-        weights = (const ds4_cuda_block_q8_0 *)
-            ds4_cuda_model_range_ptr(model_map, model_size, out_a_offset, out_a_bytes,
-                                     "attention output low weights");
-        if (!weights) ok = 0;
-    }
+    int ok = 1;
+    const ds4_cuda_block_q8_0 *weights = (const ds4_cuda_block_q8_0 *)
+        ds4_cuda_model_range_ptr(model_map, model_size, out_a_offset, out_a_bytes,
+                                 "attention output low weights");
+    if (!weights) ok = 0;
     if (ok) {
         constexpr uint32_t ROWS_PER_BLOCK = 4u;
         const uint32_t row_blocks = ((uint32_t)rank + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
@@ -2366,11 +2393,10 @@ static int ds4_cuda_attention_output_low_q8_launch(
                 dim3(32u, ROWS_PER_BLOCK, 1),
                 0, g_stream>>>(
             weights,
-            g_scratch_attention_output_low_q8_heads_q,
-            g_scratch_attention_output_low_q8_heads_scale,
+            (const float *)heads_ptr,
             (float *)low_ptr,
             (uint32_t)group_dim, (uint32_t)rank, n_groups, n_tokens);
-        ok = ds4_cuda_check(cudaGetLastError(), "launch attention output low q8");
+        ok = ds4_cuda_check(cudaGetLastError(), "launch attention output low q8 fused");
     }
     return ok;
 }
@@ -2858,34 +2884,15 @@ static int ds4_cuda_q8_0_hc_expand_launch(
     }
     if (has_add && !ds4_cuda_tensor_range(block_add, out_bytes, label, &add_ptr)) return 0;
 
-    const uint64_t xq_bytes = blocks * 32u;
-    const uint64_t xscale_bytes = blocks * sizeof(*g_scratch_q8_0_hc_expand_xscale);
-    if (xq_bytes > SIZE_MAX || xscale_bytes > SIZE_MAX) return 0;
-    if (!ds4_cuda_scratch_reserve((void **)&g_scratch_q8_0_hc_expand_xq,
-                                  &g_scratch_q8_0_hc_expand_xq_bytes,
-                                  (size_t)xq_bytes,
-                                  "q8 hc fusion xq scratch allocation") ||
-        !ds4_cuda_scratch_reserve((void **)&g_scratch_q8_0_hc_expand_xscale,
-                                  &g_scratch_q8_0_hc_expand_xscale_bytes,
-                                  (size_t)xscale_bytes,
-                                  "q8 hc fusion scale scratch allocation")) {
-        return 0;
-    }
+    /* Phase 3b-6: activation quantize fused inside the kernel; the pre-launch
+     * quantize_q8_0_activation_kernel and g_scratch_q8_0_hc_expand_* scratch
+     * buffers are no longer used on this call path. */
 
-    ds4_cuda_quantize_q8_0_activation_kernel<<<1, 1, 0, g_stream>>>(
-        (const float *)x_ptr,
-        g_scratch_q8_0_hc_expand_xq,
-        g_scratch_q8_0_hc_expand_xscale,
-        (uint32_t)in_dim,
-        1);
-    int ok = ds4_cuda_check(cudaGetLastError(), "launch q8 hc fusion input quantize");
-    const ds4_cuda_block_q8_0 *weights = NULL;
-    if (ok) {
-        weights = (const ds4_cuda_block_q8_0 *)
-            ds4_cuda_model_range_ptr(model_map, model_size, weight_offset, weight_bytes,
-                                     "q8 hc fusion weights");
-        if (!weights) ok = 0;
-    }
+    int ok = 1;
+    const ds4_cuda_block_q8_0 *weights = (const ds4_cuda_block_q8_0 *)
+        ds4_cuda_model_range_ptr(model_map, model_size, weight_offset, weight_bytes,
+                                 "q8 hc fusion weights");
+    if (!weights) ok = 0;
     if (ok) {
         constexpr uint32_t ROWS_PER_BLOCK = 4u;
         const uint32_t row_blocks = ((uint32_t)out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
@@ -2894,13 +2901,12 @@ static int ds4_cuda_q8_0_hc_expand_launch(
                 dim3(32u, ROWS_PER_BLOCK, 1),
                 0, g_stream>>>(
             weights,
-            g_scratch_q8_0_hc_expand_xq,
-            g_scratch_q8_0_hc_expand_xscale,
+            (const float *)x_ptr,
             has_add ? (const float *)add_ptr : (const float *)NULL,
             (const float *)res_ptr, (const float *)split_ptr,
             (float *)block_ptr, (float *)out_ptr,
             (uint32_t)in_dim, (uint32_t)out_dim, n_embd, n_hc, has_add ? 1u : 0u);
-        ok = ds4_cuda_check(cudaGetLastError(), "launch q8 hc fusion");
+        ok = ds4_cuda_check(cudaGetLastError(), "launch q8 hc fusion fused");
     }
     return ok;
 }
