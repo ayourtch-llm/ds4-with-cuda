@@ -757,6 +757,276 @@ static __device__ __forceinline__ void ds4_cuda_warp_quantize_and_dot_q8_0_pair_
     *acc1_out = acc1;
 }
 
+/* Phase 3b-10 fused-quantize helper: Q8_K activation quantization (256-element
+ * super-block) parallelised across the 32 warp lanes.  Returns:
+ *   - lane_qs[8]    — the 8 quantized int8 values lane `lane` owns,
+ *                     at element indices step*32+lane for step ∈ [0,8).
+ *   - lane_bsum     — int16 partial sum for sub-block `lane` (only valid
+ *                     for lane < 16; sub-block j has 16 elements at
+ *                     [16*j, 16*j+16), step=j/2, lanes (j%2==0 ? lower :
+ *                     upper) half-warp).
+ *   - block_d       — per-block fp32 scale.
+ *
+ * Math is bit-identical to the standalone ds4_cuda_quantize_row_q8_K_device
+ * by construction:
+ *   1. amax = max(|x_i|, i ∈ [0,256)) computed via warp tree-reduce of
+ *      fmaxf (associative for non-NaN floats).
+ *   2. The signed value at the FIRST (linear-order) max-abs position is
+ *      identified via a lane-min reduce on the matching element index
+ *      (lane k owns elements at e=step*32+k, so the global linear-first
+ *      match has the smallest e).  Ballot-sync picks the unique winning
+ *      lane and shfl-broadcasts its signed value.  Tie cases (multiple
+ *      positions with exactly equal |x|) preserve the standalone kernel's
+ *      "first-such" choice — important for parity, but extremely rare on
+ *      random fp32 inputs.
+ *   3. iscale = -127 / max_signed; per-lane quantize via
+ *      lrintf(iscale * x_i) clamped to [-128, 127].
+ *   4. Per-step half-warp tree-reduce of qs[step] gives bsum_lower(step)
+ *      in lanes [0..15] and bsum_upper(step) in lanes [16..31].  Lane k <
+ *      16 then extracts bsums[k]: even k → bsum_lower(k/2) (already in
+ *      its lane); odd k → bsum_upper((k-1)/2) via shfl_sync from lane
+ *      k+16 (every lane participates uniformly so the shfl is well-formed).
+ *   5. d = 1 / iscale = max_signed / -127.0f.
+ *
+ * Caller must invoke from a full warp (32 lanes participating). */
+static __device__ __forceinline__ void ds4_cuda_warp_quantize_q8_K_block(
+        const float *x_block,    /* 256 fp32 activations */
+        uint32_t     lane,
+        int8_t       lane_qs[8], /* output: this lane's 8 quants @ step*32+lane */
+        int16_t     *lane_bsum,  /* output: bsum for sub-block `lane` (lane<16 only) */
+        float       *block_d) {  /* output: super-block scale */
+    const uint32_t mask = 0xffffffffu;
+
+    /* 1. Each lane loads its 8 elements (e = step*32 + lane). */
+    float xv[8];
+    #pragma unroll
+    for (uint32_t step = 0; step < 8u; step++) {
+        xv[step] = x_block[step * 32u + lane];
+    }
+
+    /* 2. Find global amax via warp tree-reduce. */
+    float lane_amax = 0.0f;
+    #pragma unroll
+    for (uint32_t step = 0; step < 8u; step++) {
+        lane_amax = fmaxf(lane_amax, fabsf(xv[step]));
+    }
+    float amax = lane_amax;
+    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, 16));
+    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, 8));
+    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, 4));
+    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, 2));
+    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, 1));
+
+    /* 3. Find first-linear-order match position: smallest e where
+     *    fabsf(xv) == amax.  Each lane's smallest local-step match;
+     *    then warp tree-reduce min over e.  Indices e = step*32+lane
+     *    are unique per (step,lane), so exactly one lane will own the
+     *    minimum after the reduce. */
+    uint32_t lane_min_e = 256u;
+    float    lane_match_val = 0.0f;
+    #pragma unroll
+    for (uint32_t step = 0; step < 8u; step++) {
+        if (fabsf(xv[step]) == amax) {
+            const uint32_t e = step * 32u + lane;
+            if (e < lane_min_e) {
+                lane_min_e = e;
+                lane_match_val = xv[step];
+            }
+        }
+    }
+    uint32_t min_e = lane_min_e;
+    min_e = min(min_e, __shfl_xor_sync(mask, min_e, 16));
+    min_e = min(min_e, __shfl_xor_sync(mask, min_e, 8));
+    min_e = min(min_e, __shfl_xor_sync(mask, min_e, 4));
+    min_e = min(min_e, __shfl_xor_sync(mask, min_e, 2));
+    min_e = min(min_e, __shfl_xor_sync(mask, min_e, 1));
+
+    /* Ballot identifies the unique winning lane; broadcast its signed value. */
+    const uint32_t winner_mask = __ballot_sync(mask, lane_min_e == min_e);
+    const int      winner_lane = __ffs((int)winner_mask) - 1;
+    const float    max_signed  = __shfl_sync(mask, lane_match_val, winner_lane);
+
+    /* 4. iscale + per-lane quantize.  amax==0 short-circuits to all-zero
+     *    quants and d=0, matching the standalone kernel's branch. */
+    float iscale;
+    float d_val;
+    if (amax == 0.0f) {
+        iscale = 0.0f;
+        d_val  = 0.0f;
+    } else {
+        iscale = -127.0f / max_signed;
+        d_val  = 1.0f / iscale;
+    }
+    *block_d = d_val;
+
+    #pragma unroll
+    for (uint32_t step = 0; step < 8u; step++) {
+        int v;
+        if (amax == 0.0f) {
+            v = 0;
+        } else {
+            v = (int)lrintf(iscale * xv[step]);
+            if (v > 127)  v = 127;
+            if (v < -128) v = -128;
+        }
+        lane_qs[step] = (int8_t)v;
+    }
+
+    /* 5. bsums per sub-block.  For each step s, half-warp tree-reduce of
+     *    qs[s] gives bsum_lower(s) in lanes [0..15] and bsum_upper(s) in
+     *    lanes [16..31].  We only need to publish bsums[lane] for
+     *    lane < 16: even-lane reads bsum_lower(lane/2) directly; odd-lane
+     *    fetches bsum_upper((lane-1)/2) via shfl_sync from lane (lane|16).
+     *    All lanes participate in shfl_sync uniformly. */
+    int32_t my_bsum = 0;
+    const uint32_t my_step = lane >> 1;        /* lane/2; only meaningful for lane<16 */
+    const uint32_t my_odd  = lane & 1u;
+
+    #pragma unroll
+    for (uint32_t s = 0; s < 8u; s++) {
+        int32_t v = (int32_t)lane_qs[s];
+        v += __shfl_xor_sync(mask, v, 8);
+        v += __shfl_xor_sync(mask, v, 4);
+        v += __shfl_xor_sync(mask, v, 2);
+        v += __shfl_xor_sync(mask, v, 1);
+        /* lane <16: v == bsum_lower(s); lane >=16: v == bsum_upper(s). */
+        const int32_t v_upper = __shfl_sync(mask, v, lane | 16u);
+        if (lane < 16u && s == my_step) {
+            my_bsum = my_odd ? v_upper : v;
+        }
+    }
+    *lane_bsum = (int16_t)my_bsum;
+}
+
+/* Phase 3b-10 fused: IQ2_XXS dot against an in-warp Q8_K-quantized
+ * activation block.  Mirrors warp_vec_dot_iq2_xxs_q8_K but consumes the
+ * un-quantized fp32 activation directly, calling the Q8_K warp quantizer
+ * once per super-block to materialize lane_qs in registers.  Math is
+ * bit-identical to "quantize_rows_q8_K then warp_vec_dot_iq2_xxs_q8_K";
+ * see helper docstrings. */
+static __device__ __forceinline__ float ds4_cuda_warp_quantize_and_dot_iq2_xxs_q8_K_f32(
+        const ds4_cuda_block_iq2_xxs *x,
+        const float                  *act,
+        uint32_t                      nb,
+        uint32_t                      lane) {
+    const uint32_t group = lane >> 3;
+    const uint32_t k     = lane & 7u;
+    const uint32_t l     = (group >> 1) * 2u;
+    const uint32_t which = group & 1u;
+    const uint8_t  km    = kmask_iq2xs[k];
+    const uint32_t mask  = 0xffffffffu;
+
+    float sumf = 0.0f;
+    for (uint32_t i = 0; i < nb; i++) {
+        int8_t  lane_qs[8];
+        int16_t lane_bsum_unused;
+        float   yd;
+        ds4_cuda_warp_quantize_q8_K_block(act + (uint64_t)i * 256u,
+                                          lane, lane_qs, &lane_bsum_unused, &yd);
+        (void)lane_bsum_unused; /* IQ2_XXS path doesn't consume bsums */
+
+        const float d = ds4_cuda_f16_to_f32(x[i].d) * yd;
+        const uint16_t *q2_base = x[i].qs;
+        int32_t bsum = 0;
+
+        for (int ib32 = 0; ib32 < 8; ib32++) {
+            const uint16_t *q2 = q2_base + (uint32_t)ib32 * 4u;
+            const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+            const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+            const uint8_t *aux8 = (const uint8_t *)&aux0;
+            const uint32_t ls   = 2u * (aux1 >> 28) + 1u;
+
+            const uint8_t  grid_idx = aux8[l + which];
+            const uint32_t sign_idx = (aux1 >> (7u * (l + which))) & 127u;
+            const uint8_t *grid     = (const uint8_t *)(iq2xxs_grid + grid_idx);
+            const uint8_t  signs    = ksigns_iq2xs[sign_idx];
+            const int32_t  v        = (signs & km) ? -(int32_t)grid[k] : (int32_t)grid[k];
+            int32_t lane_partial    = v * (int32_t)lane_qs[ib32];
+
+            lane_partial += __shfl_xor_sync(mask, lane_partial, 16);
+            lane_partial += __shfl_xor_sync(mask, lane_partial, 8);
+            lane_partial += __shfl_xor_sync(mask, lane_partial, 4);
+            lane_partial += __shfl_xor_sync(mask, lane_partial, 2);
+            lane_partial += __shfl_xor_sync(mask, lane_partial, 1);
+
+            bsum += lane_partial * (int32_t)ls;
+        }
+        sumf += d * (float)bsum;
+    }
+    return 0.125f * sumf;
+}
+
+/* Phase 3b-10 fused: Q2_K dot against an in-warp Q8_K-quantized activation
+ * block.  Mirrors warp_vec_dot_q2_K_q8_K; consumes un-quantized fp32
+ * activation directly via the Q8_K warp quantizer.  Math is bit-identical
+ * to the un-fused two-launch path. */
+static __device__ __forceinline__ float ds4_cuda_warp_quantize_and_dot_q2_K_q8_K_f32(
+        const ds4_cuda_block_q2_K *x,
+        const float               *act,
+        uint32_t                   nb,
+        uint32_t                   lane) {
+    const uint32_t mask = 0xffffffffu;
+    float sumf = 0.0f;
+    for (uint32_t i = 0; i < nb; i++) {
+        int8_t  lane_qs[8];
+        int16_t lane_bsum;
+        float   yd;
+        ds4_cuda_warp_quantize_q8_K_block(act + (uint64_t)i * 256u,
+                                          lane, lane_qs, &lane_bsum, &yd);
+
+        const uint8_t *q2 = x[i].qs;
+        const uint8_t *sc = x[i].scales;
+
+        /* summs: (lane_bsum * (sc[lane] >> 4)) for lane < 16, tree-reduce. */
+        int32_t lane_summ = 0;
+        if (lane < 16u) {
+            lane_summ = (int32_t)lane_bsum * (int32_t)((uint32_t)sc[lane] >> 4u);
+        }
+        lane_summ += __shfl_xor_sync(mask, lane_summ, 16);
+        lane_summ += __shfl_xor_sync(mask, lane_summ, 8);
+        lane_summ += __shfl_xor_sync(mask, lane_summ, 4);
+        lane_summ += __shfl_xor_sync(mask, lane_summ, 2);
+        lane_summ += __shfl_xor_sync(mask, lane_summ, 1);
+        const int32_t summs = lane_summ;
+
+        const float d    =  yd * ds4_cuda_f16_to_f32(x[i].d);
+        const float dmin = -yd * ds4_cuda_f16_to_f32(x[i].dmin);
+        sumf = fmaf(dmin, (float)summs, sumf);
+
+        /* isum: 256 element products, 8 per lane (stride 32).  Same chunk
+         * mapping as warp_vec_dot_q2_K_q8_K; q8 supplied by lane_qs[step]
+         * (where step = (chunk>>1)&3 ... wait no: e = step*32+lane, so
+         * step = e >> 5 = chunk >> 1 — but that's the "outer step".
+         * Actually our lane_qs is indexed by step = e/32 directly, which
+         * for the 8 stride-32 sweeps of e maps to step 0..7. */
+        int32_t lane_isum = 0;
+        #pragma unroll
+        for (uint32_t step = 0; step < 8u; step++) {
+            const uint32_t e      = step * 32u + lane;
+            const uint32_t chunk  = e >> 4;
+            const uint32_t pos    = e & 15u;
+            const uint32_t block  = chunk >> 3;
+            const uint32_t inner  = chunk & 1u;
+            const uint32_t jj     = (chunk >> 1) & 3u;
+            const uint32_t shift  = jj * 2u;
+            const uint32_t q2_idx = block * 32u + inner * 16u + pos;
+            const int32_t  scale  = (int32_t)((uint32_t)sc[chunk] & 0x0fu);
+            const int32_t  q2v    = (int32_t)(((uint32_t)q2[q2_idx] >> shift) & 3u);
+            const int32_t  q8v    = (int32_t)lane_qs[step];
+            lane_isum += scale * q2v * q8v;
+        }
+        lane_isum += __shfl_xor_sync(mask, lane_isum, 16);
+        lane_isum += __shfl_xor_sync(mask, lane_isum, 8);
+        lane_isum += __shfl_xor_sync(mask, lane_isum, 4);
+        lane_isum += __shfl_xor_sync(mask, lane_isum, 2);
+        lane_isum += __shfl_xor_sync(mask, lane_isum, 1);
+        const int32_t isum = lane_isum;
+
+        sumf = fmaf(d, (float)isum, sumf);
+    }
+    return sumf;
+}
+
 /* Phase 3b-5: fused quantize+matvec.  One warp per output row; the prior
  * 3b-1 retile's int-dot body now lives inside the fused helper above
  * alongside the on-the-fly activation quantize, eliminating the
@@ -1253,7 +1523,7 @@ template<uint32_t ROWS_PER_BLOCK>
 static __global__ void ds4_cuda_routed_moe_mid_iq2_xxs_kernel(
         const ds4_cuda_block_iq2_xxs *gate_w,
         const ds4_cuda_block_iq2_xxs *up_w,
-        const ds4_cuda_block_q8_K    *xq,
+        const float                  *act,             /* Phase 3b-10: fp32, Q8_K quantize fused in */
         const int32_t                *selected,
         const float                  *route_weights,
         float                        *gate,
@@ -1276,8 +1546,8 @@ static __global__ void ds4_cuda_routed_moe_mid_iq2_xxs_kernel(
     const int32_t expert = selected[(uint64_t)token * n_expert + slot];
     if (expert < 0) return;
 
+    const float *token_act = act + (uint64_t)token * expert_in_dim;
     const uint32_t xq_blocks = expert_in_dim / 256u;
-    const ds4_cuda_block_q8_K *token_xq = xq + (uint64_t)token * xq_blocks;
     const uint8_t *gate_base = (const uint8_t *)gate_w + (uint64_t)(uint32_t)expert * gate_expert_bytes;
     const uint8_t *up_base   = (const uint8_t *)up_w   + (uint64_t)(uint32_t)expert * gate_expert_bytes;
     const ds4_cuda_block_iq2_xxs *gate_row =
@@ -1285,8 +1555,8 @@ static __global__ void ds4_cuda_routed_moe_mid_iq2_xxs_kernel(
     const ds4_cuda_block_iq2_xxs *up_row =
         (const ds4_cuda_block_iq2_xxs *)(up_base + (uint64_t)row * gate_row_bytes);
 
-    float g = ds4_cuda_warp_vec_dot_iq2_xxs_q8_K(gate_row, token_xq, xq_blocks, lane);
-    float u = ds4_cuda_warp_vec_dot_iq2_xxs_q8_K(up_row,   token_xq, xq_blocks, lane);
+    float g = ds4_cuda_warp_quantize_and_dot_iq2_xxs_q8_K_f32(gate_row, token_act, xq_blocks, lane);
+    float u = ds4_cuda_warp_quantize_and_dot_iq2_xxs_q8_K_f32(up_row,   token_act, xq_blocks, lane);
     if (clamp > 1.0e-6f) {
         if (g > clamp) g = clamp;
         if (u > clamp) u = clamp;
@@ -1315,7 +1585,7 @@ static __global__ void ds4_cuda_routed_moe_mid_iq2_xxs_kernel(
 template<uint32_t ROWS_PER_BLOCK>
 static __global__ void ds4_cuda_routed_moe_down_q2_k_kernel(
         const ds4_cuda_block_q2_K *down_w,
-        const ds4_cuda_block_q8_K *midq,
+        const float               *mid_act,           /* Phase 3b-10: fp32, Q8_K quantize fused in */
         const int32_t             *selected,
         float                     *experts,
         float                     *out,
@@ -1330,7 +1600,6 @@ static __global__ void ds4_cuda_routed_moe_down_q2_k_kernel(
     if (row >= out_dim || token >= n_tokens) return;
     const uint32_t lane = threadIdx.x;
 
-    const uint32_t midq_blocks = expert_mid_dim / 256u;
     float sum = 0.0f;
     for (uint32_t slot = 0; slot < n_expert; slot++) {
         const int32_t expert = selected[(uint64_t)token * n_expert + slot];
@@ -1338,9 +1607,9 @@ static __global__ void ds4_cuda_routed_moe_down_q2_k_kernel(
         const uint8_t *down_base = (const uint8_t *)down_w + (uint64_t)(uint32_t)expert * down_expert_bytes;
         const ds4_cuda_block_q2_K *down_row =
             (const ds4_cuda_block_q2_K *)(down_base + (uint64_t)row * down_row_bytes);
-        const ds4_cuda_block_q8_K *slot_midq =
-            midq + ((uint64_t)token * n_expert + slot) * midq_blocks;
-        const float v = ds4_cuda_warp_vec_dot_q2_K_q8_K(down_row, slot_midq, midq_blocks, lane);
+        const float *slot_mid =
+            mid_act + ((uint64_t)token * n_expert + slot) * expert_mid_dim;
+        const float v = ds4_cuda_warp_quantize_and_dot_q2_K_q8_K_f32(down_row, slot_mid, expert_mid_dim / 256u, lane);
         if (lane == 0u && experts) {
             experts[((uint64_t)token * n_expert + slot) * out_dim + row] = v;
         }
@@ -2686,21 +2955,11 @@ static int ds4_cuda_routed_moe_impl(
         return 0;
     }
 
-    const uint32_t xq_blocks = expert_in_dim / 256u;
-    const uint32_t midq_blocks = expert_mid_dim / 256u;
-    const uint64_t xq_bytes = (uint64_t)n_tokens * xq_blocks * sizeof(*g_scratch_routed_moe_xq);
-    const uint64_t midq_bytes = pair_rows * midq_blocks * sizeof(*g_scratch_routed_moe_midq);
-    if (xq_bytes > SIZE_MAX || midq_bytes > SIZE_MAX) return 0;
-    if (!ds4_cuda_scratch_reserve((void **)&g_scratch_routed_moe_xq,
-                                  &g_scratch_routed_moe_xq_bytes,
-                                  (size_t)xq_bytes,
-                                  "routed MoE xq scratch allocation") ||
-        !ds4_cuda_scratch_reserve((void **)&g_scratch_routed_moe_midq,
-                                  &g_scratch_routed_moe_midq_bytes,
-                                  (size_t)midq_bytes,
-                                  "routed MoE midq scratch allocation")) {
-        return 0;
-    }
+    /* Phase 3b-10: both Q8_K activation quantizations (input + mid) are now
+     * fused inside the consumer warp kernels.  The pre-launch
+     * quantize_rows_q8_K_kernel calls and the g_scratch_routed_moe_xq /
+     * g_scratch_routed_moe_midq scratch buffers are no longer used on this
+     * call path. */
 
     const ds4_cuda_block_iq2_xxs *gate_w =
         (const ds4_cuda_block_iq2_xxs *)((const uint8_t *)model_map + gate_offset);
@@ -2709,9 +2968,7 @@ static int ds4_cuda_routed_moe_impl(
     const ds4_cuda_block_q2_K *down_w =
         (const ds4_cuda_block_q2_K *)((const uint8_t *)model_map + down_offset);
 
-    ds4_cuda_quantize_rows_q8_K_kernel<<<n_tokens, 1, 0, g_stream>>>(
-        (const float *)x_ptr, g_scratch_routed_moe_xq, expert_in_dim, n_tokens);
-    int ok = ds4_cuda_check(cudaGetLastError(), "launch routed MoE input quantize");
+    int ok = 1;
     if (ok) {
         constexpr uint32_t ROWS_PER_BLOCK = 4u;
         const uint32_t row_blocks = (expert_mid_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
@@ -2719,7 +2976,7 @@ static int ds4_cuda_routed_moe_impl(
                 dim3(row_blocks, (uint32_t)pair_rows, 1),
                 dim3(32u, ROWS_PER_BLOCK, 1),
                 0, g_stream>>>(
-            gate_w, up_w, g_scratch_routed_moe_xq,
+            gate_w, up_w, (const float *)x_ptr,
             (const int32_t *)selected_ptr,
             (const float *)weights_ptr,
             (float *)gate_ptr,
@@ -2732,15 +2989,7 @@ static int ds4_cuda_routed_moe_impl(
             gate_expert_bytes,
             gate_row_bytes,
             clamp);
-        ok = ds4_cuda_check(cudaGetLastError(), "launch routed MoE gate/up/mid");
-    }
-    if (ok) {
-        ds4_cuda_quantize_rows_q8_K_kernel<<<(uint32_t)pair_rows, 1, 0, g_stream>>>(
-            (const float *)mid_ptr,
-            g_scratch_routed_moe_midq,
-            expert_mid_dim,
-            (uint32_t)pair_rows);
-        ok = ds4_cuda_check(cudaGetLastError(), "launch routed MoE mid quantize");
+        ok = ds4_cuda_check(cudaGetLastError(), "launch routed MoE gate/up/mid fused");
     }
     if (ok) {
         constexpr uint32_t ROWS_PER_BLOCK = 4u;
@@ -2750,7 +2999,7 @@ static int ds4_cuda_routed_moe_impl(
                 dim3(32u, ROWS_PER_BLOCK, 1),
                 0, g_stream>>>(
             down_w,
-            g_scratch_routed_moe_midq,
+            (const float *)mid_ptr,
             (const int32_t *)selected_ptr,
             (float *)experts_ptr,
             (float *)out_ptr,
@@ -2760,7 +3009,7 @@ static int ds4_cuda_routed_moe_impl(
             out_dim,
             down_expert_bytes,
             down_row_bytes);
-        ok = ds4_cuda_check(cudaGetLastError(), "launch routed MoE down");
+        ok = ds4_cuda_check(cudaGetLastError(), "launch routed MoE down fused");
     }
 
     return ok;
