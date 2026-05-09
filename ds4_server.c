@@ -6205,8 +6205,18 @@ static void usage(FILE *fp) {
         "Normal server command:\n"
         "  ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192\n"
         "\n"
+        "Backend:\n"
+        "  --metal\n"
+        "      Use the Metal graph backend (default in Metal-enabled builds).\n"
+        "  --cuda\n"
+        "      Use the CUDA graph backend (default in CUDA-only builds; Linux + NVIDIA only).\n"
+        "  --backend NAME\n"
+        "      Select backend explicitly: metal or cuda.\n"
+        "      MTP / speculative-decode is currently Metal-only; --mtp* options are rejected on CUDA.\n"
+        "      Disk KV cache (--kv-disk-*) is currently Metal-only and is silently disabled on CUDA.\n"
+        "\n"
         "Notes:\n"
-        "  The server is Metal-only. Use /v1/chat/completions, /v1/completions, or /v1/messages.\n"
+        "  Use /v1/chat/completions, /v1/completions, or /v1/messages.\n"
         "  Larger --ctx values allocate more KV memory at startup; the startup log prints the estimate.\n"
         "  Disk KV caching is best for agents that resend long prompts with stable prefixes.\n"
         "\n"
@@ -6214,11 +6224,25 @@ static void usage(FILE *fp) {
         "      Show this help.\n");
 }
 
+static ds4_backend parse_server_backend(const char *s) {
+    if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+    if (!strcmp(s, "cuda"))  return DS4_BACKEND_CUDA;
+    server_log(DS4_LOG_DEFAULT, "ds4-server: invalid backend: %s (valid: metal, cuda)", s);
+    exit(2);
+}
+
 static server_config parse_options(int argc, char **argv) {
     server_config c = {
         .engine = {
             .model_path = "ds4flash.gguf",
+            /* Default backend follows the build: Metal-enabled builds default to
+             * Metal (the production default); CUDA-only builds default to CUDA so
+             * `ds4-server-cuda` works with no flags. */
+#ifdef DS4_NO_METAL
+            .backend = DS4_BACKEND_CUDA,
+#else
             .backend = DS4_BACKEND_METAL,
+#endif
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
         },
@@ -6274,8 +6298,14 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
-        } else if (!strcmp(arg, "--cpu") || !strcmp(arg, "--backend")) {
-            server_log(DS4_LOG_DEFAULT, "ds4-server: server mode is Metal-only");
+        } else if (!strcmp(arg, "--metal")) {
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--cuda")) {
+            c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--backend")) {
+            c.engine.backend = parse_server_backend(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--cpu")) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: --cpu is not a server backend (debug-only); use --metal or --cuda");
             exit(2);
         } else {
             server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
@@ -6290,6 +6320,41 @@ static server_config parse_options(int argc, char **argv) {
                    "ds4-server: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens");
         exit(2);
     }
+
+    /* Backend availability gates (build-time): error early if the chosen backend
+     * isn't compiled into this binary. */
+#ifdef DS4_NO_METAL
+    if (c.engine.backend == DS4_BACKEND_METAL) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: --metal requested but this build has no Metal support");
+        exit(2);
+    }
+#endif
+#ifndef DS4_USE_CUDA
+    if (c.engine.backend == DS4_BACKEND_CUDA) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: --cuda requested but this build has no CUDA support");
+        exit(2);
+    }
+#endif
+
+    /* CUDA backend feature gates: MTP / speculative-decode and disk KV cache are
+     * Metal-only today.  Reject --mtp* loudly (server's spec branch would call
+     * ds4_session_eval_speculative_argmax which returns -1 on CUDA → generation
+     * error).  Quietly disable KV disk cache (silent payload-bytes=0
+     * short-circuit already exists, but a one-time notice is friendlier). */
+    if (c.engine.backend == DS4_BACKEND_CUDA) {
+        if (c.engine.mtp_path) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: --mtp is currently Metal-only; CUDA MTP/speculative-decode wire-up is in flight");
+            exit(2);
+        }
+        if (c.kv_disk_dir) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: --kv-disk-dir is currently Metal-only; disabling KV disk cache for this CUDA session");
+            c.kv_disk_dir = NULL;
+            c.kv_disk_space_mb = 0;
+        }
+    }
+
     return c;
 }
 
