@@ -14778,6 +14778,177 @@ static bool cuda_graph_encode_one_layer(
     return ok ? true : false;
 }
 
+/* Phase 4 Step 4a: MTP-specific output head.  Same kernel sequence as the
+ * regular output head, but the HC-projection / per-stream weights / norm
+ * come from the MTP weights blob and only the final vocab matmul reads
+ * from the BASE model's `output` tensor.  Mirrors metal_graph_encode_
+ * output_head_mtp at ds4.c:10063.  Takes cur_hc explicitly so callers
+ * (MTP draft) don't need to mutate g->cur_hc. */
+static bool cuda_graph_encode_output_head_mtp(
+        ds4_cuda_graph        *g,
+        const ds4_model       *base_model,
+        const ds4_weights     *base_weights,
+        const ds4_model       *mtp_model,
+        const ds4_mtp_weights *mtp,
+        ds4_cuda_tensor       *cur_hc,
+        uint64_t               vocab_dim) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+    int ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_rms_norm_plain_tensor(g->output_flat, cur_hc,
+                                                 (uint32_t)hc_dim, DS4_RMS_EPS);
+    if (ok) ok = ds4_cuda_matmul_f16_tensor(g->output_pre,
+                                             mtp_model->map, mtp_model->size,
+                                             mtp->hc_head_fn->abs_offset,
+                                             hc_dim, DS4_N_HC, g->output_flat, 1u);
+    if (ok) ok = ds4_cuda_output_hc_weights_tensor(
+                    g->output_weights, g->output_pre,
+                    mtp_model->map, mtp_model->size,
+                    mtp->hc_head_scale->abs_offset,
+                    mtp->hc_head_base->abs_offset,
+                    DS4_N_HC, DS4_HC_EPS);
+    if (ok) ok = ds4_cuda_hc_weighted_sum_tensor(g->output_embd, cur_hc,
+                                                  g->output_weights,
+                                                  DS4_N_EMBD, DS4_N_HC);
+    if (ok) ok = ds4_cuda_rms_norm_weight_tensor(g->output_norm, g->output_embd,
+                                                  mtp_model->map, mtp_model->size,
+                                                  mtp->norm->abs_offset,
+                                                  DS4_N_EMBD, DS4_RMS_EPS);
+    if (ok) ok = ds4_cuda_matmul_q8_0_tensor(g->logits,
+                                              base_model->map, base_model->size,
+                                              base_weights->output->abs_offset,
+                                              DS4_N_EMBD, vocab_dim,
+                                              g->output_norm, 1u);
+    if (ok) ok = ds4_cuda_end_commands_async();
+    return ok ? true : false;
+}
+
+/* Phase 4 Step 4b: MTP draft pass against an arbitrary prior HC stream.
+ * Mirrors metal_graph_eval_mtp_draft_from_hc (ds4.c:12698).  Produces a
+ * single proposed-next-token logit row and (optionally) its argmax via
+ * on-device top-1 indexer.  After the call, out_hc holds the drafter's
+ * post-block-1 HC stream — which becomes prev_hc for the next recursive
+ * draft step in the speculative-argmax driver.
+ *
+ * Three command batches are issued (each ends async):
+ *   1. embed → enorm → e_proj → repeat_hc → hnorm_hc → h_proj → add
+ *      (produces mtp_input_hc for stage 2).
+ *   2. cuda_graph_encode_one_layer with mtp_input_hc → out_hc, using the
+ *      mtp->block weights against g->mtp_raw_cache (mtp_n_raw counter).
+ *   3. encode_output_head_mtp on out_hc → g->logits, plus optional
+ *      indexer_topk(k=1) → g->comp_selected for cheap on-device argmax.
+ *
+ * Errors short-circuit the chain and return false; ds4_cuda_tensor_read
+ * for logits / top_id is the load-bearing host-readable sync. */
+static bool cuda_graph_eval_mtp_draft_from_hc(
+        ds4_cuda_graph        *g,
+        const ds4_model       *base_model,
+        const ds4_weights     *base_weights,
+        const ds4_model       *mtp_model,
+        const ds4_mtp_weights *mtp,
+        ds4_cuda_tensor       *prev_hc,
+        ds4_cuda_tensor       *out_hc,
+        int                    token,
+        uint32_t               pos,
+        float                 *logits,
+        int                   *top_id) {
+    if (!mtp || !mtp->block.attn_q_a || !g->mtp_raw_cache || !prev_hc || !out_hc) return false;
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+    const uint32_t raw_row = pos % g->raw_cap;
+    uint32_t n_raw = g->mtp_n_raw + 1u;
+    if (n_raw > g->raw_window) n_raw = g->raw_window;
+    if (n_raw > g->raw_cap)    n_raw = g->raw_cap;
+    const uint32_t raw_start = ((pos + 1u) - n_raw) % g->raw_cap;
+
+    /* Stage 1: project token + prev_hc into mtp_input_hc. */
+    int ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_embed_token_hc_tensor(
+                    g->mtp_embed, base_model->map, base_model->size,
+                    base_weights->token_embd->abs_offset,
+                    (uint32_t)base_weights->token_embd->dim[1],
+                    (uint32_t)token, DS4_N_EMBD, 1u);
+    if (ok) ok = ds4_cuda_rms_norm_weight_tensor(g->mtp_enorm, g->mtp_embed,
+                                                  mtp_model->map, mtp_model->size,
+                                                  mtp->enorm->abs_offset,
+                                                  DS4_N_EMBD, DS4_RMS_EPS);
+    if (ok) ok = ds4_cuda_matmul_q8_0_tensor(g->mtp_eproj,
+                                              mtp_model->map, mtp_model->size,
+                                              mtp->e_proj->abs_offset,
+                                              DS4_N_EMBD, DS4_N_EMBD, g->mtp_enorm, 1u);
+    if (ok) ok = ds4_cuda_repeat_hc_tensor(g->mtp_eproj_hc, g->mtp_eproj,
+                                            DS4_N_EMBD, DS4_N_HC);
+    if (ok) ok = ds4_cuda_rms_norm_weight_rows_tensor(g->mtp_hnorm_hc, prev_hc,
+                                                       mtp_model->map, mtp_model->size,
+                                                       mtp->hnorm->abs_offset,
+                                                       DS4_N_EMBD, DS4_N_HC, DS4_RMS_EPS);
+    if (ok) ok = ds4_cuda_matmul_q8_0_tensor(g->mtp_hproj_hc,
+                                              mtp_model->map, mtp_model->size,
+                                              mtp->h_proj->abs_offset,
+                                              DS4_N_EMBD, DS4_N_EMBD, g->mtp_hnorm_hc, DS4_N_HC);
+    if (ok) ok = ds4_cuda_add_tensor(g->mtp_input_hc, g->mtp_eproj_hc, g->mtp_hproj_hc,
+                                      (uint32_t)hc_dim);
+    if (ok) ok = ds4_cuda_end_commands_async();
+    if (!ok) return false;
+
+    /* Stage 2: per-layer body via the Step 2 helper.  The MTP block runs
+     * against g->mtp_raw_cache with its own n_raw counter; il=1 mirrors
+     * Metal's choice (the value is irrelevant for the regular CUDA
+     * helper since the helper only uses il to access g->layer_*[il]
+     * compressor state, but mtp->block weights are non-compressor for
+     * DS4 Flash MTP — the cmp branch will be skipped). */
+    if (!cuda_graph_encode_one_layer(g, mtp_model, &mtp->block, 1u, pos,
+                                     g->mtp_raw_cache, g->raw_cap,
+                                     raw_row, n_raw, raw_start,
+                                     token, g->mtp_input_hc, out_hc)) {
+        return false;
+    }
+
+    /* Stage 3: output head + optional on-device argmax. */
+    if (!cuda_graph_encode_output_head_mtp(g, base_model, base_weights,
+                                            mtp_model, mtp, out_hc,
+                                            base_weights->output->dim[1])) {
+        return false;
+    }
+    if (top_id) {
+        int oh_ok = ds4_cuda_begin_commands();
+        if (oh_ok) oh_ok = ds4_cuda_indexer_topk_tensor(g->comp_selected, g->logits,
+                                                         DS4_N_VOCAB, 1u, 1u);
+        if (oh_ok) oh_ok = ds4_cuda_end_commands_async();
+        if (!oh_ok) return false;
+    }
+
+    if (logits) {
+        if (!ds4_cuda_tensor_read(g->logits, 0, logits,
+                                   (uint64_t)DS4_N_VOCAB * sizeof(float))) return false;
+    }
+    if (top_id) {
+        if (!ds4_cuda_tensor_read(g->comp_selected, 0, top_id, sizeof(*top_id))) return false;
+    }
+
+    if (g->mtp_n_raw < g->raw_window) g->mtp_n_raw++;
+    return true;
+}
+
+/* Phase 4 Step 4b: thin wrapper that uses g->cur_hc as the prior HC
+ * stream and writes into a caller-supplied out_hc.  Mirrors
+ * metal_graph_eval_mtp_draft (ds4.c:12815). */
+static bool cuda_graph_eval_mtp_draft(
+        ds4_cuda_graph        *g,
+        const ds4_model       *base_model,
+        const ds4_weights     *base_weights,
+        const ds4_model       *mtp_model,
+        const ds4_mtp_weights *mtp,
+        ds4_cuda_tensor       *out_hc,
+        int                    token,
+        uint32_t               pos,
+        float                 *logits,
+        int                   *top_id) {
+    return cuda_graph_eval_mtp_draft_from_hc(g, base_model, base_weights,
+                                              mtp_model, mtp,
+                                              g->cur_hc, out_hc,
+                                              token, pos, logits, top_id);
+}
+
 static bool cuda_graph_eval_token_raw_swa(
         ds4_cuda_graph    *g,
         const ds4_model   *model,
@@ -20112,10 +20283,15 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->cuda_graph.quality = e->quality;
         s->cuda_graph_ready = true;
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-        /* Phase 4 Step 3: MTP draft scratch is allocated inside
-         * cuda_graph_alloc_raw_cap when e->mtp_ready.  Session-level
-         * s->mtp_logits heap allocation is gated on Step 4 wiring (the
-         * draft kernel chain that writes into it); stays NULL until then. */
+        /* Phase 4 Step 4: allocate the heap row that
+         * cuda_graph_eval_mtp_draft_from_hc writes its logits into when
+         * the caller wants per-draft-step full logits (e.g. for the
+         * margin gate or DS4_MTP_FULL_LOGITS).  Mirrors Metal's pattern
+         * at ds4.c:20012. */
+        if (e->mtp_ready) {
+            s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
+            s->mtp_draft_token = -1;
+        }
         *out = s;
         return 0;
     }
