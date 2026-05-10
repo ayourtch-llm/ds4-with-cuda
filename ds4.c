@@ -2957,6 +2957,59 @@ void ds4_test_moe_gather_act_to_f32(
     }
 }
 
+/* Phase 7b MoE retile Step E-2: CPU oracle for the scatter-sum down
+ * kernel.  Builds the same inverse_permute the GPU would (init -1; for
+ * each routing p, inverse[permuted_indices[p]] = p), then for each
+ * (token, out_row): sum across slots 0..n_expert_used-1, skipping slots
+ * where inverse[token*n_expert_used+slot] is -1.  Same accumulator
+ * order as the existing fused down kernel (slots iterated in order). */
+void ds4_test_moe_scatter_down_sum(
+        float          *out,
+        const float    *permuted_down,
+        const uint32_t *permuted_indices,
+        uint32_t        n_tokens,
+        uint32_t        n_expert_used,
+        uint32_t        out_dim,
+        uint32_t        total_routings) {
+    const uint32_t pair_rows = n_tokens * n_expert_used;
+    int32_t *inverse = (int32_t *)xmalloc((size_t)pair_rows * sizeof(int32_t));
+    for (uint32_t i = 0; i < pair_rows; i++) inverse[i] = -1;
+    for (uint32_t p = 0; p < total_routings; p++) {
+        inverse[permuted_indices[p]] = (int32_t)p;
+    }
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t r = 0; r < out_dim; r++) {
+            float sum = 0.0f;
+            for (uint32_t s = 0; s < n_expert_used; s++) {
+                const int32_t p = inverse[(uint64_t)t * n_expert_used + s];
+                if (p < 0) continue;
+                sum += permuted_down[(uint64_t)p * out_dim + r];
+            }
+            out[(uint64_t)t * out_dim + r] = sum;
+        }
+    }
+    free(inverse);
+}
+
+/* Phase 7b MoE retile Step E-1: CPU oracle for the gather_mid kernel.
+ * Same as gather_act but reads `mid` indexed by canonical pair index
+ * (token*n_expert_used+slot) directly. */
+void ds4_test_moe_gather_mid_to_f32(
+        float          *out,
+        const float    *mid,
+        const uint32_t *permuted_indices,
+        uint32_t        mid_dim,
+        uint32_t        total_routings) {
+    for (uint32_t p = 0; p < total_routings; p++) {
+        const uint32_t idx = permuted_indices[p];
+        const float *src = mid + (uint64_t)idx * mid_dim;
+        float *dst       = out + (uint64_t)p   * mid_dim;
+        for (uint32_t r = 0; r < mid_dim; r++) {
+            dst[r] = f16_to_f32(f32_to_f16(src[r]));
+        }
+    }
+}
+
 /* Phase 7b MoE retile Step C-3: CPU oracle for the unpermute + clamp +
  * SwiGLU + route kernel.  Mirrors the math of the existing fused kernel
  * (ds4_cuda_routed_moe_mid_iq2_xxs_kernel) one-to-one, just with the matmul

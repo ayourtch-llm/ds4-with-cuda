@@ -230,6 +230,18 @@ void ds4_test_moe_gather_act_to_f32(float *out,
                                     uint32_t in_dim,
                                     uint32_t n_expert_used,
                                     uint32_t total_routings);
+void ds4_test_moe_gather_mid_to_f32(float *out,
+                                    const float *mid,
+                                    const uint32_t *permuted_indices,
+                                    uint32_t mid_dim,
+                                    uint32_t total_routings);
+void ds4_test_moe_scatter_down_sum(float *out,
+                                   const float *permuted_down,
+                                   const uint32_t *permuted_indices,
+                                   uint32_t n_tokens,
+                                   uint32_t n_expert_used,
+                                   uint32_t out_dim,
+                                   uint32_t total_routings);
 void ds4_test_moe_unpermute_swiglu_route(float *gate_out,
                                          float *up_out,
                                          float *mid_out,

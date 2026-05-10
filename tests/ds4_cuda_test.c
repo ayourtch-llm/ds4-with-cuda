@@ -124,6 +124,21 @@ int ds4_cuda_test_moe_gather_act_to_f32_tensor(
         uint32_t               in_dim,
         uint32_t               n_expert_used,
         uint32_t               total_routings);
+int ds4_cuda_test_moe_gather_mid_to_f32_tensor(
+        ds4_cuda_tensor       *out_f32,
+        const ds4_cuda_tensor *mid,
+        const ds4_cuda_tensor *permuted_indices,
+        uint32_t               pair_rows,
+        uint32_t               mid_dim,
+        uint32_t               total_routings);
+int ds4_cuda_test_moe_scatter_down_sum_tensor(
+        ds4_cuda_tensor       *out,
+        const ds4_cuda_tensor *permuted_down,
+        const ds4_cuda_tensor *permuted_indices,
+        uint32_t               n_tokens,
+        uint32_t               n_expert_used,
+        uint32_t               out_dim,
+        uint32_t               total_routings);
 int ds4_cuda_test_moe_unpermute_swiglu_route_tensor(
         ds4_cuda_tensor       *gate_out,
         ds4_cuda_tensor       *up_out,
@@ -1907,6 +1922,178 @@ DS4_CUDA_PARITY_TEST(moe_unpermute_swiglu_route,
     .cpu_fn  = moe_unpermute_cpu,
     .cuda_fn = moe_unpermute_cuda,
     .cfg = (void *)&moe_unpermute_cfg_v);
+
+/* Phase 7b MoE retile Step E-1: gather_mid kernel parity test.  Mirrors
+ * moe_gather_act_to_f32 but the source `mid` is indexed by canonical pair
+ * index (token*n_expert_used+slot) and has pair_rows rows, not n_tokens.
+ *
+ * Test shape: pair_rows = n_tokens × n_expert_used = 4 × 6 = 24,
+ * mid_dim = 256, total_routings = 16.  in_elems = pair_rows × mid_dim =
+ * 6144 floats from harness.  out_elems = total_routings × mid_dim = 4096
+ * floats.  Bit-exact (ulp=0). */
+struct moe_gather_mid_cfg {
+    uint32_t  pair_rows;
+    uint32_t  mid_dim;
+    uint32_t  total_routings;
+    uint64_t  perm_seed;
+    uint32_t *permuted_indices;
+    int       initialized;
+};
+
+static void moe_gather_mid_fill(struct moe_gather_mid_cfg *c) {
+    if (c->initialized) return;
+    c->permuted_indices = (uint32_t *)malloc((size_t)c->total_routings * sizeof(uint32_t));
+    if (!c->permuted_indices) return;
+    uint64_t s = c->perm_seed;
+    for (uint32_t i = 0; i < c->total_routings; i++) {
+        c->permuted_indices[i] = test_rng_u32(&s) % c->pair_rows;
+    }
+    c->initialized = 1;
+}
+
+static int moe_gather_mid_cpu(const float *in, float *out, void *cfg) {
+    struct moe_gather_mid_cfg *c = cfg;
+    moe_gather_mid_fill(c);
+    if (!c->initialized) return 0;
+    ds4_test_moe_gather_mid_to_f32(out, in, c->permuted_indices,
+                                   c->mid_dim, c->total_routings);
+    return 1;
+}
+
+static int moe_gather_mid_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                               size_t in_elems, size_t out_elems, void *cfg) {
+    (void)out_elems;
+    struct moe_gather_mid_cfg *c = cfg;
+    moe_gather_mid_fill(c);
+    if (!c->initialized) return 0;
+
+    ds4_cuda_tensor *mid = ds4_cuda_tensor_alloc((uint64_t)in_elems * sizeof(float));
+    ds4_cuda_tensor *idx = ds4_cuda_tensor_alloc((uint64_t)c->total_routings * sizeof(uint32_t));
+    if (!mid || !idx) {
+        ds4_cuda_tensor_free(mid); ds4_cuda_tensor_free(idx);
+        return 0;
+    }
+    int ok = ds4_cuda_tensor_write(mid, 0, in, (uint64_t)in_elems * sizeof(float))
+          && ds4_cuda_tensor_write(idx, 0, c->permuted_indices,
+                                   (uint64_t)c->total_routings * sizeof(uint32_t));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_test_moe_gather_mid_to_f32_tensor(out_dev, mid, idx,
+                                                            c->pair_rows, c->mid_dim, c->total_routings);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(mid); ds4_cuda_tensor_free(idx);
+    return ok;
+}
+
+static struct moe_gather_mid_cfg moe_gather_mid_cfg_v = {
+    .pair_rows      = 24,
+    .mid_dim        = 256,
+    .total_routings = 16,
+    .perm_seed      = 0xD3E1011ull,
+};
+
+DS4_CUDA_PARITY_TEST(moe_gather_mid_to_f32,
+    .seed = 0xD3E101,
+    .in_elems  = 24u * 256u,
+    .out_elems = 16u * 256u,
+    .ulp_tolerance = 0,
+    .cpu_fn  = moe_gather_mid_cpu,
+    .cuda_fn = moe_gather_mid_cuda,
+    .cfg = (void *)&moe_gather_mid_cfg_v);
+
+/* Phase 7b MoE retile Step E-2: scatter-sum kernel parity test.
+ *
+ * Generates a unique-permuted_indices subset of pair_rows via Fisher-Yates
+ * shuffle so the inverse-permute build has no collisions.  Both sides
+ * iterate slots 0..n_expert_used-1 in order, skip when inverse[idx] is
+ * -1, and accumulate F32 sums — bit-exact match (ulp=0).
+ *
+ * Test shape: n_tokens=4, n_expert_used=6, out_dim=128, total_routings=16.
+ * pair_rows = 24, total_routings < pair_rows so inverse has -1 entries
+ * exercising the skip path.  in_elems = total_routings × out_dim = 2048.
+ * out_elems = n_tokens × out_dim = 512. */
+struct moe_scatter_cfg {
+    uint32_t  n_tokens;
+    uint32_t  n_expert_used;
+    uint32_t  out_dim;
+    uint32_t  total_routings;
+    uint64_t  perm_seed;
+    uint32_t *permuted_indices;
+    int       initialized;
+};
+
+static void moe_scatter_fill(struct moe_scatter_cfg *c) {
+    if (c->initialized) return;
+    const uint32_t pair_rows = c->n_tokens * c->n_expert_used;
+    c->permuted_indices = (uint32_t *)malloc((size_t)c->total_routings * sizeof(uint32_t));
+    uint32_t *pool = (uint32_t *)malloc((size_t)pair_rows * sizeof(uint32_t));
+    if (!c->permuted_indices || !pool) {
+        free(c->permuted_indices); free(pool);
+        c->permuted_indices = NULL;
+        return;
+    }
+    for (uint32_t i = 0; i < pair_rows; i++) pool[i] = i;
+    uint64_t s = c->perm_seed;
+    /* Fisher-Yates partial shuffle: pick first total_routings unique slots. */
+    for (uint32_t i = 0; i < c->total_routings; i++) {
+        const uint32_t j = i + (test_rng_u32(&s) % (pair_rows - i));
+        const uint32_t tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp;
+        c->permuted_indices[i] = pool[i];
+    }
+    free(pool);
+    c->initialized = 1;
+}
+
+static int moe_scatter_cpu(const float *in, float *out, void *cfg) {
+    struct moe_scatter_cfg *c = cfg;
+    moe_scatter_fill(c);
+    if (!c->initialized) return 0;
+    ds4_test_moe_scatter_down_sum(out, in, c->permuted_indices,
+                                  c->n_tokens, c->n_expert_used, c->out_dim,
+                                  c->total_routings);
+    return 1;
+}
+
+static int moe_scatter_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                            size_t in_elems, size_t out_elems, void *cfg) {
+    (void)out_elems;
+    struct moe_scatter_cfg *c = cfg;
+    moe_scatter_fill(c);
+    if (!c->initialized) return 0;
+
+    ds4_cuda_tensor *down = ds4_cuda_tensor_alloc((uint64_t)in_elems * sizeof(float));
+    ds4_cuda_tensor *idx  = ds4_cuda_tensor_alloc((uint64_t)c->total_routings * sizeof(uint32_t));
+    if (!down || !idx) {
+        ds4_cuda_tensor_free(down); ds4_cuda_tensor_free(idx);
+        return 0;
+    }
+    int ok = ds4_cuda_tensor_write(down, 0, in, (uint64_t)in_elems * sizeof(float))
+          && ds4_cuda_tensor_write(idx, 0, c->permuted_indices,
+                                   (uint64_t)c->total_routings * sizeof(uint32_t));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_test_moe_scatter_down_sum_tensor(out_dev, down, idx,
+                                                           c->n_tokens, c->n_expert_used,
+                                                           c->out_dim, c->total_routings);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(down); ds4_cuda_tensor_free(idx);
+    return ok;
+}
+
+static struct moe_scatter_cfg moe_scatter_cfg_v = {
+    .n_tokens       = 4,
+    .n_expert_used  = 6,
+    .out_dim        = 128,
+    .total_routings = 16,
+    .perm_seed      = 0xD3E2022ull,
+};
+
+DS4_CUDA_PARITY_TEST(moe_scatter_down_sum,
+    .seed = 0xD3E202,
+    .in_elems  = 16u * 128u,
+    .out_elems = 4u * 128u,
+    .ulp_tolerance = 0,
+    .cpu_fn  = moe_scatter_cpu,
+    .cuda_fn = moe_scatter_cuda,
+    .cfg = (void *)&moe_scatter_cfg_v);
 
 /* ---------------------------------------------------------------------------
  * flash_attn — Phase 1 m3.  Raw sliding-window attention with sinks.
@@ -6415,6 +6602,8 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_moe_layout,
     &ds4_cuda_parity_moe_gather_act_to_f32,
     &ds4_cuda_parity_moe_unpermute_swiglu_route,
+    &ds4_cuda_parity_moe_gather_mid_to_f32,
+    &ds4_cuda_parity_moe_scatter_down_sum,
     &ds4_cuda_parity_flash_attn,
     &ds4_cuda_parity_router_select_batch,
     &ds4_cuda_parity_routed_moe_batch,

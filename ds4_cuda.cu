@@ -489,6 +489,74 @@ __global__ static void ds4_cuda_kernel_moe_layout(
     }
 }
 
+/* Phase 7b MoE retile Step E-2: build inverse permutation + scatter-sum
+ * for the down step.
+ *
+ * The inverse-permute kernel fills inverse_permute[pair_rows] with -1
+ * (sentinel for "no live routing for this slot") and then writes
+ * inverse_permute[permuted_indices[p]] = p for each routing p.  Caller
+ * pre-fills with -1 via cudaMemsetAsync(0xFF) — int32 -1 == 0xFFFFFFFF.
+ *
+ * The scatter-sum kernel computes
+ *   out[token, r] = sum over slots s of permuted_down[p, r]  where
+ *                   p = inverse_permute[token*n_expert_used + s]
+ *                   (skipped if p < 0)
+ * which exactly reproduces the existing fused down kernel's
+ * accumulator order — slots iterated 0..n_expert_used-1, slot skipped
+ * when expert was -1.  Bit-exact target. */
+__global__ static void ds4_cuda_kernel_moe_build_inverse_permute(
+        int32_t        *inverse_permute,
+        const uint32_t *permuted_indices,
+        uint32_t        total_routings) {
+    const uint32_t p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= total_routings) return;
+    inverse_permute[permuted_indices[p]] = (int32_t)p;
+}
+
+__global__ static void ds4_cuda_kernel_moe_scatter_down_sum(
+        float          *out,
+        const float    *permuted_down,
+        const int32_t  *inverse_permute,
+        uint32_t        n_expert_used,
+        uint32_t        out_dim) {
+    const uint32_t token = blockIdx.y;
+    const uint64_t inv_off = (uint64_t)token * n_expert_used;
+    const uint64_t out_off = (uint64_t)token * out_dim;
+    for (uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+         r < out_dim;
+         r += gridDim.x * blockDim.x) {
+        float sum = 0.0f;
+        for (uint32_t s = 0; s < n_expert_used; s++) {
+            const int32_t p = inverse_permute[inv_off + s];
+            if (p < 0) continue;
+            sum += permuted_down[(uint64_t)p * out_dim + r];
+        }
+        out[out_off + r] = sum;
+    }
+}
+
+/* Phase 7b MoE retile Step E-1: gather post-SwiGLU mid in expert-sorted
+ * order and convert F32 → F16.  Same shape as C-2 gather but the source
+ * `mid` is indexed by canonical pair index (token*n_expert_used+slot)
+ * instead of by token, so we read mid[idx, :] directly without a divmod. */
+__global__ static void ds4_cuda_kernel_moe_gather_mid_to_half(
+        __half         *out_f16,
+        const float    *mid,
+        const uint32_t *permuted_indices,
+        uint32_t        mid_dim,
+        uint32_t        total_routings) {
+    const uint32_t p = blockIdx.y;
+    if (p >= total_routings) return;
+    const uint32_t idx = permuted_indices[p];
+    const uint64_t in_off  = (uint64_t)idx * mid_dim;
+    const uint64_t out_off = (uint64_t)p   * mid_dim;
+    for (uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+         r < mid_dim;
+         r += gridDim.x * blockDim.x) {
+        out_f16[out_off + r] = __float2half(mid[in_off + r]);
+    }
+}
+
 /* Phase 7b MoE retile Step C-2: gather token activations in expert-sorted
  * order and convert F32 → F16.
  *
@@ -3381,6 +3449,128 @@ int ds4_cuda_test_moe_gather_act_to_f32_tensor(
         ds4_cuda_kernel_half_to_f32<<<conv_blocks, threads, 0, g_stream>>>(
             (float *)out_ptr, (const __half *)scratch_f16, n_elems);
         ok = ds4_cuda_check(cudaGetLastError(), "launch half_to_f32 (moe_gather test)");
+    }
+
+    cudaFree(scratch_f16);
+    return ok;
+}
+
+/* Phase 7b MoE retile Step E-2: standalone test launcher for the
+ * scatter-sum down kernel.  Drives the build_inverse_permute kernel +
+ * the scatter_down_sum kernel; allocates a transient inverse_permute
+ * scratch sized at pair_rows * sizeof(int32_t).  Out tensor doesn't need
+ * pre-zeroing because scatter_down_sum writes the full sum (not +=).
+ * Pre-fills inverse_permute with -1 via cudaMemsetAsync(0xFF). */
+int ds4_cuda_test_moe_scatter_down_sum_tensor(
+        ds4_cuda_tensor       *out,
+        const ds4_cuda_tensor *permuted_down,
+        const ds4_cuda_tensor *permuted_indices,
+        uint32_t               n_tokens,
+        uint32_t               n_expert_used,
+        uint32_t               out_dim,
+        uint32_t               total_routings) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (n_tokens == 0 || n_expert_used == 0 || out_dim == 0) return 0;
+
+    const uint64_t pair_rows  = (uint64_t)n_tokens * n_expert_used;
+    const uint64_t down_bytes = (uint64_t)total_routings * out_dim * sizeof(float);
+    const uint64_t idx_bytes  = (uint64_t)total_routings * sizeof(uint32_t);
+    const uint64_t out_bytes  = (uint64_t)n_tokens * out_dim * sizeof(float);
+    const uint64_t inv_bytes  = pair_rows * sizeof(int32_t);
+
+    void *down_ptr = NULL, *idx_ptr = NULL, *out_ptr = NULL;
+    if (!ds4_cuda_tensor_range(permuted_down, down_bytes, "scatter_down permuted_down", &down_ptr) ||
+        !ds4_cuda_tensor_range(permuted_indices, idx_bytes, "scatter_down permuted_indices", &idx_ptr) ||
+        !ds4_cuda_tensor_range(out, out_bytes, "scatter_down out", &out_ptr)) {
+        return 0;
+    }
+
+    void *inverse_scratch = NULL;
+    if (!ds4_cuda_check(cudaMalloc(&inverse_scratch, (size_t)inv_bytes),
+                        "scatter_down inverse alloc")) {
+        return 0;
+    }
+    int ok = ds4_cuda_check(cudaMemsetAsync(inverse_scratch, 0xFF, (size_t)inv_bytes, g_stream),
+                            "scatter_down inverse memset");
+
+    if (ok && total_routings > 0) {
+        const uint32_t threads = 256u;
+        const uint32_t blocks  = (total_routings + threads - 1u) / threads;
+        ds4_cuda_kernel_moe_build_inverse_permute<<<blocks, threads, 0, g_stream>>>(
+            (int32_t *)inverse_scratch,
+            (const uint32_t *)idx_ptr,
+            total_routings);
+        ok = ds4_cuda_check(cudaGetLastError(), "scatter_down build_inverse");
+    }
+
+    if (ok) {
+        const uint32_t threads = 256u;
+        const uint32_t grid_x  = (out_dim + threads - 1u) / threads;
+        ds4_cuda_kernel_moe_scatter_down_sum<<<
+                dim3(grid_x, n_tokens, 1),
+                dim3(threads, 1, 1),
+                0, g_stream>>>(
+            (float *)out_ptr,
+            (const float *)down_ptr,
+            (const int32_t *)inverse_scratch,
+            n_expert_used, out_dim);
+        ok = ds4_cuda_check(cudaGetLastError(), "scatter_down scatter_sum");
+    }
+
+    cudaFree(inverse_scratch);
+    return ok;
+}
+
+/* Phase 7b MoE retile Step E-1: standalone test launcher for the
+ * gather_mid kernel.  Mirrors the C-2 launcher: transient F16 scratch
+ * + half→float conversion into the F32 parity output. */
+int ds4_cuda_test_moe_gather_mid_to_f32_tensor(
+        ds4_cuda_tensor       *out_f32,
+        const ds4_cuda_tensor *mid,
+        const ds4_cuda_tensor *permuted_indices,
+        uint32_t               pair_rows,
+        uint32_t               mid_dim,
+        uint32_t               total_routings) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (pair_rows == 0 || mid_dim == 0 || total_routings == 0) return 0;
+
+    const uint64_t mid_bytes     = (uint64_t)pair_rows * mid_dim * sizeof(float);
+    const uint64_t indices_bytes = (uint64_t)total_routings * sizeof(uint32_t);
+    const uint64_t n_elems       = (uint64_t)total_routings * mid_dim;
+    const uint64_t out_bytes     = n_elems * sizeof(float);
+
+    void *mid_ptr = NULL, *idx_ptr = NULL, *out_ptr = NULL;
+    if (!ds4_cuda_tensor_range(mid, mid_bytes, "moe_gather_mid mid", &mid_ptr) ||
+        !ds4_cuda_tensor_range(permuted_indices, indices_bytes, "moe_gather_mid indices", &idx_ptr) ||
+        !ds4_cuda_tensor_range(out_f32, out_bytes, "moe_gather_mid out", &out_ptr)) {
+        return 0;
+    }
+
+    void *scratch_f16 = NULL;
+    if (!ds4_cuda_check(cudaMalloc(&scratch_f16, (size_t)(n_elems * sizeof(__half))),
+                        "moe_gather_mid scratch alloc")) {
+        return 0;
+    }
+
+    const uint32_t threads = 256u;
+    const uint32_t grid_x  = (mid_dim + threads - 1u) / threads;
+    ds4_cuda_kernel_moe_gather_mid_to_half<<<
+            dim3(grid_x, total_routings, 1),
+            dim3(threads, 1, 1),
+            0, g_stream>>>(
+        (__half *)scratch_f16,
+        (const float *)mid_ptr,
+        (const uint32_t *)idx_ptr,
+        mid_dim, total_routings);
+    int ok = ds4_cuda_check(cudaGetLastError(), "launch moe_gather_mid");
+
+    if (ok) {
+        const uint32_t conv_blocks = (uint32_t)((n_elems + threads - 1) / threads);
+        ds4_cuda_kernel_half_to_f32<<<conv_blocks, threads, 0, g_stream>>>(
+            (float *)out_ptr, (const __half *)scratch_f16, n_elems);
+        ok = ds4_cuda_check(cudaGetLastError(), "launch half_to_f32 (moe_gather_mid test)");
     }
 
     cudaFree(scratch_f16);
