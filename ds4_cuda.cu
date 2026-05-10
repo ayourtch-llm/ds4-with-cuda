@@ -1982,6 +1982,68 @@ static __global__ void ds4_cuda_routed_moe_mid_iq2_xxs_kernel(
     }
 }
 
+/* Phase 7b MoE retile Step C-3: unpermute + clamp + SwiGLU + route fold-in.
+ *
+ * Closes the retile loop for IQ2_XXS gate/up: takes the per-expert cuBLAS
+ * outputs in expert-sorted layout and produces the canonical-pair-indexed
+ * gate/up/mid tensors the existing fused kernel writes — same math, same
+ * memory layout, just with the matmul work done by cuBLAS upstream.
+ *
+ * For each routing p:
+ *   idx     = permuted_indices[p]            (== token*n_expert_used + slot)
+ *   token   = idx / n_expert_used
+ *   slot    = idx % n_expert_used
+ *   weight  = route_weights[idx]
+ *   for r in [0, mid_dim):
+ *     g = perm_gate[p, r]; u = perm_up[p, r]
+ *     if (clamp > 1e-6): clamp g (one-sided high), clamp u (two-sided);
+ *                         matches existing routed_moe_mid_iq2_xxs_kernel.
+ *     gate[idx, r] = g
+ *     up  [idx, r] = u
+ *     mid [idx, r] = silu(g) * u * weight
+ *
+ * Rows of gate/up/mid for routings whose expert was -1 are left
+ * uninitialized — same behavior as the existing fused kernel, which early-
+ * returns on `expert < 0`.  The downstream down kernel iterates slots and
+ * skips negative experts, so it never reads those rows. */
+static __global__ void ds4_cuda_kernel_moe_unpermute_swiglu_route(
+        float          *gate_out,
+        float          *up_out,
+        float          *mid_out,
+        const float    *perm_gate,
+        const float    *perm_up,
+        const uint32_t *permuted_indices,
+        const float    *route_weights,
+        uint32_t        n_expert_used,
+        uint32_t        mid_dim,
+        uint32_t        total_routings,
+        float           clamp) {
+    const uint32_t p = blockIdx.y;
+    if (p >= total_routings) return;
+    const uint32_t idx   = permuted_indices[p];
+    const uint32_t token = idx / n_expert_used;
+    const uint32_t slot  = idx - token * n_expert_used;
+    const float    w     = route_weights[(uint64_t)token * n_expert_used + slot];
+    const uint64_t in_off  = (uint64_t)p   * mid_dim;
+    const uint64_t out_off = (uint64_t)idx * mid_dim;
+    const bool clamp_active = (clamp > 1.0e-6f);
+
+    for (uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+         r < mid_dim;
+         r += gridDim.x * blockDim.x) {
+        float g = perm_gate[in_off + r];
+        float u = perm_up  [in_off + r];
+        if (clamp_active) {
+            if (g > clamp) g = clamp;
+            if (u > clamp) u = clamp;
+            if (u < -clamp) u = -clamp;
+        }
+        gate_out[out_off + r] = g;
+        up_out  [out_off + r] = u;
+        mid_out [out_off + r] = ds4_cuda_silu_f32(g) * u * w;
+    }
+}
+
 /* Phase 3b-3 retile: one warp per output row.  Inner Q2_K dot parallelised
  * across the 32 lanes via ds4_cuda_warp_vec_dot_q2_K_q8_K (integer reductions
  * → bit-exact).  The outer loop over n_expert slots stays serial in lock-step
@@ -3227,6 +3289,58 @@ int ds4_cuda_test_moe_gather_act_to_f32_tensor(
 
     cudaFree(scratch_f16);
     return ok;
+}
+
+/* Phase 7b MoE retile Step C-3: standalone test launcher for the
+ * unpermute + clamp + SwiGLU + route kernel.  Drives the production kernel
+ * directly; no scratch allocation needed. */
+int ds4_cuda_test_moe_unpermute_swiglu_route_tensor(
+        ds4_cuda_tensor       *gate_out,
+        ds4_cuda_tensor       *up_out,
+        ds4_cuda_tensor       *mid_out,
+        const ds4_cuda_tensor *perm_gate,
+        const ds4_cuda_tensor *perm_up,
+        const ds4_cuda_tensor *permuted_indices,
+        const ds4_cuda_tensor *route_weights,
+        uint32_t               n_tokens,
+        uint32_t               n_expert_used,
+        uint32_t               mid_dim,
+        uint32_t               total_routings,
+        float                  clamp) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (n_tokens == 0 || n_expert_used == 0 || mid_dim == 0 || total_routings == 0) return 0;
+
+    const uint64_t pair_rows  = (uint64_t)n_tokens * n_expert_used;
+    const uint64_t out_bytes  = pair_rows * mid_dim * sizeof(float);
+    const uint64_t perm_bytes = (uint64_t)total_routings * mid_dim * sizeof(float);
+    const uint64_t idx_bytes  = (uint64_t)total_routings * sizeof(uint32_t);
+    const uint64_t rw_bytes   = pair_rows * sizeof(float);
+
+    void *gate_ptr = NULL, *up_ptr = NULL, *mid_ptr = NULL;
+    void *pg_ptr   = NULL, *pu_ptr = NULL, *idx_ptr = NULL, *rw_ptr = NULL;
+    if (!ds4_cuda_tensor_range(gate_out, out_bytes, "moe_unperm gate_out", &gate_ptr) ||
+        !ds4_cuda_tensor_range(up_out, out_bytes, "moe_unperm up_out", &up_ptr) ||
+        !ds4_cuda_tensor_range(mid_out, out_bytes, "moe_unperm mid_out", &mid_ptr) ||
+        !ds4_cuda_tensor_range(perm_gate, perm_bytes, "moe_unperm perm_gate", &pg_ptr) ||
+        !ds4_cuda_tensor_range(perm_up, perm_bytes, "moe_unperm perm_up", &pu_ptr) ||
+        !ds4_cuda_tensor_range(permuted_indices, idx_bytes, "moe_unperm permuted_indices", &idx_ptr) ||
+        !ds4_cuda_tensor_range(route_weights, rw_bytes, "moe_unperm route_weights", &rw_ptr)) {
+        return 0;
+    }
+
+    const uint32_t threads = 256u;
+    const uint32_t grid_x  = (mid_dim + threads - 1u) / threads;
+    ds4_cuda_kernel_moe_unpermute_swiglu_route<<<
+            dim3(grid_x, total_routings, 1),
+            dim3(threads, 1, 1),
+            0, g_stream>>>(
+        (float *)gate_ptr, (float *)up_ptr, (float *)mid_ptr,
+        (const float *)pg_ptr, (const float *)pu_ptr,
+        (const uint32_t *)idx_ptr,
+        (const float *)rw_ptr,
+        n_expert_used, mid_dim, total_routings, clamp);
+    return ds4_cuda_check(cudaGetLastError(), "launch moe_unpermute_swiglu_route");
 }
 
 #define DS4_CUDA_STUB(fn, args) \

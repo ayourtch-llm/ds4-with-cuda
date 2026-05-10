@@ -124,6 +124,19 @@ int ds4_cuda_test_moe_gather_act_to_f32_tensor(
         uint32_t               in_dim,
         uint32_t               n_expert_used,
         uint32_t               total_routings);
+int ds4_cuda_test_moe_unpermute_swiglu_route_tensor(
+        ds4_cuda_tensor       *gate_out,
+        ds4_cuda_tensor       *up_out,
+        ds4_cuda_tensor       *mid_out,
+        const ds4_cuda_tensor *perm_gate,
+        const ds4_cuda_tensor *perm_up,
+        const ds4_cuda_tensor *permuted_indices,
+        const ds4_cuda_tensor *route_weights,
+        uint32_t               n_tokens,
+        uint32_t               n_expert_used,
+        uint32_t               mid_dim,
+        uint32_t               total_routings,
+        float                  clamp);
 
 typedef struct {
     uint8_t  scales[16];
@@ -1736,6 +1749,164 @@ DS4_CUDA_PARITY_TEST(moe_gather_act_to_f32,
     .cpu_fn  = moe_gather_cpu,
     .cuda_fn = moe_gather_cuda,
     .cfg = (void *)&moe_gather_cfg_v);
+
+/* Phase 7b MoE retile Step C-3: unpermute + clamp + SwiGLU + route kernel
+ * parity test.
+ *
+ * Harness `in[]` provides perm_gate (first half) and perm_up (second half);
+ * permuted_indices and route_weights are deterministically generated from
+ * a per-cfg seed.  Output buffer packs three pair_rows × mid_dim tensors
+ * sequentially: [gate_out, up_out, mid_out].  gate_out / up_out are pure
+ * elementwise clamp (bit-exact); mid_out depends on silu(g) and three FP
+ * multiplies, so a small ULP cushion (16) covers the libm-vs-libdevice
+ * expf gap that the existing unary_silu test sees at ulp=4 on smaller
+ * input ranges, plus the multiply chain.
+ *
+ * Test shape: n_tokens=4, n_expert_used=6, mid_dim=128, total_routings=12.
+ * pair_rows = 24 → 24 × 128 = 3072 floats per output buffer × 3 = 9216
+ * out_elems.  Clamp=0.5 exercises the clamp branch on harness inputs which
+ * are uniform in [-1, 1).  Routings only target a subset of pair_rows; the
+ * untouched rows of gate/up/mid stay calloc-zeroed on both sides for a
+ * matching comparison. */
+struct moe_unpermute_cfg {
+    uint32_t  n_tokens;
+    uint32_t  n_expert_used;
+    uint32_t  mid_dim;
+    uint32_t  total_routings;
+    float     clamp;
+    uint64_t  seed;
+    uint32_t *permuted_indices;
+    float    *route_weights;
+    int       initialized;
+};
+
+static void moe_unpermute_fill(struct moe_unpermute_cfg *c) {
+    if (c->initialized) return;
+    const uint32_t flat_max = c->n_tokens * c->n_expert_used;
+    c->permuted_indices = (uint32_t *)malloc((size_t)c->total_routings * sizeof(uint32_t));
+    c->route_weights    = (float    *)malloc((size_t)flat_max * sizeof(float));
+    if (!c->permuted_indices || !c->route_weights) return;
+    uint64_t s = c->seed;
+    /* Permuted indices target a random subset of (token, slot) pairs; we
+     * accept duplicates because nothing in the kernel forbids them — the
+     * production C-1 layout never produces dupes, but C-3 doesn't depend on
+     * uniqueness. */
+    for (uint32_t i = 0; i < c->total_routings; i++) {
+        c->permuted_indices[i] = test_rng_u32(&s) % flat_max;
+    }
+    /* Route weights ∈ [0, 1).  Production weights are normalized after
+     * router top-k; magnitude doesn't affect parity, only deterministic
+     * agreement between sides. */
+    for (uint32_t i = 0; i < flat_max; i++) {
+        c->route_weights[i] = (float)(test_rng_u32(&s) >> 8) / (float)(1u << 24);
+    }
+    c->initialized = 1;
+}
+
+static int moe_unpermute_cpu(const float *in, float *out, void *cfg) {
+    struct moe_unpermute_cfg *c = cfg;
+    moe_unpermute_fill(c);
+    if (!c->initialized) return 0;
+    const uint64_t pair_rows = (uint64_t)c->n_tokens * c->n_expert_used;
+    const uint64_t out_elems_each = pair_rows * c->mid_dim;
+    const float *perm_gate = in;
+    const float *perm_up   = in + (uint64_t)c->total_routings * c->mid_dim;
+    float *gate_out = out + 0u * out_elems_each;
+    float *up_out   = out + 1u * out_elems_each;
+    float *mid_out  = out + 2u * out_elems_each;
+    /* calloc was done by the harness (cpu_out is calloc'd); we still need to
+     * zero the gate/up/mid regions because the harness clears them once.
+     * Since `out` is the harness's pre-cleared cpu_out, zero already; just
+     * write into rows the kernel touches. */
+    ds4_test_moe_unpermute_swiglu_route(
+        gate_out, up_out, mid_out,
+        perm_gate, perm_up,
+        c->permuted_indices, c->route_weights,
+        c->n_expert_used, c->mid_dim, c->total_routings, c->clamp);
+    return 1;
+}
+
+static int moe_unpermute_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                              size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    struct moe_unpermute_cfg *c = cfg;
+    moe_unpermute_fill(c);
+    if (!c->initialized) return 0;
+    const uint64_t pair_rows = (uint64_t)c->n_tokens * c->n_expert_used;
+    const uint64_t out_each_bytes = pair_rows * c->mid_dim * sizeof(float);
+    const uint64_t perm_bytes = (uint64_t)c->total_routings * c->mid_dim * sizeof(float);
+    const uint64_t idx_bytes  = (uint64_t)c->total_routings * sizeof(uint32_t);
+    const uint64_t rw_bytes   = pair_rows * sizeof(float);
+
+    ds4_cuda_tensor *pg = ds4_cuda_tensor_alloc(perm_bytes);
+    ds4_cuda_tensor *pu = ds4_cuda_tensor_alloc(perm_bytes);
+    ds4_cuda_tensor *idx = ds4_cuda_tensor_alloc(idx_bytes);
+    ds4_cuda_tensor *rw = ds4_cuda_tensor_alloc(rw_bytes);
+    ds4_cuda_tensor *go = ds4_cuda_tensor_alloc(out_each_bytes);
+    ds4_cuda_tensor *uo = ds4_cuda_tensor_alloc(out_each_bytes);
+    ds4_cuda_tensor *mo = ds4_cuda_tensor_alloc(out_each_bytes);
+    if (!pg || !pu || !idx || !rw || !go || !uo || !mo) {
+        ds4_cuda_tensor_free(pg); ds4_cuda_tensor_free(pu);
+        ds4_cuda_tensor_free(idx); ds4_cuda_tensor_free(rw);
+        ds4_cuda_tensor_free(go); ds4_cuda_tensor_free(uo); ds4_cuda_tensor_free(mo);
+        return 0;
+    }
+
+    /* Zero gate/up/mid output tensors so the unmodified rows match cpu's
+     * calloc-zero baseline. */
+    float *zero_buf = (float *)calloc((size_t)pair_rows * c->mid_dim, sizeof(float));
+    int ok = (zero_buf != NULL);
+    if (ok) ok = ds4_cuda_tensor_write(go, 0, zero_buf, out_each_bytes);
+    if (ok) ok = ds4_cuda_tensor_write(uo, 0, zero_buf, out_each_bytes);
+    if (ok) ok = ds4_cuda_tensor_write(mo, 0, zero_buf, out_each_bytes);
+    free(zero_buf);
+    if (ok) ok = ds4_cuda_tensor_write(pg, 0, in, perm_bytes);
+    if (ok) ok = ds4_cuda_tensor_write(pu, 0, in + (uint64_t)c->total_routings * c->mid_dim, perm_bytes);
+    if (ok) ok = ds4_cuda_tensor_write(idx, 0, c->permuted_indices, idx_bytes);
+    if (ok) ok = ds4_cuda_tensor_write(rw, 0, c->route_weights, rw_bytes);
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_test_moe_unpermute_swiglu_route_tensor(
+        go, uo, mo, pg, pu, idx, rw,
+        c->n_tokens, c->n_expert_used, c->mid_dim, c->total_routings, c->clamp);
+    if (ok) ok = ds4_cuda_end_commands();
+
+    /* Pack [go, uo, mo] back into out_dev. */
+    if (ok) {
+        float *packed = (float *)malloc((size_t)pair_rows * c->mid_dim * 3u * sizeof(float));
+        if (!packed) ok = 0;
+        else {
+            ok = ds4_cuda_tensor_read(go, 0, packed + 0u * pair_rows * c->mid_dim, out_each_bytes);
+            if (ok) ok = ds4_cuda_tensor_read(uo, 0, packed + 1u * pair_rows * c->mid_dim, out_each_bytes);
+            if (ok) ok = ds4_cuda_tensor_read(mo, 0, packed + 2u * pair_rows * c->mid_dim, out_each_bytes);
+            if (ok) ok = ds4_cuda_tensor_write(out_dev, 0, packed,
+                                               (uint64_t)pair_rows * c->mid_dim * 3u * sizeof(float));
+            free(packed);
+        }
+    }
+
+    ds4_cuda_tensor_free(pg); ds4_cuda_tensor_free(pu);
+    ds4_cuda_tensor_free(idx); ds4_cuda_tensor_free(rw);
+    ds4_cuda_tensor_free(go); ds4_cuda_tensor_free(uo); ds4_cuda_tensor_free(mo);
+    return ok;
+}
+
+static struct moe_unpermute_cfg moe_unpermute_cfg_v = {
+    .n_tokens       = 4,
+    .n_expert_used  = 6,
+    .mid_dim        = 128,
+    .total_routings = 12,
+    .clamp          = 0.5f,
+    .seed           = 0xD3C5033ull,
+};
+
+DS4_CUDA_PARITY_TEST(moe_unpermute_swiglu_route,
+    .seed = 0xD3C503,
+    .in_elems  = 12u * 128u * 2u,
+    .out_elems = 4u * 6u * 128u * 3u,
+    .ulp_tolerance = 16,
+    .cpu_fn  = moe_unpermute_cpu,
+    .cuda_fn = moe_unpermute_cuda,
+    .cfg = (void *)&moe_unpermute_cfg_v);
 
 /* ---------------------------------------------------------------------------
  * flash_attn — Phase 1 m3.  Raw sliding-window attention with sinks.
@@ -6243,6 +6414,7 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_dequant_q2_K_to_f32,
     &ds4_cuda_parity_moe_layout,
     &ds4_cuda_parity_moe_gather_act_to_f32,
+    &ds4_cuda_parity_moe_unpermute_swiglu_route,
     &ds4_cuda_parity_flash_attn,
     &ds4_cuda_parity_router_select_batch,
     &ds4_cuda_parity_routed_moe_batch,

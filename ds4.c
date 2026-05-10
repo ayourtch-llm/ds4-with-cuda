@@ -2957,6 +2957,50 @@ void ds4_test_moe_gather_act_to_f32(
     }
 }
 
+/* Phase 7b MoE retile Step C-3: CPU oracle for the unpermute + clamp +
+ * SwiGLU + route kernel.  Mirrors the math of the existing fused kernel
+ * (ds4_cuda_routed_moe_mid_iq2_xxs_kernel) one-to-one, just with the matmul
+ * inputs already done (perm_gate / perm_up are the per-routing dot
+ * results).  silu() is the existing CPU helper; the GPU's silu uses libm-
+ * style expf so a few ULPs of drift are expected vs this oracle. */
+void ds4_test_moe_unpermute_swiglu_route(
+        float          *gate_out,
+        float          *up_out,
+        float          *mid_out,
+        const float    *perm_gate,
+        const float    *perm_up,
+        const uint32_t *permuted_indices,
+        const float    *route_weights,
+        uint32_t        n_expert_used,
+        uint32_t        mid_dim,
+        uint32_t        total_routings,
+        float           clamp) {
+    const int clamp_active = (clamp > 1.0e-6f);
+    for (uint32_t p = 0; p < total_routings; p++) {
+        const uint32_t idx   = permuted_indices[p];
+        const uint32_t token = idx / n_expert_used;
+        const uint32_t slot  = idx - token * n_expert_used;
+        const float w = route_weights[(uint64_t)token * n_expert_used + slot];
+        const float *pg = perm_gate + (uint64_t)p * mid_dim;
+        const float *pu = perm_up   + (uint64_t)p * mid_dim;
+        float *go = gate_out + (uint64_t)idx * mid_dim;
+        float *uo = up_out   + (uint64_t)idx * mid_dim;
+        float *mo = mid_out  + (uint64_t)idx * mid_dim;
+        for (uint32_t r = 0; r < mid_dim; r++) {
+            float g = pg[r];
+            float u = pu[r];
+            if (clamp_active) {
+                if (g > clamp) g = clamp;
+                if (u > clamp) u = clamp;
+                if (u < -clamp) u = -clamp;
+            }
+            go[r] = g;
+            uo[r] = u;
+            mo[r] = silu(g) * u * w;
+        }
+    }
+}
+
 void ds4_test_dense_iq2_xxs_pair_matvec(
         float      *out0,
         float      *out1,
