@@ -11350,6 +11350,225 @@ int ds4_cuda_compressor_prefill_ratio4_replay_tensor(
     return 1;
 }
 
+/* Forward declaration — defined in the Chunk 2 block below. */
+static float ds4_cuda_e4m3_to_float(__nv_fp8_storage_t s);
+
+/* FP8 MoE retile Phase 0 — Chunk 3: IQ2_XXS → E4M3 dequant kernel + amax.
+ *
+ * ds4_cuda_kernel_iq2_xxs_amax: reads block scales from the IQ2_XXS packed
+ *   format without full dequant.  Per-block amax ≤ 0.125 * |d| * max_ls * 43
+ *   where 43 is the max byte in iq2xxs_grid (empirically confirmed) and max_ls
+ *   is the actual per-block max sub-block scale factor.
+ *
+ * ds4_cuda_kernel_dequant_iq2_xxs_to_e4m3_fast: port of _to_half_fast.
+ *   Body unchanged except __float2half(value) →
+ *   __nv_cvt_float_to_fp8(value / inv_scale, __NV_SATFINITE, __NV_E4M3).
+ *   Packs 8 FP8 bytes per lane into a uint64_t for one coalesced store.
+ */
+
+/* IQ2_XXS grid constant: max byte in iq2xxs_grid table = 43 = 0x2b */
+#define DS4_IQ2XXS_GRID_MAX_BYTE 43u
+
+/* Per-tensor amax helper.  One thread per IQ2_XXS block; reads the 8
+ * sub-block aux1 words to get each sub-block's ls, takes the per-block max,
+ * then reduces globally via shared memory + atomicMax.
+ * Caller must zero *amax_out before launch. */
+__global__ static void ds4_cuda_kernel_iq2_xxs_amax(
+        float                        *amax_out,
+        const ds4_cuda_block_iq2_xxs *weights,
+        uint64_t                      n_blocks)
+{
+    extern __shared__ float sdata[];
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    float local_max = 0.0f;
+    while (idx < n_blocks) {
+        const ds4_cuda_block_iq2_xxs *b = weights + idx;
+        const float d = fabsf(__half2float(__ushort_as_half(b->d)));
+        /* Find max ls across all 8 sub-blocks. */
+        uint32_t max_ls = 0u;
+        for (uint32_t ib32 = 0u; ib32 < 8u; ib32++) {
+            const uint16_t *q2 = b->qs + ib32 * 4u;
+            const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+            const uint32_t ls = 2u * (aux1 >> 28) + 1u;
+            if (ls > max_ls) max_ls = ls;
+        }
+        /* max |element| ≤ 0.125 * |d| * max_ls * max_grid_byte */
+        float block_amax = 0.125f * d * (float)max_ls * (float)DS4_IQ2XXS_GRID_MAX_BYTE;
+        if (block_amax > local_max) local_max = block_amax;
+        idx += (uint64_t)gridDim.x * blockDim.x;
+    }
+    uint32_t tid = threadIdx.x;
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (uint32_t s = blockDim.x >> 1; s > 0u; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    if (tid == 0) atomicMax((int *)amax_out, __float_as_int(sdata[0]));
+}
+
+/* IQ2_XXS → E4M3 dequant: port of ds4_cuda_kernel_dequant_iq2_xxs_to_half_fast.
+ * Identical body except the output type and the final cast.
+ * inv_scale = amax / 448 (precomputed by caller via ds4_cuda_kernel_iq2_xxs_amax).
+ * Packs 8 FP8 bytes per lane into a uint64_t for a single coalesced store. */
+__global__ static void ds4_cuda_kernel_dequant_iq2_xxs_to_e4m3_fast(
+        __nv_fp8_storage_t           *out_e4m3,
+        const ds4_cuda_block_iq2_xxs *weights,
+        uint32_t                      in_dim,
+        uint32_t                      out_dim,
+        float                         inv_scale)
+{
+    const uint32_t block_id = blockIdx.x;
+    const uint32_t row      = blockIdx.y;
+    const uint32_t blocks_per_row = in_dim / 256u;
+    if (block_id >= blocks_per_row || row >= out_dim) return;
+
+    const uint32_t lane = threadIdx.x;
+    const uint32_t ib32 = lane >> 2;
+    const uint32_t l    = lane & 3u;
+
+    const ds4_cuda_block_iq2_xxs *block =
+        weights + (uint64_t)row * blocks_per_row + block_id;
+
+    const float d = __half2float(__ushort_as_half(block->d));
+
+    const uint16_t *q2 = block->qs + ib32 * 4u;
+    const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+    const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+    const uint8_t *aux8 = (const uint8_t *)&aux0;
+
+    const uint32_t ls       = 2u * (aux1 >> 28) + 1u;
+    const uint8_t  grid_idx = aux8[l];
+    const uint32_t sign_idx = (aux1 >> (7u * l)) & 127u;
+    const uint8_t *grid     = (const uint8_t *)(iq2xxs_grid + grid_idx);
+    const uint8_t  signs    = ksigns_iq2xs[sign_idx];
+
+    const float scale    = 0.125f * d * (float)ls;
+    /* fp8_scale = 1 / inv_scale = 448 / amax; multiply value by this to
+     * map the dequanted float into the E4M3 representable range [-448,448]. */
+    const float fp8_scale = (inv_scale > 0.0f) ? (1.0f / inv_scale) : 1.0f;
+
+    /* Pack 8 FP8 bytes into a uint64_t, then issue one 8-byte store per lane
+     * (32 lanes × 8 bytes = 256 contiguous bytes / warp). */
+    uint64_t pkt = 0u;
+    #pragma unroll
+    for (uint32_t k = 0u; k < 8u; k++) {
+        const int32_t v = (signs & kmask_iq2xs[k])
+                              ? -(int32_t)grid[k]
+                              : (int32_t)grid[k];
+        __nv_fp8_storage_t b_fp8 = __nv_cvt_float_to_fp8(
+            scale * (float)v * fp8_scale, __NV_SATFINITE, __NV_E4M3);
+        pkt |= ((uint64_t)(uint8_t)b_fp8) << (k * 8u);
+    }
+
+    uint64_t *out_ptr = reinterpret_cast<uint64_t *>(
+        out_e4m3 + (uint64_t)row * in_dim
+                 + (uint64_t)block_id * 256u
+                 + ib32 * 32u
+                 + l * 8u);
+    *out_ptr = pkt;
+}
+
+/* Standalone test: dequant via F16 path AND E4M3 path, compare within
+ * tolerance.  host_blocks is a host pointer to n_blocks IQ2_XXS blocks.
+ * Requires g_initialized; does NOT require g_batch_open.
+ * Returns 1 on pass, 0 on failure. */
+int ds4_cuda_test_iq2_xxs_to_e4m3(const void *host_blocks, uint64_t n_blocks,
+                                   float tolerance) {
+    if (!g_initialized) return 0;
+    if (n_blocks == 0) return 1;
+
+    /* Treat as 1 row of n_blocks blocks: out_dim=1, in_dim=n_blocks*256. */
+    const uint32_t out_dim = 1u;
+    const uint32_t in_dim  = (uint32_t)(n_blocks * 256u);
+    const uint64_t n_elems = (uint64_t)n_blocks * 256u;
+    const uint64_t blk_bytes = n_blocks * sizeof(ds4_cuda_block_iq2_xxs);
+
+    ds4_cuda_block_iq2_xxs *d_w     = NULL;
+    __half                  *d_f16   = NULL;
+    __nv_fp8_storage_t      *d_e4m3  = NULL;
+    float                   *d_amax  = NULL;
+    int ok = 1;
+
+    ok = ok && ds4_cuda_check(cudaMalloc((void **)&d_w,    blk_bytes),                "iq2_to_e4m3 d_w");
+    ok = ok && ds4_cuda_check(cudaMalloc((void **)&d_f16,  n_elems * sizeof(__half)), "iq2_to_e4m3 d_f16");
+    ok = ok && ds4_cuda_check(cudaMalloc((void **)&d_e4m3, n_elems),                  "iq2_to_e4m3 d_e4m3");
+    ok = ok && ds4_cuda_check(cudaMalloc((void **)&d_amax, sizeof(float)),             "iq2_to_e4m3 d_amax");
+
+    if (ok) ok = ds4_cuda_check(cudaMemcpyAsync(d_w, host_blocks, blk_bytes,
+                                                cudaMemcpyHostToDevice, g_stream), "iq2_to_e4m3 H2D");
+    if (ok) ok = ds4_cuda_check(cudaMemsetAsync(d_amax, 0, sizeof(float), g_stream), "iq2_to_e4m3 amax zero");
+
+    /* F16 dequant (reference path). */
+    if (ok) {
+        ds4_cuda_kernel_dequant_iq2_xxs_to_half_fast<<<
+            dim3((uint32_t)n_blocks, out_dim, 1u), dim3(32u, 1u, 1u), 0, g_stream>>>(
+            d_f16, d_w, in_dim, out_dim);
+        ok = ds4_cuda_check(cudaGetLastError(), "iq2_to_e4m3 f16 kernel");
+    }
+
+    /* Amax from block scales. */
+    if (ok) {
+        const uint32_t threads = 256u;
+        const uint32_t blocks  = (uint32_t)((n_blocks + threads - 1u) / threads);
+        ds4_cuda_kernel_iq2_xxs_amax<<<blocks, threads, threads * sizeof(float), g_stream>>>(
+            d_amax, d_w, n_blocks);
+        ok = ds4_cuda_check(cudaGetLastError(), "iq2_to_e4m3 amax kernel");
+    }
+    if (ok) ok = ds4_cuda_check(cudaStreamSynchronize(g_stream), "iq2_to_e4m3 amax sync");
+
+    float h_amax = 0.0f;
+    if (ok) ok = ds4_cuda_check(cudaMemcpy(&h_amax, d_amax, sizeof(float),
+                                           cudaMemcpyDeviceToHost), "iq2_to_e4m3 amax D2H");
+    const float inv_scale = (h_amax > 0.0f) ? (h_amax / 448.0f) : 1.0f;
+
+    /* E4M3 dequant. */
+    if (ok) {
+        ds4_cuda_kernel_dequant_iq2_xxs_to_e4m3_fast<<<
+            dim3((uint32_t)n_blocks, out_dim, 1u), dim3(32u, 1u, 1u), 0, g_stream>>>(
+            d_e4m3, d_w, in_dim, out_dim, inv_scale);
+        ok = ds4_cuda_check(cudaGetLastError(), "iq2_to_e4m3 e4m3 kernel");
+    }
+    if (ok) ok = ds4_cuda_check(cudaStreamSynchronize(g_stream), "iq2_to_e4m3 e4m3 sync");
+
+    /* Read back both output arrays and compare. */
+    __half             *h_f16  = NULL;
+    __nv_fp8_storage_t *h_e4m3 = NULL;
+    if (ok) {
+        h_f16  = (__half *)malloc(n_elems * sizeof(__half));
+        h_e4m3 = (__nv_fp8_storage_t *)malloc(n_elems);
+        ok = (h_f16 && h_e4m3);
+    }
+    if (ok) {
+        ok = ds4_cuda_check(cudaMemcpy(h_f16,  d_f16,  n_elems * sizeof(__half), cudaMemcpyDeviceToHost), "iq2_to_e4m3 f16 D2H");
+        ok = ok && ds4_cuda_check(cudaMemcpy(h_e4m3, d_e4m3, n_elems,             cudaMemcpyDeviceToHost), "iq2_to_e4m3 e4m3 D2H");
+    }
+    if (ok) {
+        for (uint64_t i = 0; i < n_elems && ok; i++) {
+            float ref = __half2float(h_f16[i]);
+            if (fabsf(ref) < 1e-6f) continue;
+            float dq  = ds4_cuda_e4m3_to_float(h_e4m3[i]) * inv_scale;
+            float err = fabsf(dq - ref);
+            if (err > tolerance * fabsf(ref)) {
+                fprintf(stderr,
+                        "ds4_cuda_test_iq2_xxs_to_e4m3: FAIL at %llu: f16=%.6g e4m3_dq=%.6g "
+                        "err=%.3g tol=%.3g inv_scale=%.6g\n",
+                        (unsigned long long)i, (double)ref, (double)dq,
+                        (double)err, (double)(tolerance * fabsf(ref)), (double)inv_scale);
+                ok = 0;
+            }
+        }
+    }
+
+    free(h_f16);
+    free(h_e4m3);
+    if (d_w)    cudaFree(d_w);
+    if (d_f16)  cudaFree(d_f16);
+    if (d_e4m3) cudaFree(d_e4m3);
+    if (d_amax) cudaFree(d_amax);
+    return ok;
+}
+
 /* FP8 MoE retile Phase 0 — Chunk 2: F32 → E4M3 cast with amax.
  *
  * Two-kernel approach (per brief): first kernel reduces to amax, second kernel

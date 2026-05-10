@@ -119,6 +119,8 @@ int ds4_cuda_test_dequant_q2_K_to_f32_fast_tensor(
         uint32_t               in_dim,
         uint32_t               out_dim);
 int ds4_cuda_test_f32_to_e4m3(const float *host_in, uint32_t N, float tolerance);
+int ds4_cuda_test_iq2_xxs_to_e4m3(const void *host_blocks, uint64_t n_blocks,
+                                   float tolerance);
 int ds4_cuda_test_moe_layout_tensor(
         ds4_cuda_tensor       *expert_count,
         ds4_cuda_tensor       *expert_offset,
@@ -1642,6 +1644,46 @@ DS4_CUDA_PARITY_TEST(f32_to_e4m3_roundtrip,
     .cpu_fn = f32_to_e4m3_cpu,
     .cuda_fn = f32_to_e4m3_cuda,
     .cfg = NULL);
+
+/* FP8 MoE retile Phase 0 — Chunk 3: IQ2_XXS → E4M3 dequant parity test.
+ *
+ * Reuses dequant_iq2_xxs_cfg (in_dim=4096, out_dim=64) to generate weight
+ * blocks.  cpu_fn: identity.  cuda_fn: calls the standalone
+ * ds4_cuda_test_iq2_xxs_to_e4m3 (F16 vs E4M3 comparison within tolerance),
+ * then writes identity to output so the ULP comparison passes.
+ * The actual correctness gate is the F16-vs-E4M3 check inside the launcher. */
+static int iq2_xxs_to_e4m3_cpu(const float *in, float *out, void *cfg) {
+    (void)cfg;
+    memcpy(out, in, 4096 * sizeof(float));
+    return 1;
+}
+
+static int iq2_xxs_to_e4m3_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                  size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems;
+    struct dense_cfg *c = (struct dense_cfg *)cfg;
+    dense_fill_iq2_xxs_one(c);
+    if (!c->initialized) return 0;
+    const size_t n_blocks = (size_t)c->out_dim * (c->in_dim / 256u);
+    /* E4M3 worst-case rel error = 6.25%; use 8% for headroom. */
+    if (!ds4_cuda_test_iq2_xxs_to_e4m3(c->weights0, (uint64_t)n_blocks, 0.08f)) return 0;
+    /* Write identity to parity output so ULP comparison passes. */
+    float *out_ptr = (float *)ds4_cuda_tensor_contents(out_dev);
+    if (!out_ptr) return 0;
+    memcpy(out_ptr, in, out_elems * sizeof(float));
+    return 1;
+}
+
+static struct dense_cfg dequant_iq2_xxs_e4m3_cfg = { .in_dim = 4096, .out_dim = 64 };
+
+DS4_CUDA_PARITY_TEST(iq2_xxs_to_e4m3,
+    .seed = 0xE43A9020,
+    .in_elems = 4096,
+    .out_elems = 4096,
+    .ulp_tolerance = 0,
+    .cpu_fn = iq2_xxs_to_e4m3_cpu,
+    .cuda_fn = iq2_xxs_to_e4m3_cuda,
+    .cfg = (void *)&dequant_iq2_xxs_e4m3_cfg);
 
 /* Phase 7b MoE retile Step C-1: routing-layout kernel parity test.
  *
@@ -6836,6 +6878,7 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_dequant_q2_K_to_f32,
     &ds4_cuda_parity_dequant_q2_K_to_f32_fast,
     &ds4_cuda_parity_f32_to_e4m3_roundtrip,
+    &ds4_cuda_parity_iq2_xxs_to_e4m3,
     &ds4_cuda_parity_moe_layout,
     &ds4_cuda_parity_moe_gather_act_to_f32,
     &ds4_cuda_parity_moe_unpermute_swiglu_route,
