@@ -765,6 +765,24 @@ int ds4_cuda_attention_prefill_static_mixed_fa2_heads_tensor(
         uint32_t               n_head,
         uint32_t               head_dim);
 
+/* Phase 8 Stage 2 — Q-tile variant: Q_TILE=4 Q-tokens per block share one
+ * K-row load, reducing K DRAM traffic ~4×.  Env-gated via DS4_CUDA_FA2_QTILE=1
+ * inside fa2_heads_tensor; also callable directly for testing. */
+int ds4_cuda_attention_prefill_static_mixed_fa2_qtile_heads_tensor(
+        ds4_cuda_tensor       *heads,
+        const void            *model_map,
+        uint64_t               model_size,
+        uint64_t               sinks_offset,
+        const ds4_cuda_tensor *q,
+        const ds4_cuda_tensor *raw_kv,
+        const ds4_cuda_tensor *comp_kv,
+        uint32_t               n_tokens,
+        uint32_t               n_comp,
+        uint32_t               window,
+        uint32_t               ratio,
+        uint32_t               n_head,
+        uint32_t               head_dim);
+
 int ds4_cuda_attention_prefill_masked_mixed_heads_tensor(
         ds4_cuda_tensor       *heads,
         const void            *model_map,
