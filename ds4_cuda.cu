@@ -2344,11 +2344,49 @@ static __global__ void ds4_cuda_routed_moe_mid_iq2_xxs_kernel(
     }
 }
 
-/* IQ2_XXS dot product against pre-quantized Q8_K activation in shared memory.
+/* Simplified Q8_0-style quantization for 256-element blocks.
+ * Produces int8 qs and a single float d scale per 256 elements.
+ * Much simpler than Q8_K (no bsums, no sign-dependent iscale).
+ * Used by the IQ2_XXS smem path which doesn't need bsums. */
+static __device__ __forceinline__ void ds4_cuda_warp_quantize_q8_0_256(
+        const float *x_block,    /* 256 fp32 activations */
+        uint32_t     lane,
+        int8_t      *smem_qs,    /* output: 256 int8 values */
+        float       *block_d) {  /* output: per-block scale */
+    const uint32_t mask = 0xffffffffu;
+
+    /* Each lane owns 8 elements at step*32+lane. */
+    float amax = 0.0f;
+    for (uint32_t step = 0; step < 8u; step++) {
+        const float v = x_block[step * 32u + lane];
+        amax = fmaxf(amax, fabsf(v));
+    }
+    /* Warp reduce amax. */
+    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, 16));
+    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, 8));
+    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, 4));
+    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, 2));
+    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, 1));
+
+    const float d  = amax / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+
+    /* Quantize and write to smem. */
+    for (uint32_t step = 0; step < 8u; step++) {
+        const float x_i = x_block[step * 32u + lane];
+        int32_t qv = (int32_t)lrintf(x_i * id);
+        if (qv > 127)  qv = 127;
+        if (qv < -128) qv = -128;
+        smem_qs[step * 32u + lane] = (int8_t)qv;
+    }
+
+    if (lane == 0) *block_d = d;
+}
+
+/* IQ2_XXS dot product against pre-quantized Q8_0 activation in shared memory.
  * Reads int8 qs from smem_qs[blk*256 + idx] and float d from smem_d[blk].
- * Identical math to warp_vec_dot_iq2_xxs_q8_K but operates on the flat
- * shared-memory layout instead of ds4_cuda_block_q8_K structs. */
-static __device__ __forceinline__ float ds4_cuda_warp_dot_iq2_xxs_q8_K_smem(
+ * Simpler than Q8_K variant: no bsums, no sign-dependent iscale. */
+static __device__ __forceinline__ float ds4_cuda_warp_dot_iq2_xxs_q8_0_smem(
         const ds4_cuda_block_iq2_xxs *x,
         const float                   *smem_d,
         const int8_t                  *smem_qs,
@@ -2395,13 +2433,13 @@ static __device__ __forceinline__ float ds4_cuda_warp_dot_iq2_xxs_q8_K_smem(
     return 0.125f * sumf;
 }
 
-/* MoE mid kernel with shared-memory quantization cache.
+/* MoE mid kernel with shared-memory Q8_0 quantization cache.
  *
  * Same grid/block as the original kernel, but quantizes the activation
- * once per block into shared memory, then reuses the cached Q8_K for both
- * the gate and up dot products.  This eliminates the redundant second
- * quantization (the original kernel quantizes the same activation twice
- * per block — once for gate, once for up).
+ * once per block into shared memory using simple Q8_0 (no bsums), then
+ * reuses the cached int8 for both the gate and up dot products.
+ * This eliminates the redundant second quantization and uses a simpler,
+ * faster quantization than Q8_K.
  *
  * Shared memory: xq_blocks x (256 int8 + 4 float d) per block.
  * For production: 16 x 260 = 4160 bytes. */
@@ -2439,7 +2477,7 @@ static __global__ void ds4_cuda_routed_moe_mid_iq2_xxs_smem_kernel(
     __shared__ float smem_d[16];
     __shared__ int8_t smem_qs[16 * 256];
 
-    /* Phase 1: Quantize activation to Q8_K in shared memory.
+    /* Phase 1: Quantize activation to Q8_0 in shared memory.
      * Each warp quantizes xq_blocks/ROWS_PER_BLOCK blocks (rounding up). */
     {
         const float *token_act = act + (uint64_t)token * expert_in_dim;
@@ -2448,20 +2486,15 @@ static __global__ void ds4_cuda_routed_moe_mid_iq2_xxs_smem_kernel(
 
         for (uint32_t blk = warp_blk_start; blk < xq_blocks; blk += warp_blk_stride) {
             const float *blk_act = token_act + blk * 256u;
-            int8_t  lane_qs[8];
-            int16_t lane_bsum;
+            int8_t *qs_out = smem_qs + blk * 256u;
             float   block_d;
-            ds4_cuda_warp_quantize_q8_K_block(blk_act, lane, lane_qs, &lane_bsum, &block_d);
-
+            ds4_cuda_warp_quantize_q8_0_256(blk_act, lane, qs_out, &block_d);
             if (lane == 0) smem_d[blk] = block_d;
-            for (uint32_t step = 0; step < 8u; step++) {
-                smem_qs[blk * 256u + step * 32u + lane] = lane_qs[step];
-            }
         }
     }
     __syncthreads();
 
-    /* Phase 2: Dot gate and up from cached Q8_K in shared memory. */
+    /* Phase 2: Dot gate and up from cached Q8_0 in shared memory. */
     const uint8_t *gate_base = (const uint8_t *)gate_w + (uint64_t)expert * gate_expert_bytes;
     const uint8_t *up_base   = (const uint8_t *)up_w   + (uint64_t)expert * gate_expert_bytes;
     const ds4_cuda_block_iq2_xxs *gate_row =
@@ -2469,8 +2502,8 @@ static __global__ void ds4_cuda_routed_moe_mid_iq2_xxs_smem_kernel(
     const ds4_cuda_block_iq2_xxs *up_row =
         (const ds4_cuda_block_iq2_xxs *)(up_base + (uint64_t)row * gate_row_bytes);
 
-    float g = ds4_cuda_warp_dot_iq2_xxs_q8_K_smem(gate_row, smem_d, smem_qs, xq_blocks, lane);
-    float u = ds4_cuda_warp_dot_iq2_xxs_q8_K_smem(up_row,   smem_d, smem_qs, xq_blocks, lane);
+    float g = ds4_cuda_warp_dot_iq2_xxs_q8_0_smem(gate_row, smem_d, smem_qs, xq_blocks, lane);
+    float u = ds4_cuda_warp_dot_iq2_xxs_q8_0_smem(up_row,   smem_d, smem_qs, xq_blocks, lane);
     if (clamp > 1.0e-6f) {
         if (g > clamp) g = clamp;
         if (u > clamp) u = clamp;
@@ -5741,10 +5774,12 @@ static int ds4_cuda_routed_moe_impl(
 
        if (n_tokens < 8u) {
             /* Decode: quantize-once, cache-in-smem, reuse for gate+up.
-             * Same grid as original kernel; eliminates redundant 2nd quantize. */
-            ds4_cuda_routed_moe_mid_iq2_xxs_smem_kernel<ROWS_PER_BLOCK><<<
-                    dim3(mid_row_blocks, (uint32_t)pair_rows, 1),
-                    dim3(32u, ROWS_PER_BLOCK, 1),
+             * ROWS_PER_BLOCK=8 found optimal in profiling (8.09 t/s). */
+            constexpr uint32_t SMEM_ROWS = 8u;
+            const uint32_t smem_row_blocks = (expert_mid_dim + SMEM_ROWS - 1u) / SMEM_ROWS;
+            ds4_cuda_routed_moe_mid_iq2_xxs_smem_kernel<SMEM_ROWS><<<
+                    dim3(smem_row_blocks, (uint32_t)pair_rows, 1),
+                    dim3(32u, SMEM_ROWS, 1),
                     0, g_stream>>>(
                 gate_w, up_w, (const float *)x_ptr,
                 (const int32_t *)selected_ptr,
