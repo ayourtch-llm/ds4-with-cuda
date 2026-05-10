@@ -314,6 +314,146 @@ static int ds4_cuda_ensure_moe_fp8_scratches(uint64_t expert_mid_dim,
     return 1;
 }
 
+/* FP8 MoE retile Phase 0 — Chunk 4a: cublasLtMatmul descriptor cache.
+ *
+ * Caches the matmul descriptor, matrix layout templates, algo heuristic,
+ * and workspace for the up-path single-stream FP8 GEMM.
+ * No GEMM call is made here; chunk 4b wires the actual call site.
+ *
+ * Layout convention (matches the existing single-stream cublasGemmEx site):
+ *   op_A = OP_T, op_B = OP_N
+ *   M = expert_mid_dim, K = expert_in_dim, N = e_count (variable per expert)
+ *   A stored: K × M with lda = K  (weight, transposed at GEMM time → M × K)
+ *   B stored: K × N with ldb = K  (activation, not transposed)
+ *   C stored: M × N with ldc = M  (F32 output)
+ * b/c layout templates have N set to the heuristic probe value (64); chunk
+ * 4b updates CUBLASLT_MATRIX_LAYOUT_COLS per expert before each GEMM. */
+typedef struct {
+    cublasLtMatmulDesc_t   matmul_desc;
+    cublasLtMatrixLayout_t a_layout_template;  /* K × M, E4M3; stable shape */
+    cublasLtMatrixLayout_t b_layout_template;  /* K × N, E4M3; reset per call */
+    cublasLtMatrixLayout_t c_layout_template;  /* M × N, F32;  reset per call */
+    cublasLtMatmulAlgo_t   algo;
+    void                  *workspace;
+    size_t                 workspace_size;
+    int                    initialized;  /* 0 = not tried, 1 = ready, -1 = failed */
+} ds4_cuda_fp8_matmul_state;
+static ds4_cuda_fp8_matmul_state g_fp8_up_state;
+
+/* Lazily init the FP8 up-path matmul descriptor.  Must be called after
+ * ds4_cuda_ensure_moe_fp8_scratches() so the scale device pointers exist.
+ * Returns 1 on success, 0 on failure (g_moe_retile_fp8_disabled set). */
+static int ds4_cuda_fp8_matmul_init_up(uint32_t M, uint32_t K)
+{
+    if (g_fp8_up_state.initialized != 0)
+        return g_fp8_up_state.initialized == 1;
+
+    if (!g_moe_e4m3_a_inv_scale || !g_moe_e4m3_b_inv_scale) {
+        fprintf(stderr, "ds4: fp8_matmul_init_up: scale buffers not allocated\n");
+        goto fail;
+    }
+
+    cublasStatus_t st;
+
+    st = cublasLtMatmulDescCreate(&g_fp8_up_state.matmul_desc,
+                                  CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "ds4: cublasLtMatmulDescCreate failed (%d)\n", (int)st);
+        goto fail;
+    }
+    {
+        cublasOperation_t op_T = CUBLAS_OP_T, op_N = CUBLAS_OP_N;
+        cublasLtMatmulDescSetAttribute(g_fp8_up_state.matmul_desc,
+            CUBLASLT_MATMUL_DESC_TRANSA, &op_T, sizeof(op_T));
+        cublasLtMatmulDescSetAttribute(g_fp8_up_state.matmul_desc,
+            CUBLASLT_MATMUL_DESC_TRANSB, &op_N, sizeof(op_N));
+        /* Scale pointers: device addresses populated per expert (weight) /
+         * per call (act) by chunk 4b.  A = weight (b_inv_scale),
+         * B = activation (a_inv_scale) — matches existing site's a/b naming. */
+        cublasLtMatmulDescSetAttribute(g_fp8_up_state.matmul_desc,
+            CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+            &g_moe_e4m3_b_inv_scale, sizeof(g_moe_e4m3_b_inv_scale));
+        cublasLtMatmulDescSetAttribute(g_fp8_up_state.matmul_desc,
+            CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+            &g_moe_e4m3_a_inv_scale, sizeof(g_moe_e4m3_a_inv_scale));
+    }
+
+    st = cublasLtMatrixLayoutCreate(&g_fp8_up_state.a_layout_template,
+                                    CUDA_R_8F_E4M3, (uint64_t)K, (uint64_t)M, (int64_t)K);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "ds4: fp8 a_layout create failed (%d)\n", (int)st); goto fail;
+    }
+    /* N=64 placeholder; chunk 4b updates COLS before each GEMM. */
+    st = cublasLtMatrixLayoutCreate(&g_fp8_up_state.b_layout_template,
+                                    CUDA_R_8F_E4M3, (uint64_t)K, 64u, (int64_t)K);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "ds4: fp8 b_layout create failed (%d)\n", (int)st); goto fail;
+    }
+    st = cublasLtMatrixLayoutCreate(&g_fp8_up_state.c_layout_template,
+                                    CUDA_R_32F, (uint64_t)M, 64u, (int64_t)M);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "ds4: fp8 c_layout create failed (%d)\n", (int)st); goto fail;
+    }
+
+    /* Algo heuristic with a 64 MB workspace budget. */
+    {
+        cublasLtMatmulPreference_t pref = NULL;
+        st = cublasLtMatmulPreferenceCreate(&pref);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "ds4: matmul pref create failed (%d)\n", (int)st); goto fail;
+        }
+        size_t ws_limit = 64ull * 1024 * 1024;
+        cublasLtMatmulPreferenceSetAttribute(pref,
+            CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_limit, sizeof(ws_limit));
+
+        cublasLtMatmulHeuristicResult_t hresult;
+        memset(&hresult, 0, sizeof(hresult));
+        int returned = 0;
+        st = cublasLtMatmulAlgoGetHeuristic(
+            g_cublaslt_handle, g_fp8_up_state.matmul_desc,
+            g_fp8_up_state.a_layout_template, g_fp8_up_state.b_layout_template,
+            g_fp8_up_state.c_layout_template, g_fp8_up_state.c_layout_template,
+            pref, 1, &hresult, &returned);
+        cublasLtMatmulPreferenceDestroy(pref);
+
+        if (st != CUBLAS_STATUS_SUCCESS || returned == 0) {
+            fprintf(stderr,
+                "ds4: cublasLtMatmulAlgoGetHeuristic returned 0 algos for E4M3 "
+                "on this device/shape (sm_120?) — FP8 MoE retile path disabled\n");
+            g_moe_retile_fp8_disabled = 1;
+            g_fp8_up_state.initialized = -1;
+            if (g_fp8_up_state.matmul_desc)      { cublasLtMatmulDescDestroy(g_fp8_up_state.matmul_desc); g_fp8_up_state.matmul_desc = NULL; }
+            if (g_fp8_up_state.a_layout_template) { cublasLtMatrixLayoutDestroy(g_fp8_up_state.a_layout_template); g_fp8_up_state.a_layout_template = NULL; }
+            if (g_fp8_up_state.b_layout_template) { cublasLtMatrixLayoutDestroy(g_fp8_up_state.b_layout_template); g_fp8_up_state.b_layout_template = NULL; }
+            if (g_fp8_up_state.c_layout_template) { cublasLtMatrixLayoutDestroy(g_fp8_up_state.c_layout_template); g_fp8_up_state.c_layout_template = NULL; }
+            return 0;
+        }
+        g_fp8_up_state.algo           = hresult.algo;
+        g_fp8_up_state.workspace_size = hresult.workspaceSize;
+        if (g_fp8_up_state.workspace_size > 0) {
+            if (!ds4_cuda_check(cudaMalloc(&g_fp8_up_state.workspace,
+                                           g_fp8_up_state.workspace_size),
+                                "fp8 matmul workspace")) goto fail;
+        }
+    }
+
+    g_fp8_up_state.initialized = 1;
+    fprintf(stderr,
+            "ds4: FP8 up-path descriptor ready: M=%u K=%u workspace=%zu B\n",
+            M, K, g_fp8_up_state.workspace_size);
+    return 1;
+
+fail:
+    g_moe_retile_fp8_disabled = 1;
+    g_fp8_up_state.initialized = -1;
+    if (g_fp8_up_state.matmul_desc)      { cublasLtMatmulDescDestroy(g_fp8_up_state.matmul_desc); g_fp8_up_state.matmul_desc = NULL; }
+    if (g_fp8_up_state.a_layout_template) { cublasLtMatrixLayoutDestroy(g_fp8_up_state.a_layout_template); g_fp8_up_state.a_layout_template = NULL; }
+    if (g_fp8_up_state.b_layout_template) { cublasLtMatrixLayoutDestroy(g_fp8_up_state.b_layout_template); g_fp8_up_state.b_layout_template = NULL; }
+    if (g_fp8_up_state.c_layout_template) { cublasLtMatrixLayoutDestroy(g_fp8_up_state.c_layout_template); g_fp8_up_state.c_layout_template = NULL; }
+    if (g_fp8_up_state.workspace)         { cudaFree(g_fp8_up_state.workspace); g_fp8_up_state.workspace = NULL; }
+    return 0;
+}
+
 /* Dequant kernel: Q8_0 weights (out_dim × blocks × {scale, qs[32]}) →
  * F16 (out_dim × in_dim).  Block layout: one CUDA block per (block_id,
  * row); 32 threads per block, each handles one int8 element.  Total
@@ -3119,6 +3259,13 @@ void ds4_cuda_cleanup(void) {
         cudaFree(g_moe_e4m3_b_inv_scale);
         g_moe_e4m3_b_inv_scale = NULL;
     }
+    /* FP8 chunk 4a: destroy descriptor, layouts, workspace (before handle). */
+    if (g_fp8_up_state.matmul_desc)      { cublasLtMatmulDescDestroy(g_fp8_up_state.matmul_desc); }
+    if (g_fp8_up_state.a_layout_template) { cublasLtMatrixLayoutDestroy(g_fp8_up_state.a_layout_template); }
+    if (g_fp8_up_state.b_layout_template) { cublasLtMatrixLayoutDestroy(g_fp8_up_state.b_layout_template); }
+    if (g_fp8_up_state.c_layout_template) { cublasLtMatrixLayoutDestroy(g_fp8_up_state.c_layout_template); }
+    if (g_fp8_up_state.workspace)         { cudaFree(g_fp8_up_state.workspace); }
+    memset(&g_fp8_up_state, 0, sizeof(g_fp8_up_state));
     if (g_cublaslt_handle) {
         cublasLtDestroy(g_cublaslt_handle);
         g_cublaslt_handle = NULL;
