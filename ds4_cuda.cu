@@ -2344,6 +2344,51 @@ static __global__ void ds4_cuda_routed_moe_mid_iq2_xxs_kernel(
     }
 }
 
+/* Global-amax Q8_0 quantization for the entire activation.
+ * Computes a single amax across all 16 blocks (4096 elements),
+ * then quantizes all blocks using that shared scale.
+ * Each warp handles 16 blocks: one amax reduction, then quantize all blocks. */
+static __device__ __forceinline__ void ds4_cuda_warp_quantize_q8_0_global(
+        const float *x_full,     /* 4096 fp32 activations (16 x 256) */
+        uint32_t     lane,
+        int8_t      *smem_qs,    /* output: 16*256 int8 values */
+        float       *smem_d,     /* output: 16 per-block d scales (will all be same) */
+        uint32_t     nb) {       /* number of 256-element blocks */
+    const uint32_t mask = 0xffffffffu;
+
+    /* Phase 1: Global amax across ALL blocks. */
+    float amax = 0.0f;
+    for (uint32_t blk = 0; blk < nb; blk++) {
+        const float *blk_act = x_full + blk * 256u;
+        for (uint32_t step = 0; step < 8u; step++) {
+            amax = fmaxf(amax, fabsf(blk_act[step * 32u + lane]));
+        }
+    }
+    /* Warp reduce. */
+    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, 16));
+    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, 8));
+    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, 4));
+    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, 2));
+    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, 1));
+
+    const float d  = amax / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+
+    /* Phase 2: Quantize all blocks using the global scale. */
+    for (uint32_t blk = 0; blk < nb; blk++) {
+        const float *blk_act = x_full + blk * 256u;
+        int8_t *qs_out = smem_qs + blk * 256u;
+        for (uint32_t step = 0; step < 8u; step++) {
+            const float x_i = blk_act[step * 32u + lane];
+            int32_t qv = (int32_t)lrintf(x_i * id);
+            if (qv > 127)  qv = 127;
+            if (qv < -128) qv = -128;
+            qs_out[step * 32u + lane] = (int8_t)qv;
+        }
+        if (lane == 0) smem_d[blk] = d;
+    }
+}
+
 /* Simplified Q8_0-style quantization for 256-element blocks.
  * Produces int8 qs and a single float d scale per 256 elements.
  * Much simpler than Q8_K (no bsums, no sign-dependent iscale).
@@ -2385,7 +2430,7 @@ static __device__ __forceinline__ void ds4_cuda_warp_quantize_q8_0_256(
 
 /* IQ2_XXS dot product against pre-quantized Q8_0 activation in shared memory.
  * Reads int8 qs from smem_qs[blk*256 + idx] and float d from smem_d[blk].
- * Simpler than Q8_K variant: no bsums, no sign-dependent iscale. */
+ * Optimized: single warp reduce per block instead of per-ib32. */
 static __device__ __forceinline__ float ds4_cuda_warp_dot_iq2_xxs_q8_0_smem(
         const ds4_cuda_block_iq2_xxs *x,
         const float                   *smem_d,
@@ -2404,31 +2449,32 @@ static __device__ __forceinline__ float ds4_cuda_warp_dot_iq2_xxs_q8_0_smem(
         const float d = ds4_cuda_f16_to_f32(x[i].d) * smem_d[i];
         const uint16_t *q2_base = x[i].qs;
         const int8_t  *q8 = smem_qs + i * 256u;
-        int32_t bsum = 0;
 
+        /* Accumulate v*q8*ls per lane across all 8 ib32 groups. */
+        int32_t lane_sum = 0;
         for (int ib32 = 0; ib32 < 8; ib32++) {
             const uint16_t *q2 = q2_base + (uint32_t)ib32 * 4u;
             const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
             const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
             const uint8_t *aux8 = (const uint8_t *)&aux0;
-            const uint32_t ls   = 2u * (aux1 >> 28) + 1u;
+            const int32_t  ls   = (int32_t)(2u * (aux1 >> 28) + 1u);
 
             const uint8_t  grid_idx = aux8[l + which];
             const uint32_t sign_idx = (aux1 >> (7u * (l + which))) & 127u;
             const uint8_t *grid     = (const uint8_t *)(iq2xxs_grid + grid_idx);
             const uint8_t  signs    = ksigns_iq2xs[sign_idx];
             const int32_t  v        = (signs & km) ? -(int32_t)grid[k] : (int32_t)grid[k];
-            int32_t lane_partial    = v * (int32_t)q8[(uint32_t)ib32 * 32u + lane];
-
-            lane_partial += __shfl_xor_sync(mask, lane_partial, 16);
-            lane_partial += __shfl_xor_sync(mask, lane_partial, 8);
-            lane_partial += __shfl_xor_sync(mask, lane_partial, 4);
-            lane_partial += __shfl_xor_sync(mask, lane_partial, 2);
-            lane_partial += __shfl_xor_sync(mask, lane_partial, 1);
-
-            bsum += lane_partial * (int32_t)ls;
+            lane_sum += v * (int32_t)q8[(uint32_t)ib32 * 32u + lane] * ls;
         }
-        sumf += d * (float)bsum;
+
+        /* Single warp reduce for the entire block. */
+        lane_sum += __shfl_xor_sync(mask, lane_sum, 16);
+        lane_sum += __shfl_xor_sync(mask, lane_sum, 8);
+        lane_sum += __shfl_xor_sync(mask, lane_sum, 4);
+        lane_sum += __shfl_xor_sync(mask, lane_sum, 2);
+        lane_sum += __shfl_xor_sync(mask, lane_sum, 1);
+
+        sumf += d * (float)lane_sum;
     }
     return 0.125f * sumf;
 }
