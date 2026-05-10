@@ -5039,6 +5039,82 @@ DS4_CUDA_PARITY_TEST(attention_prefill_static_mixed_heads_ratio_causal,
     .cpu_fn = attn_prefill_static_mixed_cpu, .cuda_fn = attn_prefill_static_mixed_cuda,
     .cfg = (void *)&attn_prefill_static_mixed_ratio_causal_cfg);
 
+/* Phase 8 Stage 1 — FA-2 retile parity: same three boundary-condition
+ * fixtures (unwindowed, sliding-window truncation, ratio-causal comp
+ * visibility) targeting the FA-2 dispatcher
+ * `ds4_cuda_attention_prefill_static_mixed_fa2_heads_tensor`.  At Stage 1B
+ * the FA-2 path is a no-op redirect to the original kernel, so these
+ * tests pass trivially; Stage 1C swaps the redirect for the real FA-2
+ * kernel and these become the correctness gate.  Same ulp_tolerance (32)
+ * — drift must stay within the existing static_mixed envelope. */
+static int attn_prefill_static_mixed_fa2_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                              size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct attn_prefill_static_mixed_cfg *c = cfg;
+    const size_t q_n    = (size_t)c->n_tokens * c->n_head * c->head_dim;
+    const size_t raw_n  = (size_t)c->n_tokens * c->head_dim;
+    const size_t comp_n = (size_t)c->n_comp * c->head_dim;
+    float *q_h     = (float *)malloc(q_n * sizeof(float));
+    float *raw_h   = (float *)malloc(raw_n * sizeof(float));
+    float *comp_h  = c->n_comp ? (float *)malloc(comp_n * sizeof(float)) : NULL;
+    float *sinks_h = (float *)malloc((size_t)c->n_head * sizeof(float));
+    if (!q_h || !raw_h || (c->n_comp && !comp_h) || !sinks_h) {
+        free(q_h); free(raw_h); free(comp_h); free(sinks_h); return 0;
+    }
+    attn_prefill_static_mixed_prep(in, c, q_h, raw_h, comp_h, sinks_h);
+
+    ds4_cuda_tensor *q_dev    = ds4_cuda_tensor_alloc((uint64_t)q_n   * sizeof(float));
+    ds4_cuda_tensor *raw_dev  = ds4_cuda_tensor_alloc((uint64_t)raw_n * sizeof(float));
+    ds4_cuda_tensor *comp_dev = c->n_comp ? ds4_cuda_tensor_alloc((uint64_t)comp_n * sizeof(float)) : NULL;
+    ds4_cuda_tensor *sinks_dev = ds4_cuda_tensor_alloc((uint64_t)c->n_head * sizeof(float));
+
+    int ok = q_dev && raw_dev && (c->n_comp == 0 || comp_dev) && sinks_dev;
+    if (ok) ok = ds4_cuda_tensor_write(q_dev,     0, q_h,     (uint64_t)q_n   * sizeof(float))
+              && ds4_cuda_tensor_write(raw_dev,   0, raw_h,   (uint64_t)raw_n * sizeof(float))
+              && ds4_cuda_tensor_write(sinks_dev, 0, sinks_h, (uint64_t)c->n_head * sizeof(float));
+    if (ok && c->n_comp) ok = ds4_cuda_tensor_write(comp_dev, 0, comp_h, (uint64_t)comp_n * sizeof(float));
+
+    const void *fake_model_map = sinks_dev ? ds4_cuda_tensor_contents(sinks_dev) : NULL;
+    const uint64_t fake_model_size = (uint64_t)c->n_head * sizeof(float);
+
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_attention_prefill_static_mixed_fa2_heads_tensor(
+                    out_dev, fake_model_map, fake_model_size, /*sinks_offset=*/0,
+                    q_dev, raw_dev, comp_dev,
+                    c->n_tokens, c->n_comp, c->window, c->ratio,
+                    c->n_head, c->head_dim);
+    if (ok) ok = ds4_cuda_end_commands();
+
+    ds4_cuda_tensor_free(q_dev); ds4_cuda_tensor_free(raw_dev);
+    ds4_cuda_tensor_free(comp_dev); ds4_cuda_tensor_free(sinks_dev);
+    free(q_h); free(raw_h); free(comp_h); free(sinks_h);
+    return ok;
+}
+
+DS4_CUDA_PARITY_TEST(attention_prefill_static_mixed_fa2_heads_unwindowed,
+    .seed = 0x57AF1,
+    .in_elems = 2434,
+    .out_elems = 5*2*128,
+    .ulp_tolerance = 32,
+    .cpu_fn = attn_prefill_static_mixed_cpu, .cuda_fn = attn_prefill_static_mixed_fa2_cuda,
+    .cfg = (void *)&attn_prefill_static_mixed_unwindowed_cfg);
+
+DS4_CUDA_PARITY_TEST(attention_prefill_static_mixed_fa2_heads_windowed,
+    .seed = 0x57AF2,
+    .in_elems = 4866,
+    .out_elems = 12*2*128,
+    .ulp_tolerance = 32,
+    .cpu_fn = attn_prefill_static_mixed_cpu, .cuda_fn = attn_prefill_static_mixed_fa2_cuda,
+    .cfg = (void *)&attn_prefill_static_mixed_windowed_cfg);
+
+DS4_CUDA_PARITY_TEST(attention_prefill_static_mixed_fa2_heads_ratio_causal,
+    .seed = 0x57AF3,
+    .in_elems = 7170,
+    .out_elems = 16*2*128,
+    .ulp_tolerance = 32,
+    .cpu_fn = attn_prefill_static_mixed_cpu, .cuda_fn = attn_prefill_static_mixed_fa2_cuda,
+    .cfg = (void *)&attn_prefill_static_mixed_ratio_causal_cfg);
+
 /* ---------------------------------------------------------------------------
  * Phase 1.5b — HC Sinkhorn family (3 sequenced APIs, all DS4-original).
  * --------------------------------------------------------------------------- */
@@ -6643,6 +6719,9 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_attention_prefill_static_mixed_heads_unwindowed,
     &ds4_cuda_parity_attention_prefill_static_mixed_heads_windowed,
     &ds4_cuda_parity_attention_prefill_static_mixed_heads_ratio_causal,
+    &ds4_cuda_parity_attention_prefill_static_mixed_fa2_heads_unwindowed,
+    &ds4_cuda_parity_attention_prefill_static_mixed_fa2_heads_windowed,
+    &ds4_cuda_parity_attention_prefill_static_mixed_fa2_heads_ratio_causal,
     &ds4_cuda_parity_output_hc_weights,
     &ds4_cuda_parity_hc_split_sinkhorn,
     &ds4_cuda_parity_hc_split_weighted_sum,

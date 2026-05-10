@@ -5973,6 +5973,47 @@ int ds4_cuda_attention_prefill_static_mixed_heads_tensor(
     return ds4_cuda_check(cudaGetLastError(), "launch attention_prefill_static_mixed");
 }
 
+/* Phase 8 Stage 1 — FA-2-class retile of static_mixed prefill attention.
+ *
+ * Production callers go through ds4_cuda_attention_prefill_static_mixed_heads_tensor;
+ * when DS4_CUDA_FA2=1 they redirect through this entry.  Tests dispatch
+ * here directly to validate the FA-2 path independently of env-gate state.
+ *
+ * Boundary conditions inherited from static_mixed (verified against
+ * ds4_cuda.cu:5795 and tests/ds4_cuda_test.c:4883 fixtures):
+ *   1. Sinks merged into max + denom; not into weighted-sum output.
+ *   2. Two KV streams (raw_kv sliding-window + comp_kv) with distinct masks.
+ *   3. Per-token causal raw mask: kv_start = max(0, tok+1-window).
+ *   4. Per-token causal comp mask: n_visible = (tok+1)/ratio (ratio=0 => all).
+ *   5. head_dim=512 in production; tile across embd-dim.
+ *   6. Output: heads[t,h,d] = sum(weights * kv) * inv_denom — equivalent to
+ *      online-softmax FA-2 epilogue (max-rescale of accumulator + final
+ *      multiply by inv_denom).
+ *
+ * Stage 1B (this commit): scaffold only — redirects to existing kernel so
+ * parity tests pass trivially against the new entry.  Stage 1C swaps in
+ * the real FA-2 kernel; Stage 1D validates speedup vs the redirect.
+ */
+int ds4_cuda_attention_prefill_static_mixed_fa2_heads_tensor(
+        ds4_cuda_tensor       *heads,
+        const void            *model_map,
+        uint64_t               model_size,
+        uint64_t               sinks_offset,
+        const ds4_cuda_tensor *q,
+        const ds4_cuda_tensor *raw_kv,
+        const ds4_cuda_tensor *comp_kv,
+        uint32_t               n_tokens,
+        uint32_t               n_comp,
+        uint32_t               window,
+        uint32_t               ratio,
+        uint32_t               n_head,
+        uint32_t               head_dim) {
+    return ds4_cuda_attention_prefill_static_mixed_heads_tensor(
+        heads, model_map, model_size, sinks_offset,
+        q, raw_kv, comp_kv,
+        n_tokens, n_comp, window, ratio, n_head, head_dim);
+}
+
 } /* extern "C" */
 
 /* =========================================================================
