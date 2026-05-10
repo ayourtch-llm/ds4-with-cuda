@@ -4310,12 +4310,10 @@ int ds4_cuda_matmul_q8_0_tensor(
     /* Custom-kernel fallback (original Q8 fused matvec). */
     constexpr uint32_t ROWS_PER_BLOCK = 4u;
     const uint32_t row_blocks = ((uint32_t)out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
-    const uint32_t q8_blocks = ((uint32_t)in_dim + 31u) / 32u;
-    const uint32_t smem_size = in_dim + ((q8_blocks * 4 + 7u) / 8u) * 8u; /* int8 qs + 8-byte aligned float d */
     ds4_cuda_dense_q8_0_matvec_kernel<ROWS_PER_BLOCK><<<
             dim3(row_blocks, (uint32_t)n_tok, 1),
             dim3(32u, ROWS_PER_BLOCK, 1),
-            smem_size, g_stream>>>(
+            0, g_stream>>>(
         weights,
         (const float *)x_ptr,
         (float *)out_ptr,
