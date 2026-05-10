@@ -97,8 +97,11 @@ static void    *g_f16_input_scratch;
 static uint64_t g_f16_input_scratch_bytes;
 static void    *g_f16_output_scratch;
 static uint64_t g_f16_output_scratch_bytes;
+static void    *g_q8_weight_scratch_f16;
+static uint64_t g_q8_weight_scratch_bytes;
 static int g_f16_tensor_core_disabled;
 static int g_f16_tensor_core_warned;
+static int g_q8_cublas_warned;
 static int g_attr_host_register_supported;
 static int g_attr_host_register_read_only_supported;
 static int g_attr_pageable_memory_access;
@@ -176,6 +179,54 @@ static int ds4_cuda_ensure_f16_output_scratch(uint64_t bytes) {
     g_f16_output_scratch = next;
     g_f16_output_scratch_bytes = bytes;
     return 1;
+}
+
+/* Phase 7b Stage 3+: Q8_0 → F16 dequant scratch helpers + kernel.  The
+ * Q8 path uses model-resident packed weights (34-byte blocks of 32 int8
+ * + 1 f16 scale).  cuBLAS GemmEx doesn't support packed quants, so we
+ * dequant the weight slab to F16 once per call into device-resident
+ * scratch (resize-on-demand), then run cuBLAS GemmEx.  Per-call dequant
+ * cost is dominated by memory-bandwidth (single weight read + 2× write
+ * to F16 scratch); for production matmul shapes (~16M elems) it's
+ * ~50 us, dwarfed by the matmul work itself. */
+static int ds4_cuda_ensure_q8_weight_scratch_f16(uint64_t bytes) {
+    if (bytes == 0) bytes = 1;
+    if (bytes <= g_q8_weight_scratch_bytes) return 1;
+    void *next = NULL;
+    if (!ds4_cuda_check(cudaMalloc(&next, (size_t)bytes), "q8 weight scratch alloc")) {
+        return 0;
+    }
+    if (g_q8_weight_scratch_f16) cudaFree(g_q8_weight_scratch_f16);
+    g_q8_weight_scratch_f16 = next;
+    g_q8_weight_scratch_bytes = bytes;
+    return 1;
+}
+
+/* Dequant kernel: Q8_0 weights (out_dim × blocks × {scale, qs[32]}) →
+ * F16 (out_dim × in_dim).  Block layout: one CUDA block per (block_id,
+ * row); 32 threads per block, each handles one int8 element.  Total
+ * grid: (blocks_per_row, out_dim) — for typical 4096×4096 weight that's
+ * (128, 4096) = 512K blocks of 32 threads each, latency-bound on the
+ * scale-broadcast read but throughput-bound on the writes. */
+__global__ static void ds4_cuda_kernel_dequant_q8_0_to_half(
+        __half                       *out_f16,
+        const ds4_cuda_block_q8_0    *weights,
+        uint32_t                      in_dim,
+        uint32_t                      out_dim) {
+    const uint32_t block_id = blockIdx.x;
+    const uint32_t row      = blockIdx.y;
+    const uint32_t blocks_per_row = in_dim / 32u;
+    if (block_id >= blocks_per_row || row >= out_dim) return;
+    const ds4_cuda_block_q8_0 *block =
+        weights + (uint64_t)row * blocks_per_row + block_id;
+    /* Scale is f16 stored as uint16 raw bits; convert to float. */
+    const float scale = __half2float(__ushort_as_half(block->d));
+    const uint32_t i = threadIdx.x;
+    if (i < 32u) {
+        const float v = (float)block->qs[i] * scale;
+        out_f16[(uint64_t)row * in_dim + (uint64_t)block_id * 32u + i] =
+            __float2half(v);
+    }
 }
 
 /* F32→F16 / F16→F32 conversion kernels for the cuBLAS staging path.
@@ -2070,6 +2121,12 @@ void ds4_cuda_cleanup(void) {
         g_f16_output_scratch = NULL;
         g_f16_output_scratch_bytes = 0;
     }
+    if (g_q8_weight_scratch_f16) {
+        cudaFree(g_q8_weight_scratch_f16);
+        g_q8_weight_scratch_f16 = NULL;
+        g_q8_weight_scratch_bytes = 0;
+    }
+    g_q8_cublas_warned = 0;
     if (g_cublas_handle) {
         cublasDestroy(g_cublas_handle);
         g_cublas_handle = NULL;
@@ -2764,22 +2821,111 @@ int ds4_cuda_matmul_q8_0_tensor(
     int ok = 1;
     const ds4_cuda_block_q8_0 *weights = (const ds4_cuda_block_q8_0 *)
         ds4_cuda_model_range_ptr(model_map, model_size, weight_offset, weight_bytes, "matmul q8_0 weights");
-    if (!weights) ok = 0;
-    if (ok) {
-        constexpr uint32_t ROWS_PER_BLOCK = 4u;
-        const uint32_t row_blocks = ((uint32_t)out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
-        ds4_cuda_dense_q8_0_matvec_kernel<ROWS_PER_BLOCK><<<
-                dim3(row_blocks, (uint32_t)n_tok, 1),
-                dim3(32u, ROWS_PER_BLOCK, 1),
-                0, g_stream>>>(
-            weights,
-            (const float *)x_ptr,
-            (float *)out_ptr,
-            (uint32_t)in_dim,
-            (uint32_t)out_dim,
-            (uint32_t)n_tok);
-        ok = ds4_cuda_check(cudaGetLastError(), "launch matmul q8_0 fused");
+    if (!weights) return 0;
+
+    /* Phase 7b Stage 3+: dequant Q8_0 → F16 and route through cuBLAS
+     * GemmEx for tensor-core matmul.  Threshold: only fires when n_tok
+     * is large enough that tensor cores beat the per-call dequant tax
+     * (n_tok ≥ 8 is the heuristic — for n_tok=1 decode shapes the
+     * matmul is essentially a vector-matrix product, MMA fragments stay
+     * mostly idle, and per-call dequant overhead would dominate).  Also
+     * skip when the dequanted F16 scratch would exceed Q8_CUBLAS_F16_CAP
+     * — that's the output-head case (vocab matmul, ~1 GB F16 scratch);
+     * custom Q8 matvec stays better there because it avoids the dequant
+     * memory-BW round-trip entirely. */
+    constexpr uint64_t Q8_CUBLAS_F16_CAP = 256ull * 1024 * 1024;  /* 256 MB. */
+    constexpr uint32_t Q8_CUBLAS_NTOK_MIN = 8u;
+    const uint64_t weight_f16_bytes = in_dim * out_dim * sizeof(__half);
+    const uint64_t input_f16_bytes  = x_elems * sizeof(__half);
+    const uint64_t output_f16_bytes = out_elems * sizeof(__half);
+
+    if (g_cublas_handle != NULL && !g_f16_tensor_core_disabled &&
+        n_tok >= Q8_CUBLAS_NTOK_MIN &&
+        weight_f16_bytes <= Q8_CUBLAS_F16_CAP &&
+        in_dim <= INT_MAX && out_dim <= INT_MAX && n_tok <= INT_MAX) {
+        if (ds4_cuda_ensure_q8_weight_scratch_f16(weight_f16_bytes) &&
+            ds4_cuda_ensure_f16_input_scratch(input_f16_bytes) &&
+            ds4_cuda_ensure_f16_output_scratch(output_f16_bytes)) {
+
+            /* (1) Dequant Q8_0 weights → F16 scratch.  Grid (blocks_per_row,
+             * out_dim), 32 threads/block. */
+            const uint32_t blocks_per_row = (uint32_t)blocks;
+            ds4_cuda_kernel_dequant_q8_0_to_half<<<
+                    dim3(blocks_per_row, (uint32_t)out_dim, 1),
+                    dim3(32u, 1, 1),
+                    0, g_stream>>>(
+                (__half *)g_q8_weight_scratch_f16,
+                weights,
+                (uint32_t)in_dim,
+                (uint32_t)out_dim);
+            if (!ds4_cuda_check(cudaGetLastError(), "dequant q8_0 to f16")) {
+                /* Fall through to custom-kernel fallback. */
+            } else {
+                /* (2) F32 input → F16 staging. */
+                const uint32_t conv_block = 256u;
+                const uint64_t conv_in_grid =
+                    (x_elems + conv_block - 1u) / conv_block;
+                const uint64_t conv_out_grid =
+                    (out_elems + conv_block - 1u) / conv_block;
+                const uint32_t conv_in_grid_clamped =
+                    conv_in_grid > UINT32_MAX ? UINT32_MAX : (uint32_t)conv_in_grid;
+                const uint32_t conv_out_grid_clamped =
+                    conv_out_grid > UINT32_MAX ? UINT32_MAX : (uint32_t)conv_out_grid;
+                ds4_cuda_kernel_f32_to_half<<<conv_in_grid_clamped, conv_block, 0, g_stream>>>(
+                    (__half *)g_f16_input_scratch,
+                    (const float *)x_ptr,
+                    x_elems);
+                if (ds4_cuda_check(cudaGetLastError(), "q8_0 cublas input convert")) {
+                    /* (3) cuBLAS GemmEx: F16 weight × F16 input → F16 output. */
+                    __half alpha = __float2half(1.0f);
+                    __half beta  = __float2half(0.0f);
+                    cublasStatus_t status = cublasGemmEx(
+                        g_cublas_handle,
+                        CUBLAS_OP_T,
+                        CUBLAS_OP_N,
+                        (int)out_dim, (int)n_tok, (int)in_dim,
+                        &alpha,
+                        g_q8_weight_scratch_f16,  CUDA_R_16F, (int)in_dim,
+                        g_f16_input_scratch,      CUDA_R_16F, (int)in_dim,
+                        &beta,
+                        g_f16_output_scratch,     CUDA_R_16F, (int)out_dim,
+                        CUBLAS_COMPUTE_16F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                    if (status == CUBLAS_STATUS_SUCCESS) {
+                        /* (4) F16 output → F32 user buffer. */
+                        ds4_cuda_kernel_half_to_f32<<<conv_out_grid_clamped, conv_block, 0, g_stream>>>(
+                            (float *)out_ptr,
+                            (const __half *)g_f16_output_scratch,
+                            out_elems);
+                        return ds4_cuda_check(cudaGetLastError(), "q8_0 cublas output convert");
+                    }
+                    if (!g_q8_cublas_warned) {
+                        fprintf(stderr,
+                                "ds4: cuBLAS Q8_0-via-F16 GemmEx failed (%s) — falling back to custom Q8 matvec\n",
+                                ds4_cuda_cublas_status_string(status));
+                        g_q8_cublas_warned = 1;
+                    }
+                    /* Don't disable globally — the F16 path may still be
+                     * fine; only the dequant-staging variant misfired. */
+                }
+            }
+        }
     }
+
+    /* Custom-kernel fallback (original Q8 fused matvec). */
+    constexpr uint32_t ROWS_PER_BLOCK = 4u;
+    const uint32_t row_blocks = ((uint32_t)out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
+    ds4_cuda_dense_q8_0_matvec_kernel<ROWS_PER_BLOCK><<<
+            dim3(row_blocks, (uint32_t)n_tok, 1),
+            dim3(32u, ROWS_PER_BLOCK, 1),
+            0, g_stream>>>(
+        weights,
+        (const float *)x_ptr,
+        (float *)out_ptr,
+        (uint32_t)in_dim,
+        (uint32_t)out_dim,
+        (uint32_t)n_tok);
+    ok = ds4_cuda_check(cudaGetLastError(), "launch matmul q8_0 fused");
     return ok;
 }
 
