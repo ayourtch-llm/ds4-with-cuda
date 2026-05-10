@@ -2793,6 +2793,57 @@ void ds4_test_dense_iq2_xxs_matvec(
     }
 }
 
+/* Phase 7b MoE retile Step B: per-element Q2_K → F32 dequant oracle.
+ *
+ * Reference for the CUDA Q2_K dequant kernel parity test.  Implements the
+ * same per-element formula that's implicit in ds4_vec_dot_q2_K_q8_K's
+ * scalar fallback (line ~1707): each element is
+ *   `f16_to_f32(d) * (sc[is] & 0x0f) * q2_val
+ *  - f16_to_f32(dmin) * (sc[is] >> 4)`
+ * where (k, j, half, l) decomposes the in-block element index, q2_val is
+ * the 2-bit quant from `qs[k*32 + half*16 + l] >> (j*2)`, and sub-block
+ * index `is = k*8 + j*2 + half` selects the 4-bit scale and 4-bit min
+ * nibbles in scales[is].  Output is row-major (out_dim × in_dim) F32. */
+void ds4_test_dequant_q2_K_to_f32(
+        float      *out,
+        const void *weights,
+        uint32_t    in_dim,
+        uint32_t    out_dim) {
+    const uint64_t blocks_per_row = in_dim / QK_K;
+    const block_q2_K *w = (const block_q2_K *)weights;
+    for (uint32_t row = 0; row < out_dim; row++) {
+        const block_q2_K *row_blocks = w + (uint64_t)row * blocks_per_row;
+        float *row_out = out + (uint64_t)row * in_dim;
+        for (uint64_t b = 0; b < blocks_per_row; b++) {
+            const block_q2_K *blk = row_blocks + b;
+            const float d    = f16_to_f32(blk->d);
+            const float dmin = f16_to_f32(blk->dmin);
+            float *blk_out = row_out + b * (uint64_t)QK_K;
+            int is = 0;
+            for (int k = 0; k < QK_K / 128; k++) {
+                int shift = 0;
+                for (int j = 0; j < 4; j++) {
+                    for (int half = 0; half < 2; half++) {
+                        const int scale_d   = blk->scales[is] & 0x0f;
+                        const int scale_min = blk->scales[is] >> 4;
+                        const float scale_d_f   = d    * (float)scale_d;
+                        const float scale_min_f = dmin * (float)scale_min;
+                        for (int l = 0; l < 16; l++) {
+                            const int byte_idx = k * 32 + half * 16 + l;
+                            const uint8_t q2_byte = blk->qs[byte_idx];
+                            const int q2_val = (q2_byte >> shift) & 3;
+                            const int elem = k * 128 + j * 32 + half * 16 + l;
+                            blk_out[elem] = scale_d_f * (float)q2_val - scale_min_f;
+                        }
+                        is++;
+                    }
+                    shift += 2;
+                }
+            }
+        }
+    }
+}
+
 /* Phase 7b MoE retile Step A: per-element IQ2_XXS → F32 dequant oracle.
  *
  * Reference for the CUDA dequant kernel parity test.  Implements the same
