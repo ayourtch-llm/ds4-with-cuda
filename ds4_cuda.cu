@@ -2344,51 +2344,6 @@ static __global__ void ds4_cuda_routed_moe_mid_iq2_xxs_kernel(
     }
 }
 
-/* Global-amax Q8_0 quantization for the entire activation.
- * Computes a single amax across all 16 blocks (4096 elements),
- * then quantizes all blocks using that shared scale.
- * Each warp handles 16 blocks: one amax reduction, then quantize all blocks. */
-static __device__ __forceinline__ void ds4_cuda_warp_quantize_q8_0_global(
-        const float *x_full,     /* 4096 fp32 activations (16 x 256) */
-        uint32_t     lane,
-        int8_t      *smem_qs,    /* output: 16*256 int8 values */
-        float       *smem_d,     /* output: 16 per-block d scales (will all be same) */
-        uint32_t     nb) {       /* number of 256-element blocks */
-    const uint32_t mask = 0xffffffffu;
-
-    /* Phase 1: Global amax across ALL blocks. */
-    float amax = 0.0f;
-    for (uint32_t blk = 0; blk < nb; blk++) {
-        const float *blk_act = x_full + blk * 256u;
-        for (uint32_t step = 0; step < 8u; step++) {
-            amax = fmaxf(amax, fabsf(blk_act[step * 32u + lane]));
-        }
-    }
-    /* Warp reduce. */
-    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, 16));
-    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, 8));
-    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, 4));
-    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, 2));
-    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, 1));
-
-    const float d  = amax / 127.0f;
-    const float id = d != 0.0f ? 1.0f / d : 0.0f;
-
-    /* Phase 2: Quantize all blocks using the global scale. */
-    for (uint32_t blk = 0; blk < nb; blk++) {
-        const float *blk_act = x_full + blk * 256u;
-        int8_t *qs_out = smem_qs + blk * 256u;
-        for (uint32_t step = 0; step < 8u; step++) {
-            const float x_i = blk_act[step * 32u + lane];
-            int32_t qv = (int32_t)lrintf(x_i * id);
-            if (qv > 127)  qv = 127;
-            if (qv < -128) qv = -128;
-            qs_out[step * 32u + lane] = (int8_t)qv;
-        }
-        if (lane == 0) smem_d[blk] = d;
-    }
-}
-
 /* Simplified Q8_0-style quantization for 256-element blocks.
  * Produces int8 qs and a single float d scale per 256 elements.
  * Much simpler than Q8_K (no bsums, no sign-dependent iscale).
@@ -4355,10 +4310,12 @@ int ds4_cuda_matmul_q8_0_tensor(
     /* Custom-kernel fallback (original Q8 fused matvec). */
     constexpr uint32_t ROWS_PER_BLOCK = 4u;
     const uint32_t row_blocks = ((uint32_t)out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
+    const uint32_t q8_blocks = ((uint32_t)in_dim + 31u) / 32u;
+    const uint32_t smem_size = in_dim + ((q8_blocks * 4 + 7u) / 8u) * 8u; /* int8 qs + 8-byte aligned float d */
     ds4_cuda_dense_q8_0_matvec_kernel<ROWS_PER_BLOCK><<<
             dim3(row_blocks, (uint32_t)n_tok, 1),
             dim3(32u, ROWS_PER_BLOCK, 1),
-            0, g_stream>>>(
+            smem_size, g_stream>>>(
         weights,
         (const float *)x_ptr,
         (float *)out_ptr,
