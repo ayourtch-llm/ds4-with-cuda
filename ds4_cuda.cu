@@ -360,6 +360,90 @@ __global__ static void ds4_cuda_kernel_dequant_q2_K_to_half(
     }
 }
 
+/* Phase 7b MoE retile Step C-1: build the per-expert routing layout from the
+ * router's selected[] tensor.
+ *
+ * Inputs:
+ *   selected[n_tokens * n_expert_used] — int32 expert indices in [0, n_expert_total)
+ *                                        or -1 (skip-this-slot marker).
+ *
+ * Outputs:
+ *   expert_count [n_expert_total]      — # routings per expert (excluding skips).
+ *   expert_offset[n_expert_total + 1]  — exclusive prefix sum of expert_count;
+ *                                        last entry == total live routings.
+ *   permuted_indices[n_tokens * n_expert_used]
+ *                                      — for each live routing, the flat
+ *                                        (token * n_expert_used + slot) index of
+ *                                        its source pair, sorted by expert id.
+ *                                        First expert_offset[n_expert_total]
+ *                                        entries are valid; tail is unused.
+ *
+ * One CUDA block; 256 threads.  Stages: shared-mem histogram, single-thread
+ * sequential prefix sum, single-thread sequential scatter.  The sequential
+ * scatter keeps order within each expert bucket identical to the CPU oracle
+ * for bit-exact parity; downstream gather/cuBLAS/unpermute don't depend on
+ * intra-bucket order, so a parallel scatter would be correct but harder to
+ * compare ULP=0 against the oracle.  At max prefill (n_tokens=2048,
+ * n_expert_used=6, 12 288 routings) this is ~12 us per layer — negligible
+ * vs the ~50 ms MoE matmul share. */
+__global__ static void ds4_cuda_kernel_moe_layout(
+        const int32_t *selected,
+        uint32_t      *expert_count,
+        uint32_t      *expert_offset,
+        uint32_t      *permuted_indices,
+        uint32_t       n_tokens,
+        uint32_t       n_expert_used,
+        uint32_t       n_expert_total) {
+    extern __shared__ uint32_t s_buf[];
+    uint32_t *s_count  = s_buf;
+    uint32_t *s_offset = s_buf + n_expert_total;
+
+    const uint32_t tid   = threadIdx.x;
+    const uint32_t bsz   = blockDim.x;
+    const uint32_t total = n_tokens * n_expert_used;
+
+    for (uint32_t i = tid; i < n_expert_total; i += bsz) s_count[i] = 0u;
+    __syncthreads();
+
+    for (uint32_t i = tid; i < total; i += bsz) {
+        const int32_t e = selected[i];
+        if (e >= 0 && (uint32_t)e < n_expert_total) {
+            atomicAdd(&s_count[e], 1u);
+        }
+    }
+    __syncthreads();
+
+    for (uint32_t i = tid; i < n_expert_total; i += bsz) {
+        expert_count[i] = s_count[i];
+    }
+
+    if (tid == 0) {
+        uint32_t acc = 0u;
+        s_offset[0] = 0u;
+        for (uint32_t i = 0; i < n_expert_total; i++) {
+            acc += s_count[i];
+            s_offset[i + 1u] = acc;
+        }
+    }
+    __syncthreads();
+
+    for (uint32_t i = tid; i <= n_expert_total; i += bsz) {
+        expert_offset[i] = s_offset[i];
+    }
+
+    if (tid == 0) {
+        for (uint32_t i = 0; i < n_expert_total; i++) {
+            s_count[i] = s_offset[i];
+        }
+        for (uint32_t i = 0; i < total; i++) {
+            const int32_t e = selected[i];
+            if (e >= 0 && (uint32_t)e < n_expert_total) {
+                permuted_indices[s_count[e]++] = i;
+            }
+        }
+    }
+}
+
 /* F32→F16 / F16→F32 conversion kernels for the cuBLAS staging path.
  * Mirrors mitkox 1696-1710. */
 __global__ static void ds4_cuda_kernel_f32_to_half(__half *out, const float *in, uint64_t n) {
@@ -3005,6 +3089,48 @@ int ds4_cuda_test_dequant_q2_K_to_f32_tensor(
 
     cudaFree(scratch_f16);
     return ok;
+}
+
+/* Phase 7b MoE retile Step C-1: standalone test launcher for the routing
+ * layout kernel.  Mirrors the dequant launchers above: takes managed-memory
+ * input/output tensors, launches a single block, and returns.  Production
+ * retile (Step C) reuses the layout kernel directly with persistent scratch. */
+int ds4_cuda_test_moe_layout_tensor(
+        ds4_cuda_tensor       *expert_count,
+        ds4_cuda_tensor       *expert_offset,
+        ds4_cuda_tensor       *permuted_indices,
+        const ds4_cuda_tensor *selected,
+        uint32_t               n_tokens,
+        uint32_t               n_expert_used,
+        uint32_t               n_expert_total) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (n_tokens == 0 || n_expert_used == 0 || n_expert_total == 0) return 0;
+    if (n_expert_total > 1024u) return 0;
+
+    const uint64_t total          = (uint64_t)n_tokens * n_expert_used;
+    const uint64_t selected_bytes = total * sizeof(int32_t);
+    const uint64_t count_bytes    = (uint64_t)n_expert_total * sizeof(uint32_t);
+    const uint64_t offset_bytes   = ((uint64_t)n_expert_total + 1ull) * sizeof(uint32_t);
+    const uint64_t indices_bytes  = total * sizeof(uint32_t);
+
+    void *sel_ptr = NULL, *cnt_ptr = NULL, *off_ptr = NULL, *idx_ptr = NULL;
+    if (!ds4_cuda_tensor_range(selected, selected_bytes, "moe_layout selected", &sel_ptr) ||
+        !ds4_cuda_tensor_range(expert_count, count_bytes, "moe_layout expert_count", &cnt_ptr) ||
+        !ds4_cuda_tensor_range(expert_offset, offset_bytes, "moe_layout expert_offset", &off_ptr) ||
+        !ds4_cuda_tensor_range(permuted_indices, indices_bytes, "moe_layout permuted_indices", &idx_ptr)) {
+        return 0;
+    }
+
+    const uint32_t threads = 256u;
+    const size_t shmem = (size_t)((n_expert_total * 2u + 1u) * sizeof(uint32_t));
+    ds4_cuda_kernel_moe_layout<<<1, threads, shmem, g_stream>>>(
+        (const int32_t *)sel_ptr,
+        (uint32_t *)cnt_ptr,
+        (uint32_t *)off_ptr,
+        (uint32_t *)idx_ptr,
+        n_tokens, n_expert_used, n_expert_total);
+    return ds4_cuda_check(cudaGetLastError(), "launch moe_layout");
 }
 
 #define DS4_CUDA_STUB(fn, args) \

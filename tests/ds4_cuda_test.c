@@ -108,6 +108,14 @@ int ds4_cuda_test_dequant_q2_K_to_f32_tensor(
         const ds4_cuda_tensor *weights,
         uint32_t               in_dim,
         uint32_t               out_dim);
+int ds4_cuda_test_moe_layout_tensor(
+        ds4_cuda_tensor       *expert_count,
+        ds4_cuda_tensor       *expert_offset,
+        ds4_cuda_tensor       *permuted_indices,
+        const ds4_cuda_tensor *selected,
+        uint32_t               n_tokens,
+        uint32_t               n_expert_used,
+        uint32_t               n_expert_total);
 
 typedef struct {
     uint8_t  scales[16];
@@ -1498,6 +1506,143 @@ DS4_CUDA_PARITY_TEST(dequant_q2_K_to_f32,
     .cpu_fn = dequant_q2_K_to_f32_cpu,
     .cuda_fn = dequant_q2_K_to_f32_cuda,
     .cfg = (void *)&dequant_q2_k_cfg);
+
+/* Phase 7b MoE retile Step C-1: routing-layout kernel parity test.
+ *
+ * Inputs are integer expert indices; outputs are integer counts/offsets/
+ * permuted indices.  We pack uint32 results into the harness's float output
+ * buffer via reinterpretation and compare bit-exact (ulp_tolerance = 0) — the
+ * harness's parity_ulp_diff falls back to int-bit subtraction when float ==
+ * fails, so identical bit patterns always score 0 ULP.
+ *
+ * Layout in `out` (uint32 reinterpreted as float):
+ *   [0                       .. n_expert_total)             = expert_count
+ *   [n_expert_total          .. 2*n_expert_total + 1)       = expert_offset
+ *   [2*n_expert_total + 1    .. 2*n_expert_total + 1 + total)
+ *                                                           = permuted_indices
+ *
+ * The seeded harness `in[]` floats are mapped to a deterministic selected[]
+ * via a fixed bit-pattern hash; both CPU and CUDA paths use the same mapping
+ * so the inputs are identical.  Test shape: n_tokens=64, n_expert_used=6,
+ * n_expert_total=256 (production constant).  Total live routings ≈ 384;
+ * about 1/(N+1) slots come out as -1 to exercise the negative-expert skip. */
+struct moe_layout_cfg {
+    uint32_t n_tokens;
+    uint32_t n_expert_used;
+    uint32_t n_expert_total;
+};
+
+static int32_t moe_layout_select_from_float(float v, uint32_t n_expert_total) {
+    union { float f; uint32_t u; } cv;
+    cv.f = v;
+    const uint32_t bucket = cv.u % (n_expert_total + 1u);
+    return (bucket == 0u) ? -1 : (int32_t)(bucket - 1u);
+}
+
+static void moe_layout_pack_outputs(float *out,
+                                    const uint32_t *expert_count,
+                                    const uint32_t *expert_offset,
+                                    const uint32_t *permuted_indices,
+                                    uint32_t n_expert_total,
+                                    uint32_t total) {
+    uint32_t *out_u = (uint32_t *)out;
+    for (uint32_t i = 0; i < n_expert_total; i++) {
+        out_u[i] = expert_count[i];
+    }
+    for (uint32_t i = 0; i <= n_expert_total; i++) {
+        out_u[n_expert_total + i] = expert_offset[i];
+    }
+    for (uint32_t i = 0; i < total; i++) {
+        out_u[2u * n_expert_total + 1u + i] = permuted_indices[i];
+    }
+}
+
+static int moe_layout_cpu(const float *in, float *out, void *cfg) {
+    const struct moe_layout_cfg *c = cfg;
+    const uint32_t total = c->n_tokens * c->n_expert_used;
+    int32_t *selected = (int32_t *)malloc((size_t)total * sizeof(int32_t));
+    uint32_t *count   = (uint32_t *)calloc((size_t)c->n_expert_total, sizeof(uint32_t));
+    uint32_t *offset  = (uint32_t *)malloc(((size_t)c->n_expert_total + 1u) * sizeof(uint32_t));
+    uint32_t *indices = (uint32_t *)calloc((size_t)total, sizeof(uint32_t));
+    if (!selected || !count || !offset || !indices) {
+        free(selected); free(count); free(offset); free(indices);
+        return 0;
+    }
+    for (uint32_t i = 0; i < total; i++) {
+        selected[i] = moe_layout_select_from_float(in[i], c->n_expert_total);
+    }
+    ds4_test_moe_layout(count, offset, indices, selected,
+                        c->n_tokens, c->n_expert_used, c->n_expert_total);
+    moe_layout_pack_outputs(out, count, offset, indices, c->n_expert_total, total);
+    free(selected); free(count); free(offset); free(indices);
+    return 1;
+}
+
+static int moe_layout_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                           size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct moe_layout_cfg *c = cfg;
+    const uint32_t total = c->n_tokens * c->n_expert_used;
+
+    int32_t  *selected_h = (int32_t  *)malloc((size_t)total * sizeof(int32_t));
+    uint32_t *cnt_h      = (uint32_t *)malloc((size_t)c->n_expert_total * sizeof(uint32_t));
+    uint32_t *off_h      = (uint32_t *)malloc(((size_t)c->n_expert_total + 1u) * sizeof(uint32_t));
+    uint32_t *idx_h      = (uint32_t *)malloc((size_t)total * sizeof(uint32_t));
+    float    *packed     = (float    *)malloc(((size_t)c->n_expert_total * 2u + 1u + total) * sizeof(float));
+    if (!selected_h || !cnt_h || !off_h || !idx_h || !packed) {
+        free(selected_h); free(cnt_h); free(off_h); free(idx_h); free(packed);
+        return 0;
+    }
+    for (uint32_t i = 0; i < total; i++) {
+        selected_h[i] = moe_layout_select_from_float(in[i], c->n_expert_total);
+    }
+
+    ds4_cuda_tensor *sel = ds4_cuda_tensor_alloc((uint64_t)total * sizeof(int32_t));
+    ds4_cuda_tensor *cnt = ds4_cuda_tensor_alloc((uint64_t)c->n_expert_total * sizeof(uint32_t));
+    ds4_cuda_tensor *off = ds4_cuda_tensor_alloc(((uint64_t)c->n_expert_total + 1ull) * sizeof(uint32_t));
+    ds4_cuda_tensor *idx = ds4_cuda_tensor_alloc((uint64_t)total * sizeof(uint32_t));
+    if (!sel || !cnt || !off || !idx) {
+        free(selected_h); free(cnt_h); free(off_h); free(idx_h); free(packed);
+        ds4_cuda_tensor_free(sel); ds4_cuda_tensor_free(cnt);
+        ds4_cuda_tensor_free(off); ds4_cuda_tensor_free(idx);
+        return 0;
+    }
+
+    int ok = ds4_cuda_tensor_write(sel, 0, selected_h, (uint64_t)total * sizeof(int32_t));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_test_moe_layout_tensor(cnt, off, idx, sel,
+                                                 c->n_tokens, c->n_expert_used, c->n_expert_total);
+    if (ok) ok = ds4_cuda_end_commands();
+    if (ok) ok = ds4_cuda_tensor_read(cnt, 0, cnt_h, (uint64_t)c->n_expert_total * sizeof(uint32_t));
+    if (ok) ok = ds4_cuda_tensor_read(off, 0, off_h, ((uint64_t)c->n_expert_total + 1ull) * sizeof(uint32_t));
+    if (ok) ok = ds4_cuda_tensor_read(idx, 0, idx_h, (uint64_t)total * sizeof(uint32_t));
+    if (ok) {
+        moe_layout_pack_outputs(packed, cnt_h, off_h, idx_h, c->n_expert_total, total);
+        const uint64_t out_bytes =
+            ((uint64_t)c->n_expert_total * 2u + 1u + total) * sizeof(float);
+        ok = ds4_cuda_tensor_write(out_dev, 0, packed, out_bytes);
+    }
+
+    free(selected_h); free(cnt_h); free(off_h); free(idx_h); free(packed);
+    ds4_cuda_tensor_free(sel); ds4_cuda_tensor_free(cnt);
+    ds4_cuda_tensor_free(off); ds4_cuda_tensor_free(idx);
+    return ok;
+}
+
+static struct moe_layout_cfg moe_layout_cfg_v = {
+    .n_tokens       = 64,
+    .n_expert_used  = 6,
+    .n_expert_total = 256,
+};
+
+DS4_CUDA_PARITY_TEST(moe_layout,
+    .seed = 0xD3C501,
+    .in_elems  = 64u * 6u,
+    .out_elems = 256u * 2u + 1u + 64u * 6u,
+    .ulp_tolerance = 0,
+    .cpu_fn  = moe_layout_cpu,
+    .cuda_fn = moe_layout_cuda,
+    .cfg = (void *)&moe_layout_cfg_v);
 
 /* ---------------------------------------------------------------------------
  * flash_attn — Phase 1 m3.  Raw sliding-window attention with sinks.
@@ -6003,6 +6148,7 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_dense_iq2_xxs_pair_matvec,
     &ds4_cuda_parity_dequant_iq2_xxs_to_f32,
     &ds4_cuda_parity_dequant_q2_K_to_f32,
+    &ds4_cuda_parity_moe_layout,
     &ds4_cuda_parity_flash_attn,
     &ds4_cuda_parity_router_select_batch,
     &ds4_cuda_parity_routed_moe_batch,

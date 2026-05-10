@@ -217,6 +217,13 @@ void ds4_test_dense_iq2_xxs_matvec(float *out, const void *weights, const void *
 void ds4_test_dense_iq2_xxs_pair_matvec(float *out0, float *out1, const void *weights0, const void *weights1, const void *xq, uint32_t in_dim, uint32_t out_dim);
 void ds4_test_dequant_iq2_xxs_to_f32(float *out, const void *weights, uint32_t in_dim, uint32_t out_dim);
 void ds4_test_dequant_q2_K_to_f32(float *out, const void *weights, uint32_t in_dim, uint32_t out_dim);
+void ds4_test_moe_layout(uint32_t *expert_count,
+                         uint32_t *expert_offset,
+                         uint32_t *permuted_indices,
+                         const int32_t *selected,
+                         uint32_t n_tokens,
+                         uint32_t n_expert_used,
+                         uint32_t n_expert_total);
 void ds4_test_router_select_raw(int32_t *selected,
                                 float *weights,
                                 float *probs,

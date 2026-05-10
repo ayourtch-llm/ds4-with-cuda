@@ -2893,6 +2893,45 @@ void ds4_test_dequant_iq2_xxs_to_f32(
     }
 }
 
+/* Phase 7b MoE retile Step C-1: CPU oracle for the routing-layout kernel.
+ *
+ * Matches the CUDA ds4_cuda_kernel_moe_layout one-to-one: histograms expert
+ * counts (skipping selected[i] < 0 or >= n_expert_total), exclusive prefix
+ * sums into expert_offset[0..n_expert_total], and scatters the live routing
+ * flat indices into permuted_indices in expert-sorted order.  Within each
+ * expert bucket, entries appear in ascending source-order — the same
+ * deterministic order the GPU's single-thread sequential scatter produces. */
+void ds4_test_moe_layout(
+        uint32_t       *expert_count,
+        uint32_t       *expert_offset,
+        uint32_t       *permuted_indices,
+        const int32_t  *selected,
+        uint32_t        n_tokens,
+        uint32_t        n_expert_used,
+        uint32_t        n_expert_total) {
+    const uint32_t total = n_tokens * n_expert_used;
+    for (uint32_t e = 0; e < n_expert_total; e++) expert_count[e] = 0u;
+    for (uint32_t i = 0; i < total; i++) {
+        const int32_t e = selected[i];
+        if (e >= 0 && (uint32_t)e < n_expert_total) {
+            expert_count[e]++;
+        }
+    }
+    expert_offset[0] = 0u;
+    for (uint32_t e = 0; e < n_expert_total; e++) {
+        expert_offset[e + 1u] = expert_offset[e] + expert_count[e];
+    }
+    uint32_t *running = (uint32_t *)xmalloc((size_t)n_expert_total * sizeof(uint32_t));
+    for (uint32_t e = 0; e < n_expert_total; e++) running[e] = expert_offset[e];
+    for (uint32_t i = 0; i < total; i++) {
+        const int32_t e = selected[i];
+        if (e >= 0 && (uint32_t)e < n_expert_total) {
+            permuted_indices[running[e]++] = i;
+        }
+    }
+    free(running);
+}
+
 void ds4_test_dense_iq2_xxs_pair_matvec(
         float      *out0,
         float      *out1,
