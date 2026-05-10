@@ -5975,25 +5975,190 @@ int ds4_cuda_attention_prefill_static_mixed_heads_tensor(
 
 /* Phase 8 Stage 1 — FA-2-class retile of static_mixed prefill attention.
  *
- * Production callers go through ds4_cuda_attention_prefill_static_mixed_heads_tensor;
- * when DS4_CUDA_FA2=1 they redirect through this entry.  Tests dispatch
- * here directly to validate the FA-2 path independently of env-gate state.
- *
  * Boundary conditions inherited from static_mixed (verified against
  * ds4_cuda.cu:5795 and tests/ds4_cuda_test.c:4883 fixtures):
  *   1. Sinks merged into max + denom; not into weighted-sum output.
  *   2. Two KV streams (raw_kv sliding-window + comp_kv) with distinct masks.
  *   3. Per-token causal raw mask: kv_start = max(0, tok+1-window).
  *   4. Per-token causal comp mask: n_visible = (tok+1)/ratio (ratio=0 => all).
- *   5. head_dim=512 in production; tile across embd-dim.
- *   6. Output: heads[t,h,d] = sum(weights * kv) * inv_denom — equivalent to
- *      online-softmax FA-2 epilogue (max-rescale of accumulator + final
- *      multiply by inv_denom).
+ *   5. head_dim variable; production = 512.  raw_kv == V (DSv4 shared K/V).
+ *   6. Output: heads[t,h,d] = sum(weights * kv) * inv_denom — implemented
+ *      via online-softmax FA-2 epilogue (running max-rescale of O + l).
  *
- * Stage 1B (this commit): scaffold only — redirects to existing kernel so
- * parity tests pass trivially against the new entry.  Stage 1C swaps in
- * the real FA-2 kernel; Stage 1D validates speedup vs the redirect.
+ * Structural lever vs the baseline kernel: the baseline launches one
+ * block per (tok, h) and reads each K row N_HEAD times per token; this
+ * kernel launches one block per (tok, head_tile) with H_TILE=4 heads
+ * sharing a single K-row read.  Even without tensor cores, expected
+ * 2-3x speedup from K-BW amortization on n_head=64 production shapes.
  */
+
+#define DS4_CUDA_FA2_H_TILE 4
+#define DS4_CUDA_FA2_BLOCK_THREADS 128
+#define DS4_CUDA_FA2_WARP_SIZE 32
+
+__device__ __forceinline__ float ds4_cuda_fa2_warp_reduce_sum(float v) {
+    #pragma unroll
+    for (int s = DS4_CUDA_FA2_WARP_SIZE / 2; s > 0; s >>= 1) {
+        v += __shfl_xor_sync(0xffffffffu, v, s);
+    }
+    return v;
+}
+
+static __global__ void ds4_cuda_attention_prefill_static_mixed_fa2_kernel(
+        float       *heads,
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        const float *sinks,
+        uint32_t     n_tokens,
+        uint32_t     n_comp,
+        uint32_t     window,
+        uint32_t     ratio,
+        uint32_t     n_head,
+        uint32_t     head_dim) {
+    const uint32_t tok    = blockIdx.x;
+    const uint32_t h_base = blockIdx.y * DS4_CUDA_FA2_H_TILE;
+    if (tok >= n_tokens || h_base >= n_head) return;
+    const uint32_t h_remain = n_head - h_base;
+    const uint32_t h_count  = h_remain < DS4_CUDA_FA2_H_TILE ? h_remain : DS4_CUDA_FA2_H_TILE;
+
+    const uint32_t tid     = threadIdx.x;
+    const uint32_t warp_id = tid / DS4_CUDA_FA2_WARP_SIZE;
+    const uint32_t lane    = tid % DS4_CUDA_FA2_WARP_SIZE;
+
+    /* Shmem layout (variable size, depends on head_dim):
+     *   q_shm:   H_TILE × head_dim
+     *   k_shm:   head_dim          (one K row, reused as V)
+     *   o_shm:   H_TILE × head_dim (running output accumulator)
+     *   m_shm:   H_TILE            (running max per head)
+     *   l_shm:   H_TILE            (running denom per head)
+     *   p_shm:   H_TILE            (current K-row weight per head)
+     *   alpha_shm: H_TILE          (rescale factor for O before adding new weighted V)
+     */
+    extern __shared__ float fa2_shmem[];
+    float *q_shm     = fa2_shmem;
+    float *k_shm     = q_shm   + (uint64_t)DS4_CUDA_FA2_H_TILE * head_dim;
+    float *o_shm     = k_shm   + (uint64_t)head_dim;
+    float *m_shm     = o_shm   + (uint64_t)DS4_CUDA_FA2_H_TILE * head_dim;
+    float *l_shm     = m_shm   + DS4_CUDA_FA2_H_TILE;
+    float *p_shm     = l_shm   + DS4_CUDA_FA2_H_TILE;
+    float *alpha_shm = p_shm   + DS4_CUDA_FA2_H_TILE;
+
+    const float kq_scale = rsqrtf((float)head_dim);
+
+    /* Load Q[tok, h_base..h_base+h_count, :] into q_shm. */
+    for (uint32_t hi = 0; hi < h_count; hi++) {
+        const float *qsrc = q + ((uint64_t)tok * n_head + (h_base + hi)) * head_dim;
+        for (uint32_t d = tid; d < head_dim; d += DS4_CUDA_FA2_BLOCK_THREADS) {
+            q_shm[(uint64_t)hi * head_dim + d] = qsrc[d];
+        }
+    }
+    /* Initialize state. */
+    if (tid < DS4_CUDA_FA2_H_TILE) {
+        m_shm[tid] = -INFINITY;
+        l_shm[tid] = 0.0f;
+    }
+    for (uint64_t i = tid; i < (uint64_t)DS4_CUDA_FA2_H_TILE * head_dim;
+         i += DS4_CUDA_FA2_BLOCK_THREADS) {
+        o_shm[i] = 0.0f;
+    }
+    __syncthreads();
+
+    /* Per-token causal masks for this token. */
+    const uint32_t kv_start  = (tok + 1u > window) ? (tok + 1u - window) : 0u;
+    const uint32_t n_raw     = tok + 1u - kv_start;
+    const uint32_t n_visible = ratio == 0u
+        ? n_comp
+        : ((tok + 1u) / ratio < n_comp ? (tok + 1u) / ratio : n_comp);
+
+    /* Unified KV iteration: raw_kv rows [kv_start, kv_start+n_raw) then
+     * comp_kv rows [0, n_visible).  Same online-softmax body for both. */
+    const uint32_t total_kv = n_raw + n_visible;
+    for (uint32_t r = 0; r < total_kv; r++) {
+        const float *kvr;
+        if (r < n_raw) {
+            kvr = raw_kv + (uint64_t)(kv_start + r) * head_dim;
+        } else {
+            kvr = comp_kv + (uint64_t)(r - n_raw) * head_dim;
+        }
+
+        /* Cooperative load K[r] into k_shm. */
+        for (uint32_t d = tid; d < head_dim; d += DS4_CUDA_FA2_BLOCK_THREADS) {
+            k_shm[d] = kvr[d];
+        }
+        __syncthreads();
+
+        /* Each warp computes one head's QK score + does online softmax
+         * + emits per-lane (alpha, p) for the cooperative O update. */
+        if (warp_id < h_count) {
+            const uint32_t hi = warp_id;
+            float partial = 0.0f;
+            for (uint32_t d = lane; d < head_dim; d += DS4_CUDA_FA2_WARP_SIZE) {
+                partial += q_shm[(uint64_t)hi * head_dim + d] * k_shm[d];
+            }
+            partial = ds4_cuda_fa2_warp_reduce_sum(partial);
+            /* All lanes in the warp now hold the same `partial`. */
+            const float score = partial * kq_scale;
+            const float m_old = m_shm[hi];
+            const float m_new = (score > m_old) ? score : m_old;
+            const float alpha = (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
+            const float p     = __expf(score - m_new);
+            if (lane == 0) {
+                m_shm[hi]     = m_new;
+                l_shm[hi]     = alpha * l_shm[hi] + p;
+                p_shm[hi]     = p;
+                alpha_shm[hi] = alpha;
+            }
+        }
+        __syncthreads();
+
+        /* All threads cooperate on O update: o[hi, d] = alpha[hi]*o[hi, d] + p[hi]*kvr[d]. */
+        for (uint32_t hi = 0; hi < h_count; hi++) {
+            const float a = alpha_shm[hi];
+            const float p = p_shm[hi];
+            float *o_row = o_shm + (uint64_t)hi * head_dim;
+            for (uint32_t d = tid; d < head_dim; d += DS4_CUDA_FA2_BLOCK_THREADS) {
+                o_row[d] = a * o_row[d] + p * k_shm[d];
+            }
+        }
+        __syncthreads();
+    }
+
+    /* Sinks correction: for each head, fold sinks[h] into m + l (no V contribution). */
+    if (tid < h_count) {
+        const uint32_t hi = tid;
+        const float s     = sinks[h_base + hi];
+        const float m_old = m_shm[hi];
+        const float m_new = (s > m_old) ? s : m_old;
+        const float alpha = (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
+        const float p     = __expf(s - m_new);
+        m_shm[hi]     = m_new;
+        l_shm[hi]     = alpha * l_shm[hi] + p;
+        alpha_shm[hi] = alpha;
+    }
+    __syncthreads();
+    /* Apply final alpha rescale to O (sinks contribute nothing to O). */
+    for (uint32_t hi = 0; hi < h_count; hi++) {
+        const float a = alpha_shm[hi];
+        float *o_row = o_shm + (uint64_t)hi * head_dim;
+        for (uint32_t d = tid; d < head_dim; d += DS4_CUDA_FA2_BLOCK_THREADS) {
+            o_row[d] = a * o_row[d];
+        }
+    }
+    __syncthreads();
+
+    /* Normalize O / l and write out. */
+    for (uint32_t hi = 0; hi < h_count; hi++) {
+        const float l = l_shm[hi];
+        const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+        const float *o_row = o_shm + (uint64_t)hi * head_dim;
+        float *out_row = heads + ((uint64_t)tok * n_head + (h_base + hi)) * head_dim;
+        for (uint32_t d = tid; d < head_dim; d += DS4_CUDA_FA2_BLOCK_THREADS) {
+            out_row[d] = o_row[d] * inv;
+        }
+    }
+}
+
 int ds4_cuda_attention_prefill_static_mixed_fa2_heads_tensor(
         ds4_cuda_tensor       *heads,
         const void            *model_map,
@@ -6008,10 +6173,51 @@ int ds4_cuda_attention_prefill_static_mixed_fa2_heads_tensor(
         uint32_t               ratio,
         uint32_t               n_head,
         uint32_t               head_dim) {
-    return ds4_cuda_attention_prefill_static_mixed_heads_tensor(
-        heads, model_map, model_size, sinks_offset,
-        q, raw_kv, comp_kv,
-        n_tokens, n_comp, window, ratio, n_head, head_dim);
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (!model_map || !heads || !q || !raw_kv ||
+        n_tokens == 0u || n_head == 0u || head_dim == 0u || window == 0u) return 0;
+    if (n_comp != 0u && !comp_kv) return 0;
+
+    const uint64_t sinks_bytes = (uint64_t)n_head * sizeof(float);
+    if (sinks_offset > model_size || sinks_bytes > model_size - sinks_offset) {
+        fprintf(stderr, "ds4: CUDA prefill_static_mixed_fa2 sinks range outside mapped model\n");
+        return 0;
+    }
+
+    const uint64_t row_bytes   = (uint64_t)head_dim * sizeof(float);
+    const uint64_t q_bytes     = (uint64_t)n_tokens * n_head * row_bytes;
+    const uint64_t raw_bytes   = (uint64_t)n_tokens * row_bytes;
+    const uint64_t comp_bytes  = (uint64_t)n_comp * row_bytes;
+    const uint64_t heads_bytes = q_bytes;
+
+    void *q_ptr = NULL, *raw_ptr = NULL, *comp_ptr = NULL, *heads_ptr = NULL;
+    if (!ds4_cuda_tensor_range(q,      q_bytes,     "prefill_static_mixed_fa2 q",      &q_ptr))     return 0;
+    if (!ds4_cuda_tensor_range(raw_kv, raw_bytes,   "prefill_static_mixed_fa2 raw_kv", &raw_ptr))   return 0;
+    if (!ds4_cuda_tensor_range(heads,  heads_bytes, "prefill_static_mixed_fa2 heads",  &heads_ptr)) return 0;
+    if (n_comp != 0u) {
+        if (!ds4_cuda_tensor_range(comp_kv, comp_bytes, "prefill_static_mixed_fa2 comp_kv", &comp_ptr)) return 0;
+    }
+
+    const float *sinks_ptr = (const float *)((const uint8_t *)model_map + sinks_offset);
+
+    /* Shmem: H_TILE*head_dim (Q) + head_dim (K) + H_TILE*head_dim (O) + 4*H_TILE (m,l,p,alpha). */
+    const uint64_t shmem_floats =
+        (uint64_t)DS4_CUDA_FA2_H_TILE * head_dim + (uint64_t)head_dim
+      + (uint64_t)DS4_CUDA_FA2_H_TILE * head_dim + 4ull * DS4_CUDA_FA2_H_TILE;
+    const size_t shmem_bytes = (size_t)shmem_floats * sizeof(float);
+
+    const uint32_t h_blocks = (n_head + DS4_CUDA_FA2_H_TILE - 1u) / DS4_CUDA_FA2_H_TILE;
+    dim3 grid(n_tokens, h_blocks, 1u);
+    dim3 block(DS4_CUDA_FA2_BLOCK_THREADS, 1u, 1u);
+    ds4_cuda_attention_prefill_static_mixed_fa2_kernel
+        <<<grid, block, shmem_bytes, g_stream>>>(
+            (float *)heads_ptr, (const float *)q_ptr,
+            (const float *)raw_ptr,
+            n_comp != 0u ? (const float *)comp_ptr : (const float *)NULL,
+            sinks_ptr,
+            n_tokens, n_comp, window, ratio, n_head, head_dim);
+    return ds4_cuda_check(cudaGetLastError(), "launch attention_prefill_static_mixed_fa2");
 }
 
 } /* extern "C" */
