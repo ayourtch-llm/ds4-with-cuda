@@ -12,7 +12,9 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 
 #include <inttypes.h>
 #include <math.h>
@@ -145,6 +147,17 @@ static void    *g_moe_perm_down_scratch_f32;
 static uint64_t g_moe_perm_down_scratch_bytes;
 static void    *g_moe_inverse_permute_scratch;
 static uint64_t g_moe_inverse_permute_scratch_bytes;
+/* FP8 MoE retile Phase 0: cublasLt handle + E4M3 scratch buffers. */
+static cublasLtHandle_t g_cublaslt_handle;
+static void    *g_moe_expert_weight_scratch_e4m3;
+static uint64_t g_moe_expert_weight_scratch_e4m3_bytes;
+static void    *g_moe_perm_act_scratch_e4m3;
+static uint64_t g_moe_perm_act_scratch_e4m3_bytes;
+static float   *g_moe_e4m3_a_inv_scale;   /* 1 float on device, activation scale */
+static float   *g_moe_e4m3_b_inv_scale;   /* 1 float on device, weight scale */
+static int g_moe_retile_fp8_disabled;
+static int g_moe_retile_fp8_initialized;
+static int g_moe_retile_fp8_enabled_flag;
 static int g_f16_tensor_core_disabled;
 static int g_f16_tensor_core_warned;
 static int g_q8_cublas_warned;
@@ -266,6 +279,38 @@ static int ds4_cuda_ensure_moe_scratch(void **slot,
     if (*slot) cudaFree(*slot);
     *slot = next;
     *slot_bytes = need_bytes;
+    return 1;
+}
+
+static int ds4_cuda_moe_retile_fp8_enabled(void) {
+    if (!g_moe_retile_fp8_initialized) {
+        const char *s = getenv("DS4_CUDA_MOE_RETILE_FP8");
+        g_moe_retile_fp8_enabled_flag = (s && s[0] && s[0] != '0') ? 1 : 0;
+        g_moe_retile_fp8_initialized = 1;
+    }
+    return g_moe_retile_fp8_enabled_flag && !g_moe_retile_fp8_disabled
+           && g_cublaslt_handle != NULL;
+}
+
+static int ds4_cuda_ensure_moe_fp8_scratches(uint64_t expert_mid_dim,
+                                              uint64_t expert_in_dim,
+                                              uint64_t pair_rows) {
+    if (!ds4_cuda_ensure_moe_scratch(&g_moe_expert_weight_scratch_e4m3,
+                                     &g_moe_expert_weight_scratch_e4m3_bytes,
+                                     expert_mid_dim * expert_in_dim * sizeof(uint8_t),
+                                     "moe expert weight e4m3")) return 0;
+    if (!ds4_cuda_ensure_moe_scratch(&g_moe_perm_act_scratch_e4m3,
+                                     &g_moe_perm_act_scratch_e4m3_bytes,
+                                     pair_rows * expert_in_dim * sizeof(uint8_t),
+                                     "moe perm act e4m3")) return 0;
+    if (!g_moe_e4m3_a_inv_scale) {
+        if (!ds4_cuda_check(cudaMalloc((void **)&g_moe_e4m3_a_inv_scale, sizeof(float)),
+                            "moe e4m3 a inv scale")) return 0;
+    }
+    if (!g_moe_e4m3_b_inv_scale) {
+        if (!ds4_cuda_check(cudaMalloc((void **)&g_moe_e4m3_b_inv_scale, sizeof(float)),
+                            "moe e4m3 b inv scale")) return 0;
+    }
     return 1;
 }
 
@@ -2916,6 +2961,16 @@ int ds4_cuda_init(void) {
         }
     }
 
+    /* FP8 MoE retile Phase 0: cublasLt handle (non-fatal if unavailable). */
+    {
+        cublasStatus_t lt_status = cublasLtCreate(&g_cublaslt_handle);
+        if (lt_status != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "ds4: cublasLtCreate failed — FP8 MoE retile path disabled\n");
+            g_cublaslt_handle = NULL;
+            g_moe_retile_fp8_disabled = 1;
+        }
+    }
+
     /* Phase 5 C3 calibration: opt-in L2 persisting region.
      * DS4_CUDA_L2_PERSIST_MB=N sets the device-level persisting L2 budget
      * to N MiB (clamped to MaxPersistingL2CacheSize).  The matching access
@@ -3045,6 +3100,32 @@ void ds4_cuda_cleanup(void) {
         g_moe_inverse_permute_scratch = NULL;
         g_moe_inverse_permute_scratch_bytes = 0;
     }
+    /* FP8 MoE retile Phase 0: free E4M3 scratches + cublasLt handle. */
+    if (g_moe_expert_weight_scratch_e4m3) {
+        cudaFree(g_moe_expert_weight_scratch_e4m3);
+        g_moe_expert_weight_scratch_e4m3 = NULL;
+        g_moe_expert_weight_scratch_e4m3_bytes = 0;
+    }
+    if (g_moe_perm_act_scratch_e4m3) {
+        cudaFree(g_moe_perm_act_scratch_e4m3);
+        g_moe_perm_act_scratch_e4m3 = NULL;
+        g_moe_perm_act_scratch_e4m3_bytes = 0;
+    }
+    if (g_moe_e4m3_a_inv_scale) {
+        cudaFree(g_moe_e4m3_a_inv_scale);
+        g_moe_e4m3_a_inv_scale = NULL;
+    }
+    if (g_moe_e4m3_b_inv_scale) {
+        cudaFree(g_moe_e4m3_b_inv_scale);
+        g_moe_e4m3_b_inv_scale = NULL;
+    }
+    if (g_cublaslt_handle) {
+        cublasLtDestroy(g_cublaslt_handle);
+        g_cublaslt_handle = NULL;
+    }
+    g_moe_retile_fp8_disabled = 0;
+    g_moe_retile_fp8_initialized = 0;
+    g_moe_retile_fp8_enabled_flag = 0;
     g_q8_cublas_warned = 0;
     if (g_cublas_handle) {
         cublasDestroy(g_cublas_handle);
@@ -5293,6 +5374,13 @@ static int ds4_cuda_routed_moe_iq2_xxs_retile(
                                      &g_moe_inverse_permute_scratch_bytes,
                                      pair_rows * sizeof(int32_t),
                                      "moe inverse permute")) return 0;
+
+    /* FP8 MoE retile Phase 0: lazily allocate E4M3 scratches when gate is on. */
+    if (ds4_cuda_moe_retile_fp8_enabled()) {
+        if (!ds4_cuda_ensure_moe_fp8_scratches((uint64_t)expert_mid_dim,
+                                               (uint64_t)expert_in_dim,
+                                               pair_rows)) return 0;
+    }
 
     void *x_ptr = NULL, *selected_ptr = NULL, *rw_ptr = NULL;
     void *gate_ptr = NULL, *up_ptr = NULL, *mid_ptr = NULL, *out_ptr = NULL;
