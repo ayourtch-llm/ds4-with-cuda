@@ -11350,4 +11350,152 @@ int ds4_cuda_compressor_prefill_ratio4_replay_tensor(
     return 1;
 }
 
+/* FP8 MoE retile Phase 0 — Chunk 2: F32 → E4M3 cast with amax.
+ *
+ * Two-kernel approach (per brief): first kernel reduces to amax, second kernel
+ * scales and casts.  A cudaStreamSynchronize between them lets the cast kernel
+ * read the device-side amax scalar without a separate atomic-fence.
+ */
+
+/* Pass 1: reduce abs-max of x[0..N) into *amax_out via atomicMax on the
+ * positive-float integer trick (IEEE 754 positive floats compare correctly as
+ * unsigned ints).  Caller must zero-initialise *amax_out before launch. */
+__global__ static void ds4_cuda_kernel_f32_amax(
+        float       *amax_out,
+        const float *x,
+        uint32_t     N)
+{
+    extern __shared__ float sdata[];
+    uint32_t tid = threadIdx.x;
+    uint32_t idx = blockIdx.x * blockDim.x + tid;
+    float lmax = 0.0f;
+    while (idx < N) {
+        float v = fabsf(x[idx]);
+        if (v > lmax) lmax = v;
+        idx += gridDim.x * blockDim.x;
+    }
+    sdata[tid] = lmax;
+    __syncthreads();
+    for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    if (tid == 0) atomicMax((int *)amax_out, __float_as_int(sdata[0]));
+}
+
+/* Pass 2: scale x by (448 / amax) and cast each element to E4M3 storage.
+ * Writes inv_scale = amax / 448 once from thread 0 of block 0. */
+__global__ static void ds4_cuda_kernel_f32_to_e4m3(
+        __nv_fp8_storage_t *out,
+        float              *inv_scale_out,
+        const float        *x,
+        const float        *amax,
+        uint32_t            N)
+{
+    float amax_val  = *amax;
+    float scale     = (amax_val > 0.0f) ? (448.0f / amax_val) : 1.0f;
+    float inv_scale = (amax_val > 0.0f) ? (amax_val / 448.0f) : 1.0f;
+    if (threadIdx.x == 0 && blockIdx.x == 0) *inv_scale_out = inv_scale;
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    while (idx < N) {
+        out[idx] = __nv_cvt_float_to_fp8(x[idx] * scale, __NV_SATFINITE, __NV_E4M3);
+        idx += gridDim.x * blockDim.x;
+    }
+}
+
+/* Host-side E4M3 decoder for the round-trip test.  Implements the IEEE
+ * E4M3 representation: bias=7, subnormal exponent treated as 2^(-6). */
+static float ds4_cuda_e4m3_to_float(__nv_fp8_storage_t s) {
+    int sign = (s >> 7) & 1;
+    int exp  = (s >> 3) & 0xF;
+    int mant = s & 0x7;
+    if (exp == 0xF && mant == 0x7) return 0.0f / 0.0f;  /* NaN sentinel */
+    float val;
+    if (exp == 0) {
+        /* subnormal: 2^(1-bias) * (mant/8) = 2^(-6) * mant/8 */
+        val = (float)mant * (1.0f / 512.0f);
+    } else {
+        val = (1.0f + (float)mant * (1.0f / 8.0f)) * ldexpf(1.0f, exp - 7);
+    }
+    return sign ? -val : val;
+}
+
+/* Standalone test: allocates transient device buffers, runs amax + cast
+ * kernels, reads back, dequantizes on host, checks round-trip error.
+ * Requires g_initialized; does NOT require g_batch_open.
+ * Returns 1 on pass, 0 on failure. */
+int ds4_cuda_test_f32_to_e4m3(const float *host_in, uint32_t N, float tolerance) {
+    if (!g_initialized) return 0;
+    if (N == 0) return 1;
+
+    float              *d_in        = NULL;
+    float              *d_amax      = NULL;
+    __nv_fp8_storage_t *d_out_e4m3  = NULL;
+    float              *d_inv_scale = NULL;
+    int ok = 1;
+
+    ok = ok && ds4_cuda_check(cudaMalloc((void **)&d_in,        (size_t)N * sizeof(float)), "f32_to_e4m3 d_in");
+    ok = ok && ds4_cuda_check(cudaMalloc((void **)&d_amax,      sizeof(float)),              "f32_to_e4m3 d_amax");
+    ok = ok && ds4_cuda_check(cudaMalloc((void **)&d_out_e4m3,  (size_t)N),                  "f32_to_e4m3 d_out");
+    ok = ok && ds4_cuda_check(cudaMalloc((void **)&d_inv_scale, sizeof(float)),              "f32_to_e4m3 d_inv_scale");
+
+    if (ok) ok = ds4_cuda_check(cudaMemcpyAsync(d_in, host_in, (size_t)N * sizeof(float),
+                                                cudaMemcpyHostToDevice, g_stream), "f32_to_e4m3 H2D");
+    if (ok) ok = ds4_cuda_check(cudaMemsetAsync(d_amax, 0, sizeof(float), g_stream), "f32_to_e4m3 amax zero");
+
+    if (ok) {
+        const uint32_t threads = 256u;
+        const uint32_t blocks  = (N + threads - 1u) / threads;
+        ds4_cuda_kernel_f32_amax<<<blocks, threads, threads * sizeof(float), g_stream>>>(
+            d_amax, d_in, N);
+        ok = ds4_cuda_check(cudaGetLastError(), "f32_to_e4m3 amax kernel");
+    }
+    if (ok) ok = ds4_cuda_check(cudaStreamSynchronize(g_stream), "f32_to_e4m3 amax sync");
+
+    if (ok) {
+        const uint32_t threads = 256u;
+        const uint32_t blocks  = (N + threads - 1u) / threads;
+        ds4_cuda_kernel_f32_to_e4m3<<<blocks, threads, 0, g_stream>>>(
+            d_out_e4m3, d_inv_scale, d_in, d_amax, N);
+        ok = ds4_cuda_check(cudaGetLastError(), "f32_to_e4m3 cast kernel");
+    }
+    if (ok) ok = ds4_cuda_check(cudaStreamSynchronize(g_stream), "f32_to_e4m3 cast sync");
+
+    __nv_fp8_storage_t *h_out = NULL;
+    float h_inv_scale = 1.0f;
+    if (ok) {
+        h_out = (__nv_fp8_storage_t *)malloc((size_t)N);
+        ok = (h_out != NULL);
+    }
+    if (ok) {
+        ok = ds4_cuda_check(cudaMemcpy(h_out, d_out_e4m3, (size_t)N, cudaMemcpyDeviceToHost),
+                            "f32_to_e4m3 D2H out");
+        ok = ok && ds4_cuda_check(cudaMemcpy(&h_inv_scale, d_inv_scale, sizeof(float),
+                                             cudaMemcpyDeviceToHost), "f32_to_e4m3 D2H scale");
+    }
+    if (ok) {
+        for (uint32_t i = 0; i < N && ok; i++) {
+            float orig = host_in[i];
+            if (fabsf(orig) < 1e-6f) continue;  /* skip near-zero; relative error undefined */
+            float dq  = ds4_cuda_e4m3_to_float(h_out[i]) * h_inv_scale;
+            float err = fabsf(dq - orig);
+            if (err > tolerance * fabsf(orig)) {
+                fprintf(stderr,
+                        "ds4_cuda_test_f32_to_e4m3: FAIL at %u: in=%.6g dq=%.6g "
+                        "err=%.3g tol=%.3g inv_scale=%.6g\n",
+                        i, (double)orig, (double)dq, (double)err,
+                        (double)(tolerance * fabsf(orig)), (double)h_inv_scale);
+                ok = 0;
+            }
+        }
+    }
+
+    free(h_out);
+    if (d_in)        cudaFree(d_in);
+    if (d_amax)      cudaFree(d_amax);
+    if (d_out_e4m3)  cudaFree(d_out_e4m3);
+    if (d_inv_scale) cudaFree(d_inv_scale);
+    return ok;
+}
+
 } /* extern "C" */

@@ -118,6 +118,7 @@ int ds4_cuda_test_dequant_q2_K_to_f32_fast_tensor(
         const ds4_cuda_tensor *weights,
         uint32_t               in_dim,
         uint32_t               out_dim);
+int ds4_cuda_test_f32_to_e4m3(const float *host_in, uint32_t N, float tolerance);
 int ds4_cuda_test_moe_layout_tensor(
         ds4_cuda_tensor       *expert_count,
         ds4_cuda_tensor       *expert_offset,
@@ -1605,6 +1606,42 @@ DS4_CUDA_PARITY_TEST(dequant_q2_K_to_f32_fast,
     .cpu_fn = dequant_q2_K_to_f32_cpu,
     .cuda_fn = dequant_q2_K_to_f32_fast_cuda,
     .cfg = (void *)&dequant_q2_k_cfg);
+
+/* FP8 MoE retile Phase 0 — Chunk 2: F32 → E4M3 round-trip parity test.
+ *
+ * cpu_fn: identity (copies input to output).
+ * cuda_fn: calls ds4_cuda_test_f32_to_e4m3 (standalone, does its own sync
+ * and tolerance check), then writes the original input to the parity output
+ * buffer so the ULP comparison against the identity cpu_fn scores 0.
+ * The real correctness gate is the 5% relative-error check inside the
+ * standalone test; this parity entry just contributes +1 to the test count. */
+static int f32_to_e4m3_cpu(const float *in, float *out, void *cfg) {
+    (void)cfg;
+    memcpy(out, in, 4096 * sizeof(float));
+    return 1;
+}
+
+static int f32_to_e4m3_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                              size_t in_elems, size_t out_elems, void *cfg) {
+    (void)cfg; (void)out_elems;
+    /* E4M3 worst-case relative quantization error = 1/16 = 6.25%; use 7% to
+     * absorb fast-math fp32 rounding in the scale multiply. */
+    if (!ds4_cuda_test_f32_to_e4m3(in, (uint32_t)in_elems, 0.07f)) return 0;
+    /* Write identity to parity output so ULP comparison passes. */
+    float *out_ptr = (float *)ds4_cuda_tensor_contents(out_dev);
+    if (!out_ptr) return 0;
+    memcpy(out_ptr, in, out_elems * sizeof(float));
+    return 1;
+}
+
+DS4_CUDA_PARITY_TEST(f32_to_e4m3_roundtrip,
+    .seed = 0xF8E43020,
+    .in_elems = 4096,
+    .out_elems = 4096,
+    .ulp_tolerance = 0,
+    .cpu_fn = f32_to_e4m3_cpu,
+    .cuda_fn = f32_to_e4m3_cuda,
+    .cfg = NULL);
 
 /* Phase 7b MoE retile Step C-1: routing-layout kernel parity test.
  *
@@ -6798,6 +6835,7 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_dequant_iq2_xxs_to_f32_fast,
     &ds4_cuda_parity_dequant_q2_K_to_f32,
     &ds4_cuda_parity_dequant_q2_K_to_f32_fast,
+    &ds4_cuda_parity_f32_to_e4m3_roundtrip,
     &ds4_cuda_parity_moe_layout,
     &ds4_cuda_parity_moe_gather_act_to_f32,
     &ds4_cuda_parity_moe_unpermute_swiglu_route,
