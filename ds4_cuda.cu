@@ -5914,6 +5914,21 @@ static __global__ void ds4_cuda_attention_prefill_static_mixed_kernel(
 
 extern "C" {
 
+/* Phase 8 Stage 1 — env-gate to route production callers through the FA-2
+ * retile when DS4_CUDA_FA2=1.  Default off; flip on via env var until perf
+ * + parity validated.  Per `feedback_runtime_only_bugs`: env-gate so a
+ * silently-wrong FA-2 can't poison the default path. */
+static int ds4_cuda_fa2_enabled(void) {
+    static int initialized;
+    static int enabled;
+    if (!initialized) {
+        const char *s = getenv("DS4_CUDA_FA2");
+        enabled = (s && s[0] && s[0] != '0') ? 1 : 0;
+        initialized = 1;
+    }
+    return enabled;
+}
+
 int ds4_cuda_attention_prefill_static_mixed_heads_tensor(
         ds4_cuda_tensor       *heads,
         const void            *model_map,
@@ -5928,6 +5943,12 @@ int ds4_cuda_attention_prefill_static_mixed_heads_tensor(
         uint32_t               ratio,
         uint32_t               n_head,
         uint32_t               head_dim) {
+    if (ds4_cuda_fa2_enabled()) {
+        return ds4_cuda_attention_prefill_static_mixed_fa2_heads_tensor(
+            heads, model_map, model_size, sinks_offset,
+            q, raw_kv, comp_kv,
+            n_tokens, n_comp, window, ratio, n_head, head_dim);
+    }
     if (!g_initialized && !ds4_cuda_init()) return 0;
     if (!g_batch_open) return 0;
     if (!model_map || !heads || !q || !raw_kv ||
