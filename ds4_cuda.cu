@@ -123,6 +123,17 @@ static void    *g_moe_layout_offset_scratch;
 static uint64_t g_moe_layout_offset_scratch_bytes;
 static void    *g_moe_layout_indices_scratch;
 static uint64_t g_moe_layout_indices_scratch_bytes;
+/* Step E down retile adds three more scratches:
+ *   perm_mid_f16:        48 MB   (12288 × 2048 × 2 at max prefill)
+ *   perm_down_f32:      192 MB   (12288 × 4096 × 4)
+ *   inverse_permute:     48 KB   (n_tokens × n_expert_used × 4)
+ * Total Step C+E scratch ≤ 544 MB, still well within GB10 budget. */
+static void    *g_moe_perm_mid_scratch_f16;
+static uint64_t g_moe_perm_mid_scratch_bytes;
+static void    *g_moe_perm_down_scratch_f32;
+static uint64_t g_moe_perm_down_scratch_bytes;
+static void    *g_moe_inverse_permute_scratch;
+static uint64_t g_moe_inverse_permute_scratch_bytes;
 static int g_f16_tensor_core_disabled;
 static int g_f16_tensor_core_warned;
 static int g_q8_cublas_warned;
@@ -2606,6 +2617,21 @@ void ds4_cuda_cleanup(void) {
         g_moe_layout_indices_scratch = NULL;
         g_moe_layout_indices_scratch_bytes = 0;
     }
+    if (g_moe_perm_mid_scratch_f16) {
+        cudaFree(g_moe_perm_mid_scratch_f16);
+        g_moe_perm_mid_scratch_f16 = NULL;
+        g_moe_perm_mid_scratch_bytes = 0;
+    }
+    if (g_moe_perm_down_scratch_f32) {
+        cudaFree(g_moe_perm_down_scratch_f32);
+        g_moe_perm_down_scratch_f32 = NULL;
+        g_moe_perm_down_scratch_bytes = 0;
+    }
+    if (g_moe_inverse_permute_scratch) {
+        cudaFree(g_moe_inverse_permute_scratch);
+        g_moe_inverse_permute_scratch = NULL;
+        g_moe_inverse_permute_scratch_bytes = 0;
+    }
     g_q8_cublas_warned = 0;
     if (g_cublas_handle) {
         cublasDestroy(g_cublas_handle);
@@ -4639,6 +4665,18 @@ static int ds4_cuda_routed_moe_iq2_xxs_retile(
                                      &g_moe_layout_indices_scratch_bytes,
                                      pair_rows * sizeof(uint32_t),
                                      "moe layout indices")) return 0;
+    if (!ds4_cuda_ensure_moe_scratch(&g_moe_perm_mid_scratch_f16,
+                                     &g_moe_perm_mid_scratch_bytes,
+                                     pair_rows * expert_mid_dim * sizeof(__half),
+                                     "moe perm mid f16")) return 0;
+    if (!ds4_cuda_ensure_moe_scratch(&g_moe_perm_down_scratch_f32,
+                                     &g_moe_perm_down_scratch_bytes,
+                                     pair_rows * out_dim * sizeof(float),
+                                     "moe perm down f32")) return 0;
+    if (!ds4_cuda_ensure_moe_scratch(&g_moe_inverse_permute_scratch,
+                                     &g_moe_inverse_permute_scratch_bytes,
+                                     pair_rows * sizeof(int32_t),
+                                     "moe inverse permute")) return 0;
 
     void *x_ptr = NULL, *selected_ptr = NULL, *rw_ptr = NULL;
     void *gate_ptr = NULL, *up_ptr = NULL, *mid_ptr = NULL, *out_ptr = NULL;
@@ -4788,23 +4826,106 @@ static int ds4_cuda_routed_moe_iq2_xxs_retile(
         if (!ds4_cuda_check(cudaGetLastError(), "retile unpermute")) return 0;
     }
 
-    /* (6) Existing down kernel — unchanged math.  Reads mid (which we wrote
-     * at canonical pair indices) and selected (kept on device). */
-    {
-        constexpr uint32_t ROWS_PER_BLOCK = 4u;
-        const uint32_t out_row_blocks = (out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
+    /* (6) Step E: Q2_K down retile.  Replaces the existing down kernel
+     * with: gather mid → F16 → per-expert dequant_q2_K + cuBLAS GemmEx
+     * → build inverse_permute → scatter-sum.  The `experts` output (the
+     * per-routing pre-sum down tensor) is left unwritten — on the CUDA
+     * path the production prefill never reads it (allocated but only
+     * referenced as a dead write target by the existing fused kernel),
+     * so skipping it costs nothing and avoids an extra scratch pass.
+     * If a future caller needs it, they can either fall back to the
+     * fused kernel via DS4_CUDA_MOE_RETILE=0 or call cuBLAS once more
+     * with output to experts directly. */
+    (void)experts_ptr;
+
+    if (total_routings > 0) {
+        /* (6a) Gather mid → permuted_mid_f16 in expert-sorted order. */
+        const uint32_t threads_g = 256u;
+        const uint32_t grid_g    = (expert_mid_dim + threads_g - 1u) / threads_g;
+        ds4_cuda_kernel_moe_gather_mid_to_half<<<
+                dim3(grid_g, total_routings, 1),
+                dim3(threads_g, 1, 1),
+                0, g_stream>>>(
+            (__half *)g_moe_perm_mid_scratch_f16,
+            (const float *)mid_ptr,
+            (const uint32_t *)g_moe_layout_indices_scratch,
+            expert_mid_dim, total_routings);
+        if (!ds4_cuda_check(cudaGetLastError(), "retile gather_mid")) return 0;
+
+        /* (6b) Pre-fill inverse_permute with -1 then build it. */
+        if (!ds4_cuda_check(cudaMemsetAsync(g_moe_inverse_permute_scratch, 0xFF,
+                                            (size_t)pair_rows * sizeof(int32_t),
+                                            g_stream),
+                            "retile inverse memset")) return 0;
+        const uint32_t threads_i = 256u;
+        const uint32_t grid_i    = ((uint32_t)total_routings + threads_i - 1u) / threads_i;
+        ds4_cuda_kernel_moe_build_inverse_permute<<<grid_i, threads_i, 0, g_stream>>>(
+            (int32_t *)g_moe_inverse_permute_scratch,
+            (const uint32_t *)g_moe_layout_indices_scratch,
+            total_routings);
+        if (!ds4_cuda_check(cudaGetLastError(), "retile build_inverse")) return 0;
+
+        /* (6c) Per-expert dequant_q2_K + cuBLAS GemmEx.  Same shape as
+         * gate/up but with M=out_dim and K=mid_dim swapped. */
         const ds4_cuda_block_q2_K *down_w = (const ds4_cuda_block_q2_K *)
             ((const uint8_t *)model_map + down_offset);
-        ds4_cuda_routed_moe_down_q2_k_kernel<ROWS_PER_BLOCK><<<
-                dim3(out_row_blocks, n_tokens, 1),
-                dim3(32u, ROWS_PER_BLOCK, 1),
+        const uint32_t blocks_per_row_d = expert_mid_dim / 256u;
+        const float alpha = 1.0f;
+        const float beta  = 0.0f;
+
+        for (uint32_t e = 0; e < N_EXPERT_TOTAL; e++) {
+            const uint32_t e_start = expert_offset_h[e];
+            const uint32_t e_count = expert_offset_h[e + 1u] - e_start;
+            if (e_count == 0u) continue;
+
+            const ds4_cuda_block_q2_K *e_down = (const ds4_cuda_block_q2_K *)
+                ((const uint8_t *)down_w + (uint64_t)e * down_expert_bytes);
+
+            const __half *mid_block = (const __half *)g_moe_perm_mid_scratch_f16
+                                      + (uint64_t)e_start * expert_mid_dim;
+            float *down_block = (float *)g_moe_perm_down_scratch_f32
+                                + (uint64_t)e_start * out_dim;
+
+            ds4_cuda_kernel_dequant_q2_K_to_half<<<
+                    dim3(blocks_per_row_d, out_dim, 1),
+                    dim3(32u, 1, 1),
+                    0, g_stream>>>(
+                (__half *)g_moe_expert_weight_scratch_f16,
+                e_down, expert_mid_dim, out_dim);
+            if (!ds4_cuda_check(cudaGetLastError(), "retile down dequant")) return 0;
+            cublasStatus_t status = cublasGemmEx(
+                g_cublas_handle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                (int)out_dim, (int)e_count, (int)expert_mid_dim,
+                &alpha,
+                g_moe_expert_weight_scratch_f16, CUDA_R_16F, (int)expert_mid_dim,
+                mid_block,                       CUDA_R_16F, (int)expert_mid_dim,
+                &beta,
+                down_block,                      CUDA_R_32F, (int)out_dim,
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            if (!ds4_cuda_check_cublas(status, "retile down cublasGemmEx")) return 0;
+        }
+
+        /* (6d) Scatter-sum permuted_down → out. */
+        const uint32_t threads_s = 256u;
+        const uint32_t grid_s    = (out_dim + threads_s - 1u) / threads_s;
+        ds4_cuda_kernel_moe_scatter_down_sum<<<
+                dim3(grid_s, n_tokens, 1),
+                dim3(threads_s, 1, 1),
                 0, g_stream>>>(
-            down_w, (const float *)mid_ptr,
-            (const int32_t *)selected_ptr,
-            (float *)experts_ptr, (float *)out_ptr,
-            n_tokens, n_expert_used, expert_mid_dim, out_dim,
-            down_expert_bytes, down_row_bytes);
-        if (!ds4_cuda_check(cudaGetLastError(), "retile down")) return 0;
+            (float *)out_ptr,
+            (const float *)g_moe_perm_down_scratch_f32,
+            (const int32_t *)g_moe_inverse_permute_scratch,
+            n_expert_used, out_dim);
+        if (!ds4_cuda_check(cudaGetLastError(), "retile scatter_sum")) return 0;
+    } else {
+        /* No live routings — out is the sum of zero contributions per
+         * token, i.e. zeros.  Match by writing zeros explicitly. */
+        if (!ds4_cuda_check(cudaMemsetAsync(out_ptr, 0,
+                                            (size_t)n_tokens * out_dim * sizeof(float),
+                                            g_stream),
+                            "retile out zero (no routings)")) return 0;
     }
 
     return 1;
