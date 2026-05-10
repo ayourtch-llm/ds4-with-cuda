@@ -4414,7 +4414,7 @@ static int ds4_cuda_routed_moe_iq2_xxs_retile(
         float                  clamp,
         const ds4_cuda_tensor *x,
         uint32_t               n_tokens) {
-    static const uint32_t N_EXPERT_TOTAL = 256u;
+    constexpr uint32_t N_EXPERT_TOTAL = 256u;
     if (g_cublas_handle == NULL || g_f16_tensor_core_disabled) return 0;
     if ((expert_in_dim % 256u) != 0 || (expert_mid_dim % 256u) != 0) return 0;
     if (expert_in_dim > INT_MAX || expert_mid_dim > INT_MAX || n_tokens > INT_MAX) return 0;
@@ -4480,9 +4480,17 @@ static int ds4_cuda_routed_moe_iq2_xxs_retile(
         if (!ds4_cuda_check(cudaGetLastError(), "retile layout")) return 0;
     }
 
-    /* (2) Sync to read offsets host-side. */
+    /* (2) Sync + copy offsets host-side.  Scratches are plain cudaMalloc
+     * device memory, so we must DtoH-copy the small offset array before
+     * driving the per-expert dispatch. */
+    uint32_t expert_offset_h[N_EXPERT_TOTAL + 1u];
+    if (!ds4_cuda_check(cudaMemcpyAsync(expert_offset_h,
+                                        g_moe_layout_offset_scratch,
+                                        sizeof(expert_offset_h),
+                                        cudaMemcpyDeviceToHost,
+                                        g_stream),
+                        "retile copy expert_offset DtoH")) return 0;
     if (!ds4_cuda_check(cudaStreamSynchronize(g_stream), "retile sync after layout")) return 0;
-    const uint32_t *expert_offset_h = (const uint32_t *)g_moe_layout_offset_scratch;
     const uint32_t total_routings = expert_offset_h[N_EXPERT_TOTAL];
 
     /* (3) Gather + F16 convert. */
