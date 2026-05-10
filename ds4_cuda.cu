@@ -570,6 +570,21 @@ static int ds4_cuda_trace_allocs(void) {
     return enabled;
 }
 
+/* Phase 7b MoE retile Step C-6: env-gated activation of the IQ2_XXS gate+up
+ * cuBLAS retile path.  Default off; flip on with DS4_CUDA_MOE_RETILE=1.
+ * Per `feedback_runtime_only_bugs`: env-gate so a silently-wrong retile
+ * can't poison the default. */
+static int ds4_cuda_moe_retile_enabled(void) {
+    static int initialized;
+    static int enabled;
+    if (!initialized) {
+        const char *s = getenv("DS4_CUDA_MOE_RETILE");
+        enabled = (s && s[0] && s[0] != '0') ? 1 : 0;
+        initialized = 1;
+    }
+    return enabled;
+}
+
 static void ds4_cuda_clear_pending_events(void) {
     for (uint32_t i = 0; i < g_pending_event_count; i++) {
         (void)cudaEventDestroy(g_pending_events[i]);
@@ -4353,6 +4368,250 @@ int ds4_cuda_router_select_batch_tensor(
     return ds4_cuda_check(cudaGetLastError(), "launch router batch select");
 }
 
+/* Phase 7b MoE retile Step C-5: per-expert cuBLAS GemmEx driver for the
+ * IQ2_XXS gate+up + Q2_K down combo.  Replaces the fused
+ * ds4_cuda_routed_moe_mid_iq2_xxs_kernel for prefill shapes (n_tokens ≥ 8)
+ * by routing the gate and up matmuls through tensor cores via:
+ *
+ *   1. C-1 layout kernel               → expert_count + offset + permuted_indices
+ *   2. cudaStreamSynchronize           → make expert_offset host-readable
+ *   3. C-2 gather + F16 convert        → permuted_act_f16
+ *   4. for each expert E with count>0:
+ *        a. dequant_iq2_xxs_to_half (gate weights for E) → expert_weight_f16
+ *        b. cublasGemmEx F16 in × F16 in → F32 out      → permuted_gate_f32 slice
+ *        c. dequant_iq2_xxs_to_half (up weights for E)  → expert_weight_f16
+ *        d. cublasGemmEx                                → permuted_up_f32 slice
+ *   5. C-3 unpermute + clamp + SwiGLU + route          → gate/up/mid (canonical pair indices)
+ *   6. existing routed_moe_down_q2_k_kernel            → out (unchanged from fused path)
+ *
+ * The stream-sync at step 2 stalls the host until layout kernel writes
+ * expert_offset; cuBLAS GemmEx M parameter is host-side, so the per-expert
+ * dispatch can't proceed without it.  Cost: a few microseconds plus
+ * whatever's queued on g_stream — negligible vs the ~50 ms of matmul work
+ * this function unlocks.
+ *
+ * Threshold n_tokens >= 8 is enforced by the caller (C-6); inside this
+ * function we assume the caller-provided shapes are sane. */
+static int ds4_cuda_routed_moe_iq2_xxs_retile(
+        ds4_cuda_tensor       *out,
+        ds4_cuda_tensor       *gate,
+        ds4_cuda_tensor       *up,
+        ds4_cuda_tensor       *mid,
+        ds4_cuda_tensor       *experts,
+        const void            *model_map,
+        uint64_t               gate_offset,
+        uint64_t               up_offset,
+        uint64_t               down_offset,
+        uint64_t               gate_expert_bytes,
+        uint64_t               down_expert_bytes,
+        uint64_t               down_row_bytes,
+        uint32_t               expert_in_dim,
+        uint32_t               expert_mid_dim,
+        uint32_t               out_dim,
+        const ds4_cuda_tensor *selected,
+        const ds4_cuda_tensor *route_weights,
+        uint32_t               n_expert_used,
+        float                  clamp,
+        const ds4_cuda_tensor *x,
+        uint32_t               n_tokens) {
+    static const uint32_t N_EXPERT_TOTAL = 256u;
+    if (g_cublas_handle == NULL || g_f16_tensor_core_disabled) return 0;
+    if ((expert_in_dim % 256u) != 0 || (expert_mid_dim % 256u) != 0) return 0;
+    if (expert_in_dim > INT_MAX || expert_mid_dim > INT_MAX || n_tokens > INT_MAX) return 0;
+
+    const uint64_t pair_rows = (uint64_t)n_tokens * n_expert_used;
+
+    if (!ds4_cuda_ensure_moe_scratch(&g_moe_expert_weight_scratch_f16,
+                                     &g_moe_expert_weight_scratch_bytes,
+                                     (uint64_t)expert_mid_dim * expert_in_dim * sizeof(__half),
+                                     "moe expert weight f16")) return 0;
+    if (!ds4_cuda_ensure_moe_scratch(&g_moe_perm_act_scratch_f16,
+                                     &g_moe_perm_act_scratch_bytes,
+                                     pair_rows * expert_in_dim * sizeof(__half),
+                                     "moe perm act f16")) return 0;
+    if (!ds4_cuda_ensure_moe_scratch(&g_moe_perm_gate_scratch_f32,
+                                     &g_moe_perm_gate_scratch_bytes,
+                                     pair_rows * expert_mid_dim * sizeof(float),
+                                     "moe perm gate f32")) return 0;
+    if (!ds4_cuda_ensure_moe_scratch(&g_moe_perm_up_scratch_f32,
+                                     &g_moe_perm_up_scratch_bytes,
+                                     pair_rows * expert_mid_dim * sizeof(float),
+                                     "moe perm up f32")) return 0;
+    if (!ds4_cuda_ensure_moe_scratch(&g_moe_layout_count_scratch,
+                                     &g_moe_layout_count_scratch_bytes,
+                                     (uint64_t)N_EXPERT_TOTAL * sizeof(uint32_t),
+                                     "moe layout count")) return 0;
+    if (!ds4_cuda_ensure_moe_scratch(&g_moe_layout_offset_scratch,
+                                     &g_moe_layout_offset_scratch_bytes,
+                                     (uint64_t)(N_EXPERT_TOTAL + 1u) * sizeof(uint32_t),
+                                     "moe layout offset")) return 0;
+    if (!ds4_cuda_ensure_moe_scratch(&g_moe_layout_indices_scratch,
+                                     &g_moe_layout_indices_scratch_bytes,
+                                     pair_rows * sizeof(uint32_t),
+                                     "moe layout indices")) return 0;
+
+    void *x_ptr = NULL, *selected_ptr = NULL, *rw_ptr = NULL;
+    void *gate_ptr = NULL, *up_ptr = NULL, *mid_ptr = NULL, *out_ptr = NULL;
+    void *experts_ptr = NULL;
+    if (!ds4_cuda_tensor_range(x, (uint64_t)n_tokens * expert_in_dim * sizeof(float), "retile x", &x_ptr) ||
+        !ds4_cuda_tensor_range(selected, pair_rows * sizeof(int32_t), "retile selected", &selected_ptr) ||
+        !ds4_cuda_tensor_range(route_weights, pair_rows * sizeof(float), "retile weights", &rw_ptr) ||
+        !ds4_cuda_tensor_range(gate, pair_rows * expert_mid_dim * sizeof(float), "retile gate", &gate_ptr) ||
+        !ds4_cuda_tensor_range(up, pair_rows * expert_mid_dim * sizeof(float), "retile up", &up_ptr) ||
+        !ds4_cuda_tensor_range(mid, pair_rows * expert_mid_dim * sizeof(float), "retile mid", &mid_ptr) ||
+        !ds4_cuda_tensor_range(out, (uint64_t)n_tokens * out_dim * sizeof(float), "retile out", &out_ptr)) {
+        return 0;
+    }
+    if (experts &&
+        !ds4_cuda_tensor_range(experts, pair_rows * out_dim * sizeof(float), "retile experts", &experts_ptr)) {
+        return 0;
+    }
+
+    /* (1) Layout. */
+    {
+        const uint32_t threads = 256u;
+        const size_t shmem = (size_t)((N_EXPERT_TOTAL * 2u + 1u) * sizeof(uint32_t));
+        ds4_cuda_kernel_moe_layout<<<1, threads, shmem, g_stream>>>(
+            (const int32_t *)selected_ptr,
+            (uint32_t *)g_moe_layout_count_scratch,
+            (uint32_t *)g_moe_layout_offset_scratch,
+            (uint32_t *)g_moe_layout_indices_scratch,
+            n_tokens, n_expert_used, N_EXPERT_TOTAL);
+        if (!ds4_cuda_check(cudaGetLastError(), "retile layout")) return 0;
+    }
+
+    /* (2) Sync to read offsets host-side. */
+    if (!ds4_cuda_check(cudaStreamSynchronize(g_stream), "retile sync after layout")) return 0;
+    const uint32_t *expert_offset_h = (const uint32_t *)g_moe_layout_offset_scratch;
+    const uint32_t total_routings = expert_offset_h[N_EXPERT_TOTAL];
+
+    /* (3) Gather + F16 convert. */
+    if (total_routings > 0) {
+        const uint32_t threads = 256u;
+        const uint32_t grid_x  = (expert_in_dim + threads - 1u) / threads;
+        ds4_cuda_kernel_moe_gather_act_to_half<<<
+                dim3(grid_x, total_routings, 1),
+                dim3(threads, 1, 1),
+                0, g_stream>>>(
+            (__half *)g_moe_perm_act_scratch_f16,
+            (const float *)x_ptr,
+            (const uint32_t *)g_moe_layout_indices_scratch,
+            expert_in_dim, n_expert_used, total_routings);
+        if (!ds4_cuda_check(cudaGetLastError(), "retile gather")) return 0;
+    }
+
+    /* (4) Per-expert cuBLAS GemmEx for gate + up. */
+    if (total_routings > 0) {
+        const ds4_cuda_block_iq2_xxs *gate_w = (const ds4_cuda_block_iq2_xxs *)
+            ((const uint8_t *)model_map + gate_offset);
+        const ds4_cuda_block_iq2_xxs *up_w = (const ds4_cuda_block_iq2_xxs *)
+            ((const uint8_t *)model_map + up_offset);
+        const uint32_t blocks_per_row = expert_in_dim / 256u;
+        const float alpha = 1.0f;
+        const float beta  = 0.0f;
+
+        for (uint32_t e = 0; e < N_EXPERT_TOTAL; e++) {
+            const uint32_t e_start = expert_offset_h[e];
+            const uint32_t e_count = expert_offset_h[e + 1u] - e_start;
+            if (e_count == 0u) continue;
+
+            const ds4_cuda_block_iq2_xxs *e_gate = (const ds4_cuda_block_iq2_xxs *)
+                ((const uint8_t *)gate_w + (uint64_t)e * gate_expert_bytes);
+            const ds4_cuda_block_iq2_xxs *e_up   = (const ds4_cuda_block_iq2_xxs *)
+                ((const uint8_t *)up_w   + (uint64_t)e * gate_expert_bytes);
+
+            const __half *act_block = (const __half *)g_moe_perm_act_scratch_f16
+                                      + (uint64_t)e_start * expert_in_dim;
+            float *gate_block = (float *)g_moe_perm_gate_scratch_f32
+                                + (uint64_t)e_start * expert_mid_dim;
+            float *up_block   = (float *)g_moe_perm_up_scratch_f32
+                                + (uint64_t)e_start * expert_mid_dim;
+
+            /* Gate: dequant W → expert_weight_f16, then cuBLAS C[mid_dim, e_count]
+             * = W^T_col × X_col where W is row-major [mid_dim × in_dim] and X
+             * is row-major [e_count × in_dim].  Mirrors Stage 3+ pattern. */
+            ds4_cuda_kernel_dequant_iq2_xxs_to_half<<<
+                    dim3(blocks_per_row, expert_mid_dim, 1),
+                    dim3(32u, 1, 1),
+                    0, g_stream>>>(
+                (__half *)g_moe_expert_weight_scratch_f16,
+                e_gate, expert_in_dim, expert_mid_dim);
+            if (!ds4_cuda_check(cudaGetLastError(), "retile gate dequant")) return 0;
+            cublasStatus_t status = cublasGemmEx(
+                g_cublas_handle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                (int)expert_mid_dim, (int)e_count, (int)expert_in_dim,
+                &alpha,
+                g_moe_expert_weight_scratch_f16, CUDA_R_16F, (int)expert_in_dim,
+                act_block,                       CUDA_R_16F, (int)expert_in_dim,
+                &beta,
+                gate_block,                      CUDA_R_32F, (int)expert_mid_dim,
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            if (!ds4_cuda_check_cublas(status, "retile gate cublasGemmEx")) return 0;
+
+            /* Up: same pattern, different weight slab. */
+            ds4_cuda_kernel_dequant_iq2_xxs_to_half<<<
+                    dim3(blocks_per_row, expert_mid_dim, 1),
+                    dim3(32u, 1, 1),
+                    0, g_stream>>>(
+                (__half *)g_moe_expert_weight_scratch_f16,
+                e_up, expert_in_dim, expert_mid_dim);
+            if (!ds4_cuda_check(cudaGetLastError(), "retile up dequant")) return 0;
+            status = cublasGemmEx(
+                g_cublas_handle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                (int)expert_mid_dim, (int)e_count, (int)expert_in_dim,
+                &alpha,
+                g_moe_expert_weight_scratch_f16, CUDA_R_16F, (int)expert_in_dim,
+                act_block,                       CUDA_R_16F, (int)expert_in_dim,
+                &beta,
+                up_block,                        CUDA_R_32F, (int)expert_mid_dim,
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            if (!ds4_cuda_check_cublas(status, "retile up cublasGemmEx")) return 0;
+        }
+    }
+
+    /* (5) Unpermute + clamp + SwiGLU + route fold-in. */
+    if (total_routings > 0) {
+        const uint32_t threads = 256u;
+        const uint32_t grid_x  = (expert_mid_dim + threads - 1u) / threads;
+        ds4_cuda_kernel_moe_unpermute_swiglu_route<<<
+                dim3(grid_x, total_routings, 1),
+                dim3(threads, 1, 1),
+                0, g_stream>>>(
+            (float *)gate_ptr, (float *)up_ptr, (float *)mid_ptr,
+            (const float *)g_moe_perm_gate_scratch_f32,
+            (const float *)g_moe_perm_up_scratch_f32,
+            (const uint32_t *)g_moe_layout_indices_scratch,
+            (const float *)rw_ptr,
+            n_expert_used, expert_mid_dim, total_routings, clamp);
+        if (!ds4_cuda_check(cudaGetLastError(), "retile unpermute")) return 0;
+    }
+
+    /* (6) Existing down kernel — unchanged math.  Reads mid (which we wrote
+     * at canonical pair indices) and selected (kept on device). */
+    {
+        constexpr uint32_t ROWS_PER_BLOCK = 4u;
+        const uint32_t out_row_blocks = (out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
+        const ds4_cuda_block_q2_K *down_w = (const ds4_cuda_block_q2_K *)
+            ((const uint8_t *)model_map + down_offset);
+        ds4_cuda_routed_moe_down_q2_k_kernel<ROWS_PER_BLOCK><<<
+                dim3(out_row_blocks, n_tokens, 1),
+                dim3(32u, ROWS_PER_BLOCK, 1),
+                0, g_stream>>>(
+            down_w, (const float *)mid_ptr,
+            (const int32_t *)selected_ptr,
+            (float *)experts_ptr, (float *)out_ptr,
+            n_tokens, n_expert_used, expert_mid_dim, out_dim,
+            down_expert_bytes, down_row_bytes);
+        if (!ds4_cuda_check(cudaGetLastError(), "retile down")) return 0;
+    }
+
+    return 1;
+}
+
 static int ds4_cuda_routed_moe_impl(
         ds4_cuda_tensor       *out,
         ds4_cuda_tensor       *gate,
@@ -4446,6 +4705,28 @@ static int ds4_cuda_routed_moe_impl(
     const uint32_t out_row_blocks = (out_dim       + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
 
     if (combo_iq2xxs_q2k) {
+        /* Phase 7b MoE retile Step C-6: try the cuBLAS retile path when
+         * DS4_CUDA_MOE_RETILE=1 and the shape is large enough to amortize
+         * the per-expert dispatch overhead.  Threshold n_tokens >= 8 mirrors
+         * Stage 3+'s cuBLAS GemmEx dispatch (vector-matrix shapes leave
+         * tensor cores idle).  The retile call replaces both the fused mid
+         * kernel and the down kernel below; on success, return early. */
+        if (ds4_cuda_moe_retile_enabled() && n_tokens >= 8u) {
+            const int retile_ok = ds4_cuda_routed_moe_iq2_xxs_retile(
+                out, gate, up, mid, experts,
+                model_map,
+                gate_offset, up_offset, down_offset,
+                gate_expert_bytes,
+                down_expert_bytes, down_row_bytes,
+                expert_in_dim, expert_mid_dim, out_dim,
+                selected, weights, n_expert, clamp,
+                x, n_tokens);
+            if (retile_ok) return 1;
+            /* Fall through to fused path on failure (e.g. cuBLAS error,
+             * scratch alloc fail).  The retile leaves no partial state on
+             * the output tensors that the fused path can't overwrite. */
+        }
+
         const ds4_cuda_block_iq2_xxs *gate_w =
             (const ds4_cuda_block_iq2_xxs *)((const uint8_t *)model_map + gate_offset);
         const ds4_cuda_block_iq2_xxs *up_w =
