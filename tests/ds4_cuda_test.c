@@ -116,6 +116,14 @@ int ds4_cuda_test_moe_layout_tensor(
         uint32_t               n_tokens,
         uint32_t               n_expert_used,
         uint32_t               n_expert_total);
+int ds4_cuda_test_moe_gather_act_to_f32_tensor(
+        ds4_cuda_tensor       *out_f32,
+        const ds4_cuda_tensor *act,
+        const ds4_cuda_tensor *permuted_indices,
+        uint32_t               n_tokens,
+        uint32_t               in_dim,
+        uint32_t               n_expert_used,
+        uint32_t               total_routings);
 
 typedef struct {
     uint8_t  scales[16];
@@ -1643,6 +1651,91 @@ DS4_CUDA_PARITY_TEST(moe_layout,
     .cpu_fn  = moe_layout_cpu,
     .cuda_fn = moe_layout_cuda,
     .cfg = (void *)&moe_layout_cfg_v);
+
+/* Phase 7b MoE retile Step C-2: gather + F16 convert kernel parity test.
+ *
+ * Both sides round-trip act values through F16, so the comparison is
+ * bit-exact (ulp_tolerance = 0).  The CPU oracle uses ds4.c's f32_to_f16 /
+ * f16_to_f32, which match CUDA's __float2half / __half2float per the
+ * existing F16 conversion parity tests.
+ *
+ * Test shape: n_tokens=8, n_expert_used=6, in_dim=512, total_routings=32.
+ * The harness `in[]` provides the act tensor (8 × 512 = 4096 floats).
+ * permuted_indices is generated deterministically per-cfg via xorshift,
+ * each entry being a flat (token*n_expert_used+slot) index in [0, 48). */
+struct moe_gather_cfg {
+    uint32_t  n_tokens;
+    uint32_t  n_expert_used;
+    uint32_t  in_dim;
+    uint32_t  total_routings;
+    uint64_t  perm_seed;
+    uint32_t *permuted_indices;
+    int       initialized;
+};
+
+static void moe_gather_fill(struct moe_gather_cfg *c) {
+    if (c->initialized) return;
+    const uint32_t flat_max = c->n_tokens * c->n_expert_used;
+    c->permuted_indices = (uint32_t *)malloc((size_t)c->total_routings * sizeof(uint32_t));
+    if (!c->permuted_indices) return;
+    uint64_t s = c->perm_seed;
+    for (uint32_t i = 0; i < c->total_routings; i++) {
+        c->permuted_indices[i] = test_rng_u32(&s) % flat_max;
+    }
+    c->initialized = 1;
+}
+
+static int moe_gather_cpu(const float *in, float *out, void *cfg) {
+    struct moe_gather_cfg *c = cfg;
+    moe_gather_fill(c);
+    if (!c->initialized) return 0;
+    ds4_test_moe_gather_act_to_f32(out, in, c->permuted_indices,
+                                   c->in_dim, c->n_expert_used, c->total_routings);
+    return 1;
+}
+
+static int moe_gather_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                           size_t in_elems, size_t out_elems, void *cfg) {
+    (void)out_elems;
+    struct moe_gather_cfg *c = cfg;
+    moe_gather_fill(c);
+    if (!c->initialized) return 0;
+
+    ds4_cuda_tensor *act = ds4_cuda_tensor_alloc((uint64_t)in_elems * sizeof(float));
+    ds4_cuda_tensor *idx = ds4_cuda_tensor_alloc((uint64_t)c->total_routings * sizeof(uint32_t));
+    if (!act || !idx) {
+        ds4_cuda_tensor_free(act); ds4_cuda_tensor_free(idx);
+        return 0;
+    }
+    int ok = ds4_cuda_tensor_write(act, 0, in, (uint64_t)in_elems * sizeof(float))
+          && ds4_cuda_tensor_write(idx, 0, c->permuted_indices,
+                                   (uint64_t)c->total_routings * sizeof(uint32_t));
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_test_moe_gather_act_to_f32_tensor(out_dev, act, idx,
+                                                            c->n_tokens, c->in_dim,
+                                                            c->n_expert_used, c->total_routings);
+    if (ok) ok = ds4_cuda_end_commands();
+
+    ds4_cuda_tensor_free(act); ds4_cuda_tensor_free(idx);
+    return ok;
+}
+
+static struct moe_gather_cfg moe_gather_cfg_v = {
+    .n_tokens       = 8,
+    .n_expert_used  = 6,
+    .in_dim         = 512,
+    .total_routings = 32,
+    .perm_seed      = 0xD3C5022ull,
+};
+
+DS4_CUDA_PARITY_TEST(moe_gather_act_to_f32,
+    .seed = 0xD3C502,
+    .in_elems  = 8u * 512u,
+    .out_elems = 32u * 512u,
+    .ulp_tolerance = 0,
+    .cpu_fn  = moe_gather_cpu,
+    .cuda_fn = moe_gather_cuda,
+    .cfg = (void *)&moe_gather_cfg_v);
 
 /* ---------------------------------------------------------------------------
  * flash_attn — Phase 1 m3.  Raw sliding-window attention with sinks.
@@ -6149,6 +6242,7 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_dequant_iq2_xxs_to_f32,
     &ds4_cuda_parity_dequant_q2_K_to_f32,
     &ds4_cuda_parity_moe_layout,
+    &ds4_cuda_parity_moe_gather_act_to_f32,
     &ds4_cuda_parity_flash_attn,
     &ds4_cuda_parity_router_select_batch,
     &ds4_cuda_parity_routed_moe_batch,

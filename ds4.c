@@ -2932,6 +2932,31 @@ void ds4_test_moe_layout(
     free(running);
 }
 
+/* Phase 7b MoE retile Step C-2: CPU oracle for the gather + F16 convert
+ * kernel.  For each routing p, decode token = permuted_indices[p] /
+ * n_expert_used and copy act[token, :] into out[p, :] with the same F16
+ * round-trip the CUDA path produces (F32 → F16 → F32).  Matching GPU's
+ * `__float2half` exactly relies on f32_to_f16 / f16_to_f32 being IEEE 754
+ * round-to-nearest-even — verified bit-exact for all subnormal/finite
+ * patterns by the existing dense_f16_matvec parity. */
+void ds4_test_moe_gather_act_to_f32(
+        float          *out,
+        const float    *act,
+        const uint32_t *permuted_indices,
+        uint32_t        in_dim,
+        uint32_t        n_expert_used,
+        uint32_t        total_routings) {
+    for (uint32_t p = 0; p < total_routings; p++) {
+        const uint32_t idx = permuted_indices[p];
+        const uint32_t token = idx / n_expert_used;
+        const float *src = act + (uint64_t)token * in_dim;
+        float *dst       = out + (uint64_t)p     * in_dim;
+        for (uint32_t i = 0; i < in_dim; i++) {
+            dst[i] = f16_to_f32(f32_to_f16(src[i]));
+        }
+    }
+}
+
 void ds4_test_dense_iq2_xxs_pair_matvec(
         float      *out0,
         float      *out1,

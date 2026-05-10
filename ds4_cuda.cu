@@ -444,6 +444,45 @@ __global__ static void ds4_cuda_kernel_moe_layout(
     }
 }
 
+/* Phase 7b MoE retile Step C-2: gather token activations in expert-sorted
+ * order and convert F32 → F16.
+ *
+ * Inputs:
+ *   act               [n_tokens, in_dim]      F32 activation rows.
+ *   permuted_indices  [total_routings]        flat (token*n_expert_used+slot)
+ *                                             from C-1; sorted by expert id.
+ *
+ * Output:
+ *   out_f16           [total_routings, in_dim] F16 activations gathered into
+ *                                              expert-sorted layout, ready for
+ *                                              the per-expert cuBLAS GemmEx.
+ *
+ * Each block handles one routing row × elem_per_block columns.  Lanes within
+ * a block read consecutive in_dim elements from the source token row (fully
+ * coalesced) and write to consecutive output positions (fully coalesced).
+ * The slot component of permuted_indices[p] is unused here; C-3 needs it for
+ * the route-weight lookup. */
+__global__ static void ds4_cuda_kernel_moe_gather_act_to_half(
+        __half         *out_f16,
+        const float    *act,
+        const uint32_t *permuted_indices,
+        uint32_t        in_dim,
+        uint32_t        n_expert_used,
+        uint32_t        total_routings) {
+    const uint32_t p = blockIdx.y;
+    if (p >= total_routings) return;
+    const uint32_t routing_idx = permuted_indices[p];
+    const uint32_t token = routing_idx / n_expert_used;
+    const uint64_t in_off  = (uint64_t)token * in_dim;
+    const uint64_t out_off = (uint64_t)p     * in_dim;
+
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < in_dim;
+         i += gridDim.x * blockDim.x) {
+        out_f16[out_off + i] = __float2half(act[in_off + i]);
+    }
+}
+
 /* F32→F16 / F16→F32 conversion kernels for the cuBLAS staging path.
  * Mirrors mitkox 1696-1710. */
 __global__ static void ds4_cuda_kernel_f32_to_half(__half *out, const float *in, uint64_t n) {
@@ -3131,6 +3170,63 @@ int ds4_cuda_test_moe_layout_tensor(
         (uint32_t *)idx_ptr,
         n_tokens, n_expert_used, n_expert_total);
     return ds4_cuda_check(cudaGetLastError(), "launch moe_layout");
+}
+
+/* Phase 7b MoE retile Step C-2: standalone test launcher for the gather
+ * kernel.  Same pattern as the dequant launchers: transient F16 scratch +
+ * half→float conversion into the F32 parity output. */
+int ds4_cuda_test_moe_gather_act_to_f32_tensor(
+        ds4_cuda_tensor       *out_f32,
+        const ds4_cuda_tensor *act,
+        const ds4_cuda_tensor *permuted_indices,
+        uint32_t               n_tokens,
+        uint32_t               in_dim,
+        uint32_t               n_expert_used,
+        uint32_t               total_routings) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (n_tokens == 0 || n_expert_used == 0 || total_routings == 0 || in_dim == 0) return 0;
+
+    const uint64_t act_bytes     = (uint64_t)n_tokens       * in_dim * sizeof(float);
+    const uint64_t indices_bytes = (uint64_t)total_routings * sizeof(uint32_t);
+    const uint64_t n_elems       = (uint64_t)total_routings * in_dim;
+    const uint64_t out_bytes     = n_elems * sizeof(float);
+
+    void *act_ptr = NULL, *idx_ptr = NULL, *out_ptr = NULL;
+    if (!ds4_cuda_tensor_range(act, act_bytes, "moe_gather act", &act_ptr) ||
+        !ds4_cuda_tensor_range(permuted_indices, indices_bytes, "moe_gather permuted_indices", &idx_ptr) ||
+        !ds4_cuda_tensor_range(out_f32, out_bytes, "moe_gather out_f32", &out_ptr)) {
+        return 0;
+    }
+
+    void *scratch_f16 = NULL;
+    const uint64_t scratch_bytes = n_elems * sizeof(__half);
+    if (!ds4_cuda_check(cudaMalloc(&scratch_f16, (size_t)scratch_bytes),
+                        "moe_gather scratch alloc")) {
+        return 0;
+    }
+
+    const uint32_t threads = 256u;
+    const uint32_t grid_x  = (in_dim + threads - 1u) / threads;
+    ds4_cuda_kernel_moe_gather_act_to_half<<<
+            dim3(grid_x, total_routings, 1),
+            dim3(threads, 1, 1),
+            0, g_stream>>>(
+        (__half *)scratch_f16,
+        (const float *)act_ptr,
+        (const uint32_t *)idx_ptr,
+        in_dim, n_expert_used, total_routings);
+    int ok = ds4_cuda_check(cudaGetLastError(), "launch moe_gather act->half");
+
+    if (ok) {
+        const uint32_t conv_blocks = (uint32_t)((n_elems + threads - 1) / threads);
+        ds4_cuda_kernel_half_to_f32<<<conv_blocks, threads, 0, g_stream>>>(
+            (float *)out_ptr, (const __half *)scratch_f16, n_elems);
+        ok = ds4_cuda_check(cudaGetLastError(), "launch half_to_f32 (moe_gather test)");
+    }
+
+    cudaFree(scratch_f16);
+    return ok;
 }
 
 #define DS4_CUDA_STUB(fn, args) \

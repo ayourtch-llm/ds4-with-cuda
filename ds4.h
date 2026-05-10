@@ -224,6 +224,12 @@ void ds4_test_moe_layout(uint32_t *expert_count,
                          uint32_t n_tokens,
                          uint32_t n_expert_used,
                          uint32_t n_expert_total);
+void ds4_test_moe_gather_act_to_f32(float *out,
+                                    const float *act,
+                                    const uint32_t *permuted_indices,
+                                    uint32_t in_dim,
+                                    uint32_t n_expert_used,
+                                    uint32_t total_routings);
 void ds4_test_router_select_raw(int32_t *selected,
                                 float *weights,
                                 float *probs,
