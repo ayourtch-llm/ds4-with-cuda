@@ -2344,6 +2344,147 @@ static __global__ void ds4_cuda_routed_moe_mid_iq2_xxs_kernel(
     }
 }
 
+/* IQ2_XXS dot product against pre-quantized Q8_K activation in shared memory.
+ * Reads int8 qs from smem_qs[blk*256 + idx] and float d from smem_d[blk].
+ * Identical math to warp_vec_dot_iq2_xxs_q8_K but operates on the flat
+ * shared-memory layout instead of ds4_cuda_block_q8_K structs. */
+static __device__ __forceinline__ float ds4_cuda_warp_dot_iq2_xxs_q8_K_smem(
+        const ds4_cuda_block_iq2_xxs *x,
+        const float                   *smem_d,
+        const int8_t                  *smem_qs,
+        uint32_t                       nb,
+        uint32_t                       lane) {
+    const uint32_t group = lane >> 3;
+    const uint32_t k     = lane & 7u;
+    const uint32_t l     = (group >> 1) * 2u;
+    const uint32_t which = group & 1u;
+    const uint8_t  km    = kmask_iq2xs[k];
+    const uint32_t mask  = 0xffffffffu;
+
+    float sumf = 0.0f;
+    for (uint32_t i = 0; i < nb; i++) {
+        const float d = ds4_cuda_f16_to_f32(x[i].d) * smem_d[i];
+        const uint16_t *q2_base = x[i].qs;
+        const int8_t  *q8 = smem_qs + i * 256u;
+        int32_t bsum = 0;
+
+        for (int ib32 = 0; ib32 < 8; ib32++) {
+            const uint16_t *q2 = q2_base + (uint32_t)ib32 * 4u;
+            const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+            const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+            const uint8_t *aux8 = (const uint8_t *)&aux0;
+            const uint32_t ls   = 2u * (aux1 >> 28) + 1u;
+
+            const uint8_t  grid_idx = aux8[l + which];
+            const uint32_t sign_idx = (aux1 >> (7u * (l + which))) & 127u;
+            const uint8_t *grid     = (const uint8_t *)(iq2xxs_grid + grid_idx);
+            const uint8_t  signs    = ksigns_iq2xs[sign_idx];
+            const int32_t  v        = (signs & km) ? -(int32_t)grid[k] : (int32_t)grid[k];
+            int32_t lane_partial    = v * (int32_t)q8[(uint32_t)ib32 * 32u + lane];
+
+            lane_partial += __shfl_xor_sync(mask, lane_partial, 16);
+            lane_partial += __shfl_xor_sync(mask, lane_partial, 8);
+            lane_partial += __shfl_xor_sync(mask, lane_partial, 4);
+            lane_partial += __shfl_xor_sync(mask, lane_partial, 2);
+            lane_partial += __shfl_xor_sync(mask, lane_partial, 1);
+
+            bsum += lane_partial * (int32_t)ls;
+        }
+        sumf += d * (float)bsum;
+    }
+    return 0.125f * sumf;
+}
+
+/* MoE mid kernel with shared-memory quantization cache.
+ *
+ * Same grid/block as the original kernel, but quantizes the activation
+ * once per block into shared memory, then reuses the cached Q8_K for both
+ * the gate and up dot products.  This eliminates the redundant second
+ * quantization (the original kernel quantizes the same activation twice
+ * per block — once for gate, once for up).
+ *
+ * Shared memory: xq_blocks x (256 int8 + 4 float d) per block.
+ * For production: 16 x 260 = 4160 bytes. */
+template<uint32_t ROWS_PER_BLOCK>
+static __global__ void ds4_cuda_routed_moe_mid_iq2_xxs_smem_kernel(
+        const ds4_cuda_block_iq2_xxs *gate_w,
+        const ds4_cuda_block_iq2_xxs *up_w,
+        const float                  *act,
+        const int32_t                *selected,
+        const float                  *route_weights,
+        float                        *gate,
+        float                        *up,
+        float                        *mid,
+        uint32_t                      n_tokens,
+        uint32_t                      n_expert,
+        uint32_t                      expert_in_dim,
+        uint32_t                      expert_mid_dim,
+        uint64_t                      gate_expert_bytes,
+        uint64_t                      gate_row_bytes,
+        float                         clamp) {
+
+    const uint32_t row  = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
+    const uint32_t pair = blockIdx.y;
+    if (row >= expert_mid_dim || pair >= n_tokens * n_expert) return;
+    const uint32_t lane = threadIdx.x;
+
+    const uint32_t token = pair / n_expert;
+    const uint32_t slot  = pair - token * n_expert;
+    const int32_t expert = selected[(uint64_t)token * n_expert + slot];
+    if (expert < 0) return;
+
+    const uint32_t xq_blocks = expert_in_dim / 256u;
+
+    /* Shared memory: per-block d scales + flat int8 qs. */
+    __shared__ float smem_d[16];
+    __shared__ int8_t smem_qs[16 * 256];
+
+    /* Phase 1: Quantize activation to Q8_K in shared memory.
+     * Each warp quantizes xq_blocks/ROWS_PER_BLOCK blocks (rounding up). */
+    {
+        const float *token_act = act + (uint64_t)token * expert_in_dim;
+        const uint32_t warp_blk_start = threadIdx.y;
+        const uint32_t warp_blk_stride = ROWS_PER_BLOCK;
+
+        for (uint32_t blk = warp_blk_start; blk < xq_blocks; blk += warp_blk_stride) {
+            const float *blk_act = token_act + blk * 256u;
+            int8_t  lane_qs[8];
+            int16_t lane_bsum;
+            float   block_d;
+            ds4_cuda_warp_quantize_q8_K_block(blk_act, lane, lane_qs, &lane_bsum, &block_d);
+
+            if (lane == 0) smem_d[blk] = block_d;
+            for (uint32_t step = 0; step < 8u; step++) {
+                smem_qs[blk * 256u + step * 32u + lane] = lane_qs[step];
+            }
+        }
+    }
+    __syncthreads();
+
+    /* Phase 2: Dot gate and up from cached Q8_K in shared memory. */
+    const uint8_t *gate_base = (const uint8_t *)gate_w + (uint64_t)expert * gate_expert_bytes;
+    const uint8_t *up_base   = (const uint8_t *)up_w   + (uint64_t)expert * gate_expert_bytes;
+    const ds4_cuda_block_iq2_xxs *gate_row =
+        (const ds4_cuda_block_iq2_xxs *)(gate_base + (uint64_t)row * gate_row_bytes);
+    const ds4_cuda_block_iq2_xxs *up_row =
+        (const ds4_cuda_block_iq2_xxs *)(up_base + (uint64_t)row * gate_row_bytes);
+
+    float g = ds4_cuda_warp_dot_iq2_xxs_q8_K_smem(gate_row, smem_d, smem_qs, xq_blocks, lane);
+    float u = ds4_cuda_warp_dot_iq2_xxs_q8_K_smem(up_row,   smem_d, smem_qs, xq_blocks, lane);
+    if (clamp > 1.0e-6f) {
+        if (g > clamp) g = clamp;
+        if (u > clamp) u = clamp;
+        if (u < -clamp) u = -clamp;
+    }
+
+    if (lane == 0) {
+        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+        gate[off] = g;
+        up[off]   = u;
+        mid[off]  = ds4_cuda_silu_f32(g) * u * route_weights[(uint64_t)token * n_expert + slot];
+    }
+}
+
 /* Phase 7b MoE retile Step C-3: unpermute + clamp + SwiGLU + route fold-in.
  *
  * Closes the retile loop for IQ2_XXS gate/up: takes the per-expert cuBLAS
@@ -5598,17 +5739,33 @@ static int ds4_cuda_routed_moe_impl(
         const ds4_cuda_block_q2_K *down_w =
             (const ds4_cuda_block_q2_K *)((const uint8_t *)model_map + down_offset);
 
-        ds4_cuda_routed_moe_mid_iq2_xxs_kernel<ROWS_PER_BLOCK><<<
-                dim3(mid_row_blocks, (uint32_t)pair_rows, 1),
-                dim3(32u, ROWS_PER_BLOCK, 1),
-                0, g_stream>>>(
-            gate_w, up_w, (const float *)x_ptr,
-            (const int32_t *)selected_ptr,
-            (const float *)weights_ptr,
-            (float *)gate_ptr, (float *)up_ptr, (float *)mid_ptr,
-            n_tokens, n_expert, expert_in_dim, expert_mid_dim,
-            gate_expert_bytes, gate_row_bytes, clamp);
-        ok = ds4_cuda_check(cudaGetLastError(), "launch routed MoE gate/up/mid (IQ2_XXS) fused");
+       if (n_tokens < 8u) {
+            /* Decode: quantize-once, cache-in-smem, reuse for gate+up.
+             * Same grid as original kernel; eliminates redundant 2nd quantize. */
+            ds4_cuda_routed_moe_mid_iq2_xxs_smem_kernel<ROWS_PER_BLOCK><<<
+                    dim3(mid_row_blocks, (uint32_t)pair_rows, 1),
+                    dim3(32u, ROWS_PER_BLOCK, 1),
+                    0, g_stream>>>(
+                gate_w, up_w, (const float *)x_ptr,
+                (const int32_t *)selected_ptr,
+                (const float *)weights_ptr,
+                (float *)gate_ptr, (float *)up_ptr, (float *)mid_ptr,
+                n_tokens, n_expert, expert_in_dim, expert_mid_dim,
+                gate_expert_bytes, gate_row_bytes, clamp);
+            ok = ds4_cuda_check(cudaGetLastError(), "launch routed MoE gate/up/mid (IQ2_XXS) smem");
+        } else {
+            ds4_cuda_routed_moe_mid_iq2_xxs_kernel<ROWS_PER_BLOCK><<<
+                    dim3(mid_row_blocks, (uint32_t)pair_rows, 1),
+                    dim3(32u, ROWS_PER_BLOCK, 1),
+                    0, g_stream>>>(
+                gate_w, up_w, (const float *)x_ptr,
+                (const int32_t *)selected_ptr,
+                (const float *)weights_ptr,
+                (float *)gate_ptr, (float *)up_ptr, (float *)mid_ptr,
+                n_tokens, n_expert, expert_in_dim, expert_mid_dim,
+                gate_expert_bytes, gate_row_bytes, clamp);
+            ok = ds4_cuda_check(cudaGetLastError(), "launch routed MoE gate/up/mid (IQ2_XXS) fused");
+        }
         if (ok) {
             ds4_cuda_routed_moe_down_q2_k_kernel<ROWS_PER_BLOCK><<<
                     dim3(out_row_blocks, n_tokens, 1),
