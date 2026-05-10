@@ -9384,8 +9384,9 @@ int ds4_cuda_hc_split_weighted_sum_fast_tensor(
     const float *scale_ptr = (const float *)((const uint8_t *)model_map + scale_offset);
     const float *base_ptr  = (const float *)((const uint8_t *)model_map + base_offset);
 
-    /* A1 (this commit): block_x=256 with parallel Sinkhorn.  A2 will bump to 1024. */
-    constexpr uint32_t block_x = 256u;
+    /* A1 + A2: block_x=1024 (matches norm variant) for finer-grained
+     * weighted-reduce parallelism over n_embd=4096; Sinkhorn parallel on lanes 0..15. */
+    constexpr uint32_t block_x = 1024u;
     /* Shmem: pre[4] + c[16] = 20 floats. */
     const size_t shmem_bytes = (size_t)20u * sizeof(float);
     ds4_cuda_hc_split_weighted_sum_fast_kernel<<<n_rows, block_x, shmem_bytes, g_stream>>>(
