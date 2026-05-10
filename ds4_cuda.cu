@@ -3336,25 +3336,137 @@ static int ds4_cuda_attention_output_low_q8_launch(
      * quantize_q8_0_activation_kernel and its g_scratch_attention_output_low_q8_*
      * scratch buffers are no longer used on this call path. */
 
-    int ok = 1;
     const ds4_cuda_block_q8_0 *weights = (const ds4_cuda_block_q8_0 *)
         ds4_cuda_model_range_ptr(model_map, model_size, out_a_offset, out_a_bytes,
                                  "attention output low weights");
-    if (!weights) ok = 0;
-    if (ok) {
-        constexpr uint32_t ROWS_PER_BLOCK = 4u;
-        const uint32_t row_blocks = ((uint32_t)rank + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
-        ds4_cuda_attention_output_low_q8_kernel<ROWS_PER_BLOCK><<<
-                dim3(row_blocks, n_groups, n_tokens),
-                dim3(32u, ROWS_PER_BLOCK, 1),
-                0, g_stream>>>(
-            weights,
-            (const float *)heads_ptr,
-            (float *)low_ptr,
-            (uint32_t)group_dim, (uint32_t)rank, n_groups, n_tokens);
-        ok = ds4_cuda_check(cudaGetLastError(), "launch attention output low q8 fused");
+    if (!weights) return 0;
+
+    /* Phase 7b Stage 3++: dequant Q8_0 → F16 + cuBLAS GemmEx for the
+     * grouped low-rank stage A.  The weights are laid out as
+     * [low_dim, group_dim] = [n_groups*rank, group_dim] in Q8 blocks;
+     * input heads is [n_tokens, n_groups, group_dim]; output low is
+     * [n_tokens, n_groups, rank].  Per group g, the math is a standard
+     * (rank × n_tokens × group_dim) GEMM — and cuBLAS handles the
+     * strided activation/output layout via non-trivial lda/ldc, no
+     * permute kernel needed.
+     *
+     * Dispatch gates same as matmul_q8_0_tensor: n_tokens >= 8 (else
+     * tensor cores idle), and the dequanted F16 scratch fits in the
+     * 256 MB cap.  The grouped layout is small enough that we always
+     * hit the cap (8 MB at production shapes). */
+    constexpr uint64_t Q8_CUBLAS_F16_CAP = 256ull * 1024 * 1024;
+    constexpr uint32_t Q8_CUBLAS_NTOK_MIN = 8u;
+    const uint64_t weight_f16_bytes = (uint64_t)low_dim * group_dim * sizeof(__half);
+
+    if (g_cublas_handle != NULL && !g_f16_tensor_core_disabled &&
+        n_tokens >= Q8_CUBLAS_NTOK_MIN &&
+        weight_f16_bytes <= Q8_CUBLAS_F16_CAP &&
+        group_dim <= INT_MAX && rank <= INT_MAX && n_tokens <= INT_MAX) {
+        const uint64_t input_f16_bytes  = (uint64_t)n_tokens * n_groups * group_dim * sizeof(__half);
+        const uint64_t output_f16_bytes = (uint64_t)n_tokens * low_dim * sizeof(__half);
+        if (ds4_cuda_ensure_q8_weight_scratch_f16(weight_f16_bytes) &&
+            ds4_cuda_ensure_f16_input_scratch(input_f16_bytes) &&
+            ds4_cuda_ensure_f16_output_scratch(output_f16_bytes)) {
+
+            /* (1) Dequant the FULL Q8 weight slab (all groups + ranks)
+             * to F16 scratch.  Single launch over the full low_dim×blocks
+             * shape — same kernel as the matmul_q8_0_tensor path.  Layout
+             * of dequant output: [low_dim, group_dim] = [n_groups*rank,
+             * group_dim] row-major in F16. */
+            const uint32_t blocks_per_row = (uint32_t)blocks;
+            ds4_cuda_kernel_dequant_q8_0_to_half<<<
+                    dim3(blocks_per_row, (uint32_t)low_dim, 1),
+                    dim3(32u, 1, 1),
+                    0, g_stream>>>(
+                (__half *)g_q8_weight_scratch_f16,
+                weights,
+                (uint32_t)group_dim,
+                (uint32_t)low_dim);
+            if (!ds4_cuda_check(cudaGetLastError(), "dequant q8 attention_output_low to f16")) {
+                /* Fall through to custom kernel. */
+            } else {
+                /* (2) Convert F32 heads → F16 (one launch over the full
+                 * heads slab; conversion preserves the [n_tokens, n_groups,
+                 * group_dim] layout). */
+                const uint64_t heads_total = (uint64_t)n_tokens * n_groups * group_dim;
+                const uint64_t low_total   = (uint64_t)n_tokens * low_dim;
+                const uint32_t conv_block  = 256u;
+                const uint64_t in_grid     = (heads_total + conv_block - 1u) / conv_block;
+                const uint64_t out_grid    = (low_total + conv_block - 1u) / conv_block;
+                const uint32_t in_grid_clamped =
+                    in_grid > UINT32_MAX ? UINT32_MAX : (uint32_t)in_grid;
+                const uint32_t out_grid_clamped =
+                    out_grid > UINT32_MAX ? UINT32_MAX : (uint32_t)out_grid;
+                ds4_cuda_kernel_f32_to_half<<<in_grid_clamped, conv_block, 0, g_stream>>>(
+                    (__half *)g_f16_input_scratch,
+                    (const float *)heads_ptr,
+                    heads_total);
+                if (ds4_cuda_check(cudaGetLastError(), "attention_output_low f32_to_half")) {
+                    /* (3) Per-group cuBLAS GemmEx.  For group g:
+                     *   - weight_g  = q8_weight_scratch + g * rank * group_dim
+                     *   - input_g   = f16_input_scratch + g * group_dim
+                     *                 (lda = n_groups * group_dim — strided
+                     *                  per-token across the n_groups dim)
+                     *   - output_g  = f16_output_scratch + g * rank
+                     *                 (ldc = n_groups * rank — same striding) */
+                    int gemm_ok = 1;
+                    __half alpha = __float2half(1.0f);
+                    __half beta  = __float2half(0.0f);
+                    const __half *weight_base = (const __half *)g_q8_weight_scratch_f16;
+                    const __half *input_base  = (const __half *)g_f16_input_scratch;
+                    __half *output_base       = (__half *)g_f16_output_scratch;
+                    const uint32_t input_lda  = (uint32_t)(n_groups * group_dim);
+                    const uint32_t output_ldc = (uint32_t)low_dim;
+                    for (uint32_t g = 0; gemm_ok && g < n_groups; g++) {
+                        const __half *w_g  = weight_base + (uint64_t)g * rank * group_dim;
+                        const __half *in_g = input_base  + (uint64_t)g * group_dim;
+                        __half *out_g      = output_base + (uint64_t)g * rank;
+                        cublasStatus_t status = cublasGemmEx(
+                            g_cublas_handle,
+                            CUBLAS_OP_T, CUBLAS_OP_N,
+                            (int)rank, (int)n_tokens, (int)group_dim,
+                            &alpha,
+                            w_g,  CUDA_R_16F, (int)group_dim,
+                            in_g, CUDA_R_16F, (int)input_lda,
+                            &beta,
+                            out_g, CUDA_R_16F, (int)output_ldc,
+                            CUBLAS_COMPUTE_16F,
+                            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                        if (status != CUBLAS_STATUS_SUCCESS) {
+                            if (!g_q8_cublas_warned) {
+                                fprintf(stderr,
+                                        "ds4: cuBLAS attention_output_low GemmEx failed (%s) — falling back to custom kernel\n",
+                                        ds4_cuda_cublas_status_string(status));
+                                g_q8_cublas_warned = 1;
+                            }
+                            gemm_ok = 0;
+                        }
+                    }
+                    if (gemm_ok) {
+                        /* (4) F16 output → F32 user buffer. */
+                        ds4_cuda_kernel_half_to_f32<<<out_grid_clamped, conv_block, 0, g_stream>>>(
+                            (float *)low_ptr,
+                            (const __half *)g_f16_output_scratch,
+                            low_total);
+                        return ds4_cuda_check(cudaGetLastError(), "attention_output_low half_to_f32");
+                    }
+                }
+            }
+        }
     }
-    return ok;
+
+    /* Custom-kernel fallback (original Q8 grouped low-rank kernel). */
+    constexpr uint32_t ROWS_PER_BLOCK = 4u;
+    const uint32_t row_blocks = ((uint32_t)rank + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
+    ds4_cuda_attention_output_low_q8_kernel<ROWS_PER_BLOCK><<<
+            dim3(row_blocks, n_groups, n_tokens),
+            dim3(32u, ROWS_PER_BLOCK, 1),
+            0, g_stream>>>(
+        weights,
+        (const float *)heads_ptr,
+        (float *)low_ptr,
+        (uint32_t)group_dim, (uint32_t)rank, n_groups, n_tokens);
+    return ds4_cuda_check(cudaGetLastError(), "launch attention output low q8 fused");
 }
 
 int ds4_cuda_attention_output_low_q8_tensor(
