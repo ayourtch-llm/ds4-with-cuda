@@ -111,6 +111,17 @@ static uint64_t g_q8_weight_scratch_bytes;
  * ds4_cuda_cleanup alongside the existing scratches. */
 static void    *g_moe_expert_weight_scratch_f16;
 static uint64_t g_moe_expert_weight_scratch_bytes;
+/* Phase 8 Stage 1.5d — second weight scratch for gate/up dual-stream
+ * pipelining; lets dequant_up of expert k run concurrently with
+ * GEMM_gate of expert k on a separate stream. */
+static void    *g_moe_expert_weight_scratch_up_f16;
+static uint64_t g_moe_expert_weight_scratch_up_bytes;
+static cudaStream_t g_moe_aux_stream;
+static cudaEvent_t  g_moe_dequant_gate_event;     /* aux signals: gate weights ready */
+static cudaEvent_t  g_moe_dequant_up_event;       /* aux signals: up   weights ready */
+static cudaEvent_t  g_moe_gemm_gate_done_event;   /* main signals: gate scratch freed */
+static cudaEvent_t  g_moe_gemm_up_done_event;     /* main signals: up   scratch freed */
+static int          g_moe_aux_initialized;
 static void    *g_moe_perm_act_scratch_f16;
 static uint64_t g_moe_perm_act_scratch_bytes;
 static void    *g_moe_perm_gate_scratch_f32;
@@ -2711,6 +2722,21 @@ void ds4_cuda_cleanup(void) {
         g_moe_expert_weight_scratch_f16 = NULL;
         g_moe_expert_weight_scratch_bytes = 0;
     }
+    /* Phase 8 Stage 1.5d — free aux pipelining resources. */
+    if (g_moe_expert_weight_scratch_up_f16) {
+        cudaFree(g_moe_expert_weight_scratch_up_f16);
+        g_moe_expert_weight_scratch_up_f16 = NULL;
+        g_moe_expert_weight_scratch_up_bytes = 0;
+    }
+    if (g_moe_aux_initialized) {
+        (void)cudaEventDestroy(g_moe_dequant_gate_event);
+        (void)cudaEventDestroy(g_moe_dequant_up_event);
+        (void)cudaEventDestroy(g_moe_gemm_gate_done_event);
+        (void)cudaEventDestroy(g_moe_gemm_up_done_event);
+        (void)cudaStreamDestroy(g_moe_aux_stream);
+        g_moe_aux_stream = NULL;
+        g_moe_aux_initialized = 0;
+    }
     if (g_moe_perm_act_scratch_f16) {
         cudaFree(g_moe_perm_act_scratch_f16);
         g_moe_perm_act_scratch_f16 = NULL;
@@ -4857,6 +4883,36 @@ static int ds4_cuda_routed_moe_iq2_xxs_retile(
 
     const uint64_t pair_rows = (uint64_t)n_tokens * n_expert_used;
 
+    /* Phase 8 Stage 1.5d — env-gated multi-stream pipelining of dequant + GEMM.
+     * dequant_up of expert k runs on aux stream, overlapping with GEMM_gate
+     * of expert k on g_stream.  Per-expert savings ≈ dequant_up time. */
+    static int gate_grouped_initialized = 0;
+    static int gate_grouped_enabled     = 0;
+    if (!gate_grouped_initialized) {
+        const char *s = getenv("DS4_CUDA_CUBLAS_GROUPED");
+        gate_grouped_enabled = (s && s[0] && s[0] != '0') ? 1 : 0;
+        gate_grouped_initialized = 1;
+    }
+    if (gate_grouped_enabled && !g_moe_aux_initialized) {
+        if (!ds4_cuda_check(cudaStreamCreateWithFlags(&g_moe_aux_stream, cudaStreamNonBlocking),
+                            "create moe aux stream")) return 0;
+        if (!ds4_cuda_check(cudaEventCreateWithFlags(&g_moe_dequant_gate_event, cudaEventDisableTiming),
+                            "create dequant_gate event")) return 0;
+        if (!ds4_cuda_check(cudaEventCreateWithFlags(&g_moe_dequant_up_event, cudaEventDisableTiming),
+                            "create dequant_up event")) return 0;
+        if (!ds4_cuda_check(cudaEventCreateWithFlags(&g_moe_gemm_gate_done_event, cudaEventDisableTiming),
+                            "create gemm_gate_done event")) return 0;
+        if (!ds4_cuda_check(cudaEventCreateWithFlags(&g_moe_gemm_up_done_event, cudaEventDisableTiming),
+                            "create gemm_up_done event")) return 0;
+        g_moe_aux_initialized = 1;
+    }
+    if (gate_grouped_enabled) {
+        if (!ds4_cuda_ensure_moe_scratch(&g_moe_expert_weight_scratch_up_f16,
+                                         &g_moe_expert_weight_scratch_up_bytes,
+                                         (uint64_t)expert_mid_dim * expert_in_dim * sizeof(__half),
+                                         "moe expert weight up f16")) return 0;
+    }
+
     if (!ds4_cuda_ensure_moe_scratch(&g_moe_expert_weight_scratch_f16,
                                      &g_moe_expert_weight_scratch_bytes,
                                      (uint64_t)expert_mid_dim * expert_in_dim * sizeof(__half),
@@ -4966,6 +5022,8 @@ static int ds4_cuda_routed_moe_iq2_xxs_retile(
         const float alpha = 1.0f;
         const float beta  = 0.0f;
 
+        const int compact = ds4_cuda_moe_compact_enabled();
+        int first_active = 1;
         for (uint32_t e = 0; e < N_EXPERT_TOTAL; e++) {
             const uint32_t e_start = expert_offset_h[e];
             const uint32_t e_count = expert_offset_h[e + 1u] - e_start;
@@ -4983,11 +5041,78 @@ static int ds4_cuda_routed_moe_iq2_xxs_retile(
             float *up_block   = (float *)g_moe_perm_up_scratch_f32
                                 + (uint64_t)e_start * expert_mid_dim;
 
-            /* Gate: dequant W → expert_weight_f16, then cuBLAS C[mid_dim, e_count]
-             * = W^T_col × X_col where W is row-major [mid_dim × in_dim] and X
-             * is row-major [e_count × in_dim].  Mirrors Stage 3+ pattern.
-             * S1.5b: env-gated _fast variant uses int4 vectorized stores. */
-            const int compact = ds4_cuda_moe_compact_enabled();
+            /* Phase 8 Stage 1.5d — multi-stream pipelining when grouped mode on:
+             * dequants run on aux stream against separate gate/up scratch buffers
+             * so dequant_up of expert k overlaps with GEMM_gate of expert k. */
+            if (gate_grouped_enabled) {
+                cudaStream_t dq_stream = g_moe_aux_stream;
+                __half      *gate_scratch = (__half *)g_moe_expert_weight_scratch_f16;
+                __half      *up_scratch   = (__half *)g_moe_expert_weight_scratch_up_f16;
+                const dim3 dq_grid(blocks_per_row, expert_mid_dim, 1);
+                const dim3 dq_block(32u, 1, 1);
+
+                /* Aux waits for prior iter's GEMMs to release the scratch buffers. */
+                if (!first_active) {
+                    if (!ds4_cuda_check(cudaStreamWaitEvent(dq_stream, g_moe_gemm_gate_done_event, 0),
+                                        "retile aux wait gate-free")) return 0;
+                    if (!ds4_cuda_check(cudaStreamWaitEvent(dq_stream, g_moe_gemm_up_done_event, 0),
+                                        "retile aux wait up-free")) return 0;
+                }
+
+                if (compact) {
+                    ds4_cuda_kernel_dequant_iq2_xxs_to_half_fast<<<dq_grid, dq_block, 0, dq_stream>>>(
+                        gate_scratch, e_gate, expert_in_dim, expert_mid_dim);
+                } else {
+                    ds4_cuda_kernel_dequant_iq2_xxs_to_half<<<dq_grid, dq_block, 0, dq_stream>>>(
+                        gate_scratch, e_gate, expert_in_dim, expert_mid_dim);
+                }
+                if (!ds4_cuda_check(cudaGetLastError(), "retile gate dequant (aux)")) return 0;
+                if (!ds4_cuda_check(cudaEventRecord(g_moe_dequant_gate_event, dq_stream),
+                                    "retile record dequant_gate event")) return 0;
+
+                if (compact) {
+                    ds4_cuda_kernel_dequant_iq2_xxs_to_half_fast<<<dq_grid, dq_block, 0, dq_stream>>>(
+                        up_scratch, e_up, expert_in_dim, expert_mid_dim);
+                } else {
+                    ds4_cuda_kernel_dequant_iq2_xxs_to_half<<<dq_grid, dq_block, 0, dq_stream>>>(
+                        up_scratch, e_up, expert_in_dim, expert_mid_dim);
+                }
+                if (!ds4_cuda_check(cudaGetLastError(), "retile up dequant (aux)")) return 0;
+                if (!ds4_cuda_check(cudaEventRecord(g_moe_dequant_up_event, dq_stream),
+                                    "retile record dequant_up event")) return 0;
+
+                /* Main stream waits on dequants, runs GEMMs, signals scratch-freed. */
+                if (!ds4_cuda_check(cudaStreamWaitEvent(g_stream, g_moe_dequant_gate_event, 0),
+                                    "retile main wait dequant_gate")) return 0;
+                cublasStatus_t status = cublasGemmEx(
+                    g_cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    (int)expert_mid_dim, (int)e_count, (int)expert_in_dim,
+                    &alpha, gate_scratch, CUDA_R_16F, (int)expert_in_dim,
+                    act_block,            CUDA_R_16F, (int)expert_in_dim,
+                    &beta,  gate_block,   CUDA_R_32F, (int)expert_mid_dim,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                if (!ds4_cuda_check_cublas(status, "retile gate cublasGemmEx (grouped)")) return 0;
+                if (!ds4_cuda_check(cudaEventRecord(g_moe_gemm_gate_done_event, g_stream),
+                                    "retile record gemm_gate_done event")) return 0;
+
+                if (!ds4_cuda_check(cudaStreamWaitEvent(g_stream, g_moe_dequant_up_event, 0),
+                                    "retile main wait dequant_up")) return 0;
+                status = cublasGemmEx(
+                    g_cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    (int)expert_mid_dim, (int)e_count, (int)expert_in_dim,
+                    &alpha, up_scratch, CUDA_R_16F, (int)expert_in_dim,
+                    act_block,          CUDA_R_16F, (int)expert_in_dim,
+                    &beta,  up_block,   CUDA_R_32F, (int)expert_mid_dim,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                if (!ds4_cuda_check_cublas(status, "retile up cublasGemmEx (grouped)")) return 0;
+                if (!ds4_cuda_check(cudaEventRecord(g_moe_gemm_up_done_event, g_stream),
+                                    "retile record gemm_up_done event")) return 0;
+
+                first_active = 0;
+                continue;
+            }
+
+            /* Baseline (single-stream) path. */
             if (compact) {
                 ds4_cuda_kernel_dequant_iq2_xxs_to_half_fast<<<
                         dim3(blocks_per_row, expert_mid_dim, 1),
@@ -5046,6 +5171,12 @@ static int ds4_cuda_routed_moe_iq2_xxs_retile(
                 CUBLAS_COMPUTE_32F,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
             if (!ds4_cuda_check_cublas(status, "retile up cublasGemmEx")) return 0;
+        }
+        /* End-of-phase: ensure aux stream's last work is visible to subsequent
+         * downstream kernels on g_stream (the swiglu/route step reads gate/up). */
+        if (gate_grouped_enabled && !first_active) {
+            if (!ds4_cuda_check(cudaStreamWaitEvent(g_stream, g_moe_gemm_up_done_event, 0),
+                                "retile main wait final gemm_up")) return 0;
         }
     }
 
