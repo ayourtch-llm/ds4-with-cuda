@@ -12,6 +12,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cublas_v2.h>
 
 #include <inttypes.h>
 #include <math.h>
@@ -85,6 +86,19 @@ static int g_device = 0;
 static int g_initialized;
 static int g_batch_open;
 static int g_quality_mode;
+
+/* Phase 7b Stage 3 — cuBLAS GemmEx (F16 tensor cores) + Sgemm (TF32 tensor
+ * cores) for the F16/F32 matmul paths.  Mirrors mitkox's ds4-cuda port at
+ * ds4_cuda.cu:168 (handle), 175-178 (scratch), 198-218 (status helpers),
+ * 376-390 (init), 430-432 (destroy), 1619-1848 (matmul wrappers).  Lazy
+ * F16 input/output scratch buffers grow on demand; freed at cleanup. */
+static cublasHandle_t g_cublas_handle;
+static void    *g_f16_input_scratch;
+static uint64_t g_f16_input_scratch_bytes;
+static void    *g_f16_output_scratch;
+static uint64_t g_f16_output_scratch_bytes;
+static int g_f16_tensor_core_disabled;
+static int g_f16_tensor_core_warned;
 static int g_attr_host_register_supported;
 static int g_attr_host_register_read_only_supported;
 static int g_attr_pageable_memory_access;
@@ -109,6 +123,77 @@ static int ds4_cuda_check(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
     fprintf(stderr, "ds4: CUDA %s failed: %s\n", what, cudaGetErrorString(err));
     return 0;
+}
+
+/* Phase 7b Stage 3 — cuBLAS status mapping + check helpers.  Mirrors
+ * mitkox/ds4-cuda/ds4_cuda.cu:198-218. */
+static const char *ds4_cuda_cublas_status_string(cublasStatus_t status) {
+    switch (status) {
+    case CUBLAS_STATUS_SUCCESS:          return "success";
+    case CUBLAS_STATUS_NOT_INITIALIZED:  return "not initialized";
+    case CUBLAS_STATUS_ALLOC_FAILED:     return "allocation failed";
+    case CUBLAS_STATUS_INVALID_VALUE:    return "invalid value";
+    case CUBLAS_STATUS_ARCH_MISMATCH:    return "architecture mismatch";
+    case CUBLAS_STATUS_MAPPING_ERROR:    return "mapping error";
+    case CUBLAS_STATUS_EXECUTION_FAILED: return "execution failed";
+    case CUBLAS_STATUS_INTERNAL_ERROR:   return "internal error";
+    case CUBLAS_STATUS_NOT_SUPPORTED:    return "not supported";
+    case CUBLAS_STATUS_LICENSE_ERROR:    return "license error";
+    }
+    return "unknown";
+}
+
+static int ds4_cuda_check_cublas(cublasStatus_t status, const char *what) {
+    if (status == CUBLAS_STATUS_SUCCESS) return 1;
+    fprintf(stderr, "ds4: cuBLAS %s failed: %s\n", what,
+            ds4_cuda_cublas_status_string(status));
+    return 0;
+}
+
+/* Lazy resize-on-demand F16 input/output scratch buffers.  Mirrors
+ * mitkox 1712-1732. */
+static int ds4_cuda_ensure_f16_input_scratch(uint64_t bytes) {
+    if (bytes == 0) bytes = 1;
+    if (bytes <= g_f16_input_scratch_bytes) return 1;
+    void *next = NULL;
+    if (!ds4_cuda_check(cudaMalloc(&next, (size_t)bytes), "f16 input scratch alloc")) {
+        return 0;
+    }
+    if (g_f16_input_scratch) cudaFree(g_f16_input_scratch);
+    g_f16_input_scratch = next;
+    g_f16_input_scratch_bytes = bytes;
+    return 1;
+}
+
+static int ds4_cuda_ensure_f16_output_scratch(uint64_t bytes) {
+    if (bytes == 0) bytes = 1;
+    if (bytes <= g_f16_output_scratch_bytes) return 1;
+    void *next = NULL;
+    if (!ds4_cuda_check(cudaMalloc(&next, (size_t)bytes), "f16 output scratch alloc")) {
+        return 0;
+    }
+    if (g_f16_output_scratch) cudaFree(g_f16_output_scratch);
+    g_f16_output_scratch = next;
+    g_f16_output_scratch_bytes = bytes;
+    return 1;
+}
+
+/* F32→F16 / F16→F32 conversion kernels for the cuBLAS staging path.
+ * Mirrors mitkox 1696-1710. */
+__global__ static void ds4_cuda_kernel_f32_to_half(__half *out, const float *in, uint64_t n) {
+    for (uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < n;
+         idx += (uint64_t)blockDim.x * gridDim.x) {
+        out[idx] = __float2half(in[idx]);
+    }
+}
+
+__global__ static void ds4_cuda_kernel_half_to_f32(float *out, const __half *in, uint64_t n) {
+    for (uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < n;
+         idx += (uint64_t)blockDim.x * gridDim.x) {
+        out[idx] = __half2float(in[idx]);
+    }
 }
 
 static int ds4_cuda_get_device_attr(cudaDeviceAttr attr) {
@@ -1894,6 +1979,39 @@ int ds4_cuda_init(void) {
         return 0;
     }
 
+    /* Phase 7b Stage 3: cuBLAS handle bound to g_stream.  TF32 tensor-core
+     * math is enabled at the handle level so cublasSgemm transparently
+     * routes through tensor cores for the F32 path; F16 GemmEx routes
+     * through tensor cores via CUBLAS_GEMM_DEFAULT_TENSOR_OP at call site.
+     * Init failure is non-fatal — the existing custom-kernel paths remain
+     * the fallback (and g_f16_tensor_core_disabled forces the fallback for
+     * the F16 path).  DS4_CUDA_DISABLE_CUBLAS=1 disables the F16 cuBLAS
+     * path explicitly without touching the handle (useful for A/B perf).
+     */
+    cublasStatus_t cubl_status = cublasCreate(&g_cublas_handle);
+    if (cubl_status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "ds4: cuBLAS create failed: %s — falling back to custom matmul kernels\n",
+                ds4_cuda_cublas_status_string(cubl_status));
+        g_cublas_handle = NULL;
+        g_f16_tensor_core_disabled = 1;
+    } else {
+        if (!ds4_cuda_check_cublas(cublasSetStream(g_cublas_handle, g_stream),
+                                   "set stream") ||
+            !ds4_cuda_check_cublas(cublasSetMathMode(g_cublas_handle,
+                                                    CUBLAS_TF32_TENSOR_OP_MATH),
+                                   "set TF32 math mode")) {
+            cublasDestroy(g_cublas_handle);
+            g_cublas_handle = NULL;
+            g_f16_tensor_core_disabled = 1;
+        } else {
+            const char *cubl_off = getenv("DS4_CUDA_DISABLE_CUBLAS");
+            if (cubl_off && cubl_off[0] == '1') {
+                g_f16_tensor_core_disabled = 1;
+                fprintf(stderr, "ds4: cuBLAS F16 tensor-core path disabled via DS4_CUDA_DISABLE_CUBLAS=1\n");
+            }
+        }
+    }
+
     /* Phase 5 C3 calibration: opt-in L2 persisting region.
      * DS4_CUDA_L2_PERSIST_MB=N sets the device-level persisting L2 budget
      * to N MiB (clamped to MaxPersistingL2CacheSize).  The matching access
@@ -1939,6 +2057,26 @@ void ds4_cuda_cleanup(void) {
     ds4_cuda_clear_pending_events();
     ds4_cuda_hot_views_clear();
     ds4_cuda_unregister_model();
+    /* Phase 7b Stage 3 — release F16 scratch + cuBLAS handle BEFORE the
+     * stream they were bound to.  Destroying the stream first leaves the
+     * cuBLAS handle with a dangling reference. */
+    if (g_f16_input_scratch) {
+        cudaFree(g_f16_input_scratch);
+        g_f16_input_scratch = NULL;
+        g_f16_input_scratch_bytes = 0;
+    }
+    if (g_f16_output_scratch) {
+        cudaFree(g_f16_output_scratch);
+        g_f16_output_scratch = NULL;
+        g_f16_output_scratch_bytes = 0;
+    }
+    if (g_cublas_handle) {
+        cublasDestroy(g_cublas_handle);
+        g_cublas_handle = NULL;
+    }
+    g_f16_tensor_core_disabled = 0;
+    g_f16_tensor_core_warned = 0;
+
     if (g_stream) {
         (void)cudaStreamDestroy(g_stream);
         g_stream = NULL;
@@ -2737,6 +2875,73 @@ int ds4_cuda_matmul_f16_tensor(
     }
 
     const uint16_t *weights = (const uint16_t *)((const uint8_t *)model_map + weight_offset);
+
+    /* Phase 7b Stage 3 — cuBLAS GemmEx fast path with tensor cores.
+     * Stage F32 input → F16 scratch, run cublasGemmEx with FP16
+     * compute + DEFAULT_TENSOR_OP, then convert F16 output back to
+     * F32.  Mirrors mitkox's ds4_cuda_matmul_f16_tensor at
+     * mitkox/ds4-cuda/ds4_cuda.cu:1756-1848.  Falls back to the
+     * per-token custom kernel on any cuBLAS error (and globally
+     * disables tensor-core path so subsequent calls skip the staging
+     * dance). */
+    if (!g_f16_tensor_core_disabled && g_cublas_handle != NULL) {
+        const uint64_t input_half_bytes  = x_elems * sizeof(__half);
+        const uint64_t output_half_bytes = out_elems * sizeof(__half);
+        if (ds4_cuda_ensure_f16_input_scratch(input_half_bytes) &&
+            ds4_cuda_ensure_f16_output_scratch(output_half_bytes)) {
+
+            const uint32_t conv_block = 256u;
+            const uint64_t conv_in_grid =
+                (x_elems + conv_block - 1u) / conv_block;
+            const uint64_t conv_out_grid =
+                (out_elems + conv_block - 1u) / conv_block;
+            const uint32_t conv_in_grid_clamped =
+                conv_in_grid > UINT32_MAX ? UINT32_MAX : (uint32_t)conv_in_grid;
+            const uint32_t conv_out_grid_clamped =
+                conv_out_grid > UINT32_MAX ? UINT32_MAX : (uint32_t)conv_out_grid;
+
+            ds4_cuda_kernel_f32_to_half<<<conv_in_grid_clamped, conv_block, 0, g_stream>>>(
+                (__half *)g_f16_input_scratch,
+                (const float *)x_ptr,
+                x_elems);
+            if (!ds4_cuda_check(cudaGetLastError(), "f32_to_half input convert")) {
+                /* Fall through to custom-kernel fallback. */
+            } else {
+                __half alpha = __float2half(1.0f);
+                __half beta  = __float2half(0.0f);
+                cublasStatus_t status = cublasGemmEx(
+                    g_cublas_handle,
+                    CUBLAS_OP_T,
+                    CUBLAS_OP_N,
+                    (int)out_dim, (int)n_tok, (int)in_dim,
+                    &alpha,
+                    weights,                 CUDA_R_16F, (int)in_dim,
+                    g_f16_input_scratch,     CUDA_R_16F, (int)in_dim,
+                    &beta,
+                    g_f16_output_scratch,    CUDA_R_16F, (int)out_dim,
+                    CUBLAS_COMPUTE_16F,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                if (status == CUBLAS_STATUS_SUCCESS) {
+                    ds4_cuda_kernel_half_to_f32<<<conv_out_grid_clamped, conv_block, 0, g_stream>>>(
+                        (float *)out_ptr,
+                        (const __half *)g_f16_output_scratch,
+                        out_elems);
+                    return ds4_cuda_check(cudaGetLastError(), "half_to_f32 output convert");
+                }
+                /* On error, disable cuBLAS path globally + log once. */
+                g_f16_tensor_core_disabled = 1;
+                if (!g_f16_tensor_core_warned) {
+                    fprintf(stderr,
+                            "ds4: cuBLAS GemmEx failed (%s) — falling back to custom F16 matvec for remainder of session\n",
+                            ds4_cuda_cublas_status_string(status));
+                    g_f16_tensor_core_warned = 1;
+                }
+            }
+        }
+    }
+
+    /* Custom-kernel fallback: per-token loop (slow, but bit-stable).  This
+     * is the original path before Phase 7b Stage 3. */
     constexpr uint32_t ROWS_PER_BLOCK = 4u;
     const uint32_t row_blocks = ((uint32_t)out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
     for (uint32_t t = 0; t < (uint32_t)n_tok; t++) {
@@ -2824,6 +3029,33 @@ int ds4_cuda_matmul_f32_tensor(
         return 0;
     }
     const float *weights = (const float *)((const uint8_t *)model_map + weight_offset);
+
+    /* Phase 7b Stage 3 — cuBLAS Sgemm with TF32 tensor cores.  Math mode
+     * was set on the handle at init (CUBLAS_TF32_TENSOR_OP_MATH); routing
+     * through cublasSgemm transparently engages tensor cores for shapes
+     * that satisfy the alignment constraints.  Fallback to custom kernel
+     * on cuBLAS error (logs once, doesn't disable globally — F32 path is
+     * less frequently exercised in production). */
+    if (g_cublas_handle != NULL) {
+        const float alpha = 1.0f;
+        const float beta  = 0.0f;
+        cublasStatus_t status = cublasSgemm(
+            g_cublas_handle,
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            (int)out_dim, (int)n_tok, (int)in_dim,
+            &alpha,
+            weights,                  (int)in_dim,
+            (const float *)x_ptr,     (int)in_dim,
+            &beta,
+            (float *)out_ptr,         (int)out_dim);
+        if (status == CUBLAS_STATUS_SUCCESS) return 1;
+        fprintf(stderr,
+                "ds4: cuBLAS Sgemm failed (%s) — falling back to custom F32 matvec\n",
+                ds4_cuda_cublas_status_string(status));
+    }
+
+    /* Custom-kernel fallback (original path). */
     ds4_cuda_dense_f32_matvec_kernel<<<dim3((uint32_t)out_dim, (uint32_t)n_tok, 1), 1, 0, g_stream>>>(
         weights, (const float *)x_ptr, (float *)out_ptr,
         (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);

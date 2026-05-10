@@ -11,7 +11,7 @@ NATIVE_LDLIBS := $(LDLIBS)
 # form for the CUDA link line.  Compile-side pthread is not needed for the .cu
 # TU itself (no pthread headers there), only for linking against ds4.c which
 # uses pthreads.
-CUDA_LDLIBS ?= -lm -lpthread
+CUDA_LDLIBS ?= -lcublas -lm -lpthread
 METAL_SRCS := $(wildcard metal/*.metal)
 CUDA_TARGETS :=
 CUDA_CORE_OBJS = ds4_cuda_host.o ds4_cuda.o
