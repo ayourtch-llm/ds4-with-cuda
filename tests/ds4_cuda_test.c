@@ -5282,6 +5282,64 @@ DS4_CUDA_PARITY_TEST(hc_split_weighted_sum,
     .cpu_fn = hc_split_sum_cpu, .cuda_fn = hc_split_sum_cuda,
     .cfg = (void *)&hc_split_sum_cfg_v);
 
+/* Phase 8 Stage 1.5 A1 — parity for hc_split_weighted_sum_fast (parallel
+ * Sinkhorn variant).  Same fixture as the baseline; same ULP tolerance.
+ * Math is bit-equivalent to baseline so worst_ulp should match within noise. */
+static int hc_split_sum_fast_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                  size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in_elems; (void)out_elems;
+    const struct hc_split_sum_cfg *c = cfg;
+    const uint32_t mix_hc = 24u;
+    const uint32_t n_hc   = 4u;
+    const size_t mix_n   = (size_t)c->n_rows * mix_hc;
+    const size_t model_n = 3u + mix_hc;
+    const size_t res_n   = (size_t)c->n_rows * n_hc * c->n_embd;
+    const float *mix     = in;
+    const float *scale   = in + mix_n;
+    const float *res_raw = scale + 3 + mix_hc;
+
+    float *res_h = (float *)malloc(res_n * sizeof(float));
+    if (!res_h) return 0;
+    for (size_t i = 0; i < res_n; i++) res_h[i] = fabsf(res_raw[i]) + 0.5f;
+
+    ds4_cuda_tensor *mix_dev   = ds4_cuda_tensor_alloc((uint64_t)mix_n   * sizeof(float));
+    ds4_cuda_tensor *model_dev = ds4_cuda_tensor_alloc((uint64_t)model_n * sizeof(float));
+    ds4_cuda_tensor *res_dev   = ds4_cuda_tensor_alloc((uint64_t)res_n   * sizeof(float));
+    ds4_cuda_tensor *split_dev = ds4_cuda_tensor_alloc((uint64_t)mix_n   * sizeof(float));
+    if (!mix_dev || !model_dev || !res_dev || !split_dev) {
+        ds4_cuda_tensor_free(mix_dev); ds4_cuda_tensor_free(model_dev);
+        ds4_cuda_tensor_free(res_dev); ds4_cuda_tensor_free(split_dev);
+        free(res_h); return 0;
+    }
+    int ok = ds4_cuda_tensor_write(mix_dev,   0, mix,   (uint64_t)mix_n   * sizeof(float))
+          && ds4_cuda_tensor_write(model_dev, 0, scale, (uint64_t)model_n * sizeof(float))
+          && ds4_cuda_tensor_write(res_dev,   0, res_h, (uint64_t)res_n   * sizeof(float));
+    free(res_h);
+
+    const void *fake_model_map = ds4_cuda_tensor_contents(model_dev);
+    const uint64_t fake_model_size = (uint64_t)model_n * sizeof(float);
+    const uint64_t scale_offset = 0;
+    const uint64_t base_offset  = 3u * sizeof(float);
+
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_hc_split_weighted_sum_fast_tensor(
+                    out_dev, split_dev, mix_dev, res_dev,
+                    fake_model_map, fake_model_size, scale_offset, base_offset,
+                    c->n_embd, n_hc, c->sinkhorn_iters, c->eps);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(mix_dev);   ds4_cuda_tensor_free(model_dev);
+    ds4_cuda_tensor_free(res_dev);   ds4_cuda_tensor_free(split_dev);
+    return ok;
+}
+
+DS4_CUDA_PARITY_TEST(hc_split_weighted_sum_fast,
+    .seed = 0x515D,
+    .in_elems = 2123,
+    .out_elems = 2 * 256,
+    .ulp_tolerance = 32,
+    .cpu_fn = hc_split_sum_cpu, .cuda_fn = hc_split_sum_fast_cuda,
+    .cfg = (void *)&hc_split_sum_cfg_v);
+
 struct hc_split_sum_norm_cfg {
     uint32_t n_rows;
     uint32_t sinkhorn_iters;
@@ -6725,6 +6783,7 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_output_hc_weights,
     &ds4_cuda_parity_hc_split_sinkhorn,
     &ds4_cuda_parity_hc_split_weighted_sum,
+    &ds4_cuda_parity_hc_split_weighted_sum_fast,
     &ds4_cuda_parity_hc_split_weighted_sum_norm,
     &ds4_cuda_parity_compressor_store_batch_r4_f32,
     &ds4_cuda_parity_compressor_store_batch_r4_f16,

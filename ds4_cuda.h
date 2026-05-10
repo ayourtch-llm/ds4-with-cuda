@@ -951,6 +951,24 @@ int ds4_cuda_hc_split_weighted_sum_tensor(
         uint32_t               sinkhorn_iters,
         float                  eps);
 
+/* Phase 8 Stage 1.5 — A1 parallel-Sinkhorn fast variant of
+ * hc_split_weighted_sum.  Same args/semantics; parallelizes the
+ * thread-0-serial Sinkhorn iteration across lanes 0..15.  Production-path
+ * env-gated by DS4_CUDA_HC_FAST=1 (default off until perf+parity validated). */
+int ds4_cuda_hc_split_weighted_sum_fast_tensor(
+        ds4_cuda_tensor       *out,
+        ds4_cuda_tensor       *split,
+        const ds4_cuda_tensor *mix,
+        const ds4_cuda_tensor *residual_hc,
+        const void            *model_map,
+        uint64_t               model_size,
+        uint64_t               scale_offset,
+        uint64_t               base_offset,
+        uint32_t               n_embd,
+        uint32_t               n_hc,
+        uint32_t               sinkhorn_iters,
+        float                  eps);
+
 int ds4_cuda_hc_split_weighted_sum_norm_tensor(
         ds4_cuda_tensor       *out,
         ds4_cuda_tensor       *norm_out,

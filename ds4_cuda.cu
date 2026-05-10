@@ -8989,6 +8989,150 @@ static __global__ void ds4_cuda_hc_split_weighted_sum_kernel(
     }
 }
 
+/* Phase 8 Stage 1.5 A1 — parallel-Sinkhorn variant of hc_split_weighted_sum.
+ *
+ * The baseline kernel runs the entire Sinkhorn split (sigmoid pre/post +
+ * multi-iter row/col normalization on the 4x4 comb matrix) in thread 0
+ * while the other 255 threads idle.  Profile shows this serial block
+ * dominates the kernel (8.4% of GPU time at 8K post-Step-E).  This variant
+ * distributes the work across lanes 0..15: pre/post computed in parallel
+ * (lanes 0..3 + 4..7), comb init in parallel (lanes 0..15), per-iter
+ * row-norm/col-norm parallelized 4-way (lanes 0..3).
+ *
+ * Math is bit-equivalent to the baseline except for one ordering choice:
+ * baseline computes c[idx] inline during row-max scan; this version
+ * pre-stores all 16 c values to shmem then reads them back during
+ * row-softmax.  Same operands, same operation order, same result.
+ *
+ * HC=4 only (matches baseline constraint at dispatcher).
+ */
+static __global__ void ds4_cuda_hc_split_weighted_sum_fast_kernel(
+        float       *out,
+        float       *split,
+        const float *mixes,
+        const float *scale,
+        const float *base,
+        const float *x,
+        uint32_t     n_embd,
+        uint32_t     mix_hc,
+        uint32_t     n_rows,
+        int          sinkhorn_iters,
+        float        eps) {
+    const uint32_t row = blockIdx.x;
+    if (row >= n_rows) return;
+
+    const float *mix = mixes + (uint64_t)row * mix_hc;
+    float       *o   = split + (uint64_t)row * mix_hc;
+
+    /* Shmem: pre[4] + c[16] (Sinkhorn matrix). */
+    extern __shared__ float fast_shmem[];
+    float *pre_shmem = fast_shmem;          /* 4 floats */
+    float *c_shmem   = fast_shmem + 4u;     /* 16 floats */
+
+    const float pre_scale  = scale[0];
+    const float post_scale = scale[1];
+    const float comb_scale = scale[2];
+    const uint32_t tid = threadIdx.x;
+
+    /* Step 1+2: pre (lanes 0..3) and post (lanes 4..7) in parallel. */
+    if (tid < 4u) {
+        const float z = mix[tid] * pre_scale + base[tid];
+        const float p = 1.0f / (1.0f + __expf(-z)) + eps;
+        o[tid] = p;
+        pre_shmem[tid] = p;
+    } else if (tid < 8u) {
+        const uint32_t i = tid - 4u;
+        const uint32_t off = 4u + i;
+        const float z = mix[off] * post_scale + base[off];
+        o[off] = 2.0f / (1.0f + __expf(-z));
+    }
+
+    /* Step 3a: initialize c[16] in parallel (lanes 0..15). */
+    if (tid < 16u) {
+        const uint32_t off = 8u + tid;
+        c_shmem[tid] = mix[off] * comb_scale + base[off];
+    }
+    __syncthreads();
+
+    /* Step 3b: first iter row-softmax — 4 dst rows in parallel (lanes 0..3). */
+    if (tid < 4u) {
+        const uint32_t dst = tid;
+        float row_max = c_shmem[dst * 4u + 0u];
+        #pragma unroll
+        for (uint32_t src = 1u; src < 4u; src++) {
+            const float v = c_shmem[dst * 4u + src];
+            if (v > row_max) row_max = v;
+        }
+        float vals[4];
+        float row_sum = 0.0f;
+        #pragma unroll
+        for (uint32_t src = 0u; src < 4u; src++) {
+            vals[src] = __expf(c_shmem[dst * 4u + src] - row_max);
+            row_sum += vals[src];
+        }
+        const float inv_sum = 1.0f / row_sum;
+        #pragma unroll
+        for (uint32_t src = 0u; src < 4u; src++) {
+            c_shmem[dst * 4u + src] = vals[src] * inv_sum + eps;
+        }
+    }
+    __syncthreads();
+
+    /* Step 4: first col-norm — 4 src cols in parallel (lanes 0..3, no eps in row sum). */
+    if (tid < 4u) {
+        const uint32_t src = tid;
+        float col_sum = 0.0f;
+        #pragma unroll
+        for (uint32_t dst = 0u; dst < 4u; dst++) col_sum += c_shmem[dst * 4u + src];
+        const float inv = 1.0f / (col_sum + eps);
+        #pragma unroll
+        for (uint32_t dst = 0u; dst < 4u; dst++) c_shmem[dst * 4u + src] *= inv;
+    }
+    __syncthreads();
+
+    /* Steps 5..N: remaining iters, row-norm + col-norm both with eps floor. */
+    for (int iter = 1; iter < sinkhorn_iters; iter++) {
+        if (tid < 4u) {
+            const uint32_t dst = tid;
+            float row_sum = 0.0f;
+            #pragma unroll
+            for (uint32_t src = 0u; src < 4u; src++) row_sum += c_shmem[dst * 4u + src];
+            const float inv = 1.0f / (row_sum + eps);
+            #pragma unroll
+            for (uint32_t src = 0u; src < 4u; src++) c_shmem[dst * 4u + src] *= inv;
+        }
+        __syncthreads();
+        if (tid < 4u) {
+            const uint32_t src = tid;
+            float col_sum = 0.0f;
+            #pragma unroll
+            for (uint32_t dst = 0u; dst < 4u; dst++) col_sum += c_shmem[dst * 4u + src];
+            const float inv = 1.0f / (col_sum + eps);
+            #pragma unroll
+            for (uint32_t dst = 0u; dst < 4u; dst++) c_shmem[dst * 4u + src] *= inv;
+        }
+        __syncthreads();
+    }
+
+    /* Write c[16] to o[8..23] in parallel (lanes 0..15). */
+    if (tid < 16u) {
+        o[8u + tid] = c_shmem[tid];
+    }
+    __syncthreads();
+
+    /* Weighted-reduce: dst[d] = sum_h pre[h] * x[h, d].  All threads cooperate. */
+    float *dst_row = out + (uint64_t)row * n_embd;
+    const float *xr = x + (uint64_t)row * 4u * n_embd;
+    for (uint32_t d = tid; d < n_embd; d += blockDim.x) {
+        float acc = 0.0f;
+        acc += pre_shmem[0] * xr[0u * n_embd + d];
+        acc += pre_shmem[1] * xr[1u * n_embd + d];
+        acc += pre_shmem[2] * xr[2u * n_embd + d];
+        acc += pre_shmem[3] * xr[3u * n_embd + d];
+        dst_row[d] = acc;
+    }
+}
+
 /* HC=4, n_embd=4096 fused Sinkhorn-split + weighted-reduce + RMS norm.
  * One block per row.  Reduction shape mirrors the Metal kernel's 1024-thread
  * tree-reduce over 4096 elements: each thread strides 4 elements.
@@ -9183,6 +9327,74 @@ int ds4_cuda_hc_split_sinkhorn_tensor(
     return ds4_cuda_check(cudaGetLastError(), "launch hc_split_sinkhorn");
 }
 
+/* Phase 8 Stage 1.5 — env-gate to route HC fast paths.  Default off; set
+ * DS4_CUDA_HC_FAST=1 to enable parallel-Sinkhorn (A1) + block_x=1024 (A2)
+ * variants of hc_split_weighted_sum.  Per `feedback_runtime_only_bugs`. */
+static int ds4_cuda_hc_fast_enabled(void) {
+    static int initialized;
+    static int enabled;
+    if (!initialized) {
+        const char *s = getenv("DS4_CUDA_HC_FAST");
+        enabled = (s && s[0] && s[0] != '0') ? 1 : 0;
+        initialized = 1;
+    }
+    return enabled;
+}
+
+int ds4_cuda_hc_split_weighted_sum_fast_tensor(
+        ds4_cuda_tensor       *out,
+        ds4_cuda_tensor       *split,
+        const ds4_cuda_tensor *mix,
+        const ds4_cuda_tensor *residual_hc,
+        const void            *model_map,
+        uint64_t               model_size,
+        uint64_t               scale_offset,
+        uint64_t               base_offset,
+        uint32_t               n_embd,
+        uint32_t               n_hc,
+        uint32_t               sinkhorn_iters,
+        float                  eps) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (!model_map || !out || !split || !mix || !residual_hc || n_hc != 4u || n_embd == 0u) return 0;
+
+    const uint64_t mix_hc      = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    const uint64_t mix_bytes   = mix_hc * sizeof(float);
+    const uint64_t out_row     = (uint64_t)n_embd * sizeof(float);
+    const uint64_t res_row     = (uint64_t)n_hc * out_row;
+    const uint64_t scale_bytes = 3ull * sizeof(float);
+
+    if (scale_offset > model_size || scale_bytes > model_size - scale_offset ||
+        base_offset > model_size || mix_bytes > model_size - base_offset) {
+        return 0;
+    }
+
+    const uint64_t out_total = out->bytes;
+    if (out_row == 0 || out_total < out_row || out_total % out_row != 0) return 0;
+    const uint64_t n_rows64 = out_total / out_row;
+    if (n_rows64 == 0 || n_rows64 > UINT32_MAX) return 0;
+    const uint32_t n_rows = (uint32_t)n_rows64;
+
+    void *out_ptr = NULL, *split_ptr = NULL, *mix_ptr = NULL, *res_ptr = NULL;
+    if (!ds4_cuda_tensor_range(out,         (uint64_t)n_rows * out_row,   "split_sum_fast out",   &out_ptr))   return 0;
+    if (!ds4_cuda_tensor_range(split,       (uint64_t)n_rows * mix_bytes, "split_sum_fast split", &split_ptr)) return 0;
+    if (!ds4_cuda_tensor_range(mix,         (uint64_t)n_rows * mix_bytes, "split_sum_fast mix",   &mix_ptr))   return 0;
+    if (!ds4_cuda_tensor_range(residual_hc, (uint64_t)n_rows * res_row,   "split_sum_fast res",   &res_ptr))   return 0;
+
+    const float *scale_ptr = (const float *)((const uint8_t *)model_map + scale_offset);
+    const float *base_ptr  = (const float *)((const uint8_t *)model_map + base_offset);
+
+    /* A1 (this commit): block_x=256 with parallel Sinkhorn.  A2 will bump to 1024. */
+    constexpr uint32_t block_x = 256u;
+    /* Shmem: pre[4] + c[16] = 20 floats. */
+    const size_t shmem_bytes = (size_t)20u * sizeof(float);
+    ds4_cuda_hc_split_weighted_sum_fast_kernel<<<n_rows, block_x, shmem_bytes, g_stream>>>(
+        (float *)out_ptr, (float *)split_ptr,
+        (const float *)mix_ptr, scale_ptr, base_ptr, (const float *)res_ptr,
+        n_embd, (uint32_t)mix_hc, n_rows, (int)sinkhorn_iters, eps);
+    return ds4_cuda_check(cudaGetLastError(), "launch hc_split_weighted_sum_fast");
+}
+
 int ds4_cuda_hc_split_weighted_sum_tensor(
         ds4_cuda_tensor       *out,
         ds4_cuda_tensor       *split,
@@ -9196,6 +9408,11 @@ int ds4_cuda_hc_split_weighted_sum_tensor(
         uint32_t               n_hc,
         uint32_t               sinkhorn_iters,
         float                  eps) {
+    if (ds4_cuda_hc_fast_enabled()) {
+        return ds4_cuda_hc_split_weighted_sum_fast_tensor(
+            out, split, mix, residual_hc, model_map, model_size,
+            scale_offset, base_offset, n_embd, n_hc, sinkhorn_iters, eps);
+    }
     if (!g_initialized && !ds4_cuda_init()) return 0;
     if (!g_batch_open) return 0;
     if (!model_map || !out || !split || !mix || !residual_hc || n_hc != 4u || n_embd == 0u) return 0;
