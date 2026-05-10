@@ -6727,6 +6727,25 @@ static __global__ void ds4_cuda_dsv4_rope_tail_pair_kernel(
 
 extern "C" {
 
+/* Phase 8 Stage 1.5c — env-gate to right-size rope_tail block_size.  The
+ * baseline launches block_size=256 but the kernel's stride loop only uses
+ * threads where (threadIdx.x * 2 < n_rot); for DSv4 n_rot=128 that means
+ * 192 of 256 threads sit idle.  Shrinking to block_size=64 (covers any
+ * n_rot ≤ 128 with one pair per thread, n_rot ≤ 256 with two pairs per
+ * thread) lets SMs fit 4× more concurrent blocks, improving occupancy on
+ * the 128K-block prefill launches.  Math is bit-identical (kernel
+ * unchanged); only the launch shape differs.  Per `feedback_runtime_only_bugs`. */
+static int ds4_cuda_rope_fuse_enabled(void) {
+    static int initialized;
+    static int enabled;
+    if (!initialized) {
+        const char *s = getenv("DS4_CUDA_ROPE_FUSE");
+        enabled = (s && s[0] && s[0] != '0') ? 1 : 0;
+        initialized = 1;
+    }
+    return enabled;
+}
+
 int ds4_cuda_rope_tail_tensor(
         ds4_cuda_tensor *x,
         uint32_t         n_tok,
@@ -6751,7 +6770,7 @@ int ds4_cuda_rope_tail_tensor(
     void *x_ptr = NULL;
     if (!ds4_cuda_tensor_range(x, total_bytes, "dsv4_rope_tail x", &x_ptr)) return 0;
 
-    constexpr int block_size = 256;
+    const int block_size = ds4_cuda_rope_fuse_enabled() ? 64 : 256;
     dim3 grid(n_tok, n_head, 1u);
     dim3 block((uint32_t)block_size, 1u, 1u);
     ds4_cuda_dsv4_rope_tail_kernel<<<grid, block, 0, g_stream>>>(
@@ -6790,7 +6809,7 @@ int ds4_cuda_rope_tail_pair_tensor(
     if (!ds4_cuda_tensor_range(x_q,  q_bytes,  "dsv4_rope_tail_pair q",  &xq_ptr))  return 0;
     if (!ds4_cuda_tensor_range(x_kv, kv_bytes, "dsv4_rope_tail_pair kv", &xkv_ptr)) return 0;
 
-    constexpr int block_size = 256;
+    const int block_size = ds4_cuda_rope_fuse_enabled() ? 64 : 256;
     dim3 grid(n_tok, n_head_q + n_head_kv, 1u);
     dim3 block((uint32_t)block_size, 1u, 1u);
     ds4_cuda_dsv4_rope_tail_pair_kernel<<<grid, block, 0, g_stream>>>(
