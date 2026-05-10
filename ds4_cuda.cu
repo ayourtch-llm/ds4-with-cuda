@@ -99,6 +99,30 @@ static void    *g_f16_output_scratch;
 static uint64_t g_f16_output_scratch_bytes;
 static void    *g_q8_weight_scratch_f16;
 static uint64_t g_q8_weight_scratch_bytes;
+/* Phase 7b MoE retile Step C-4: lazy device-side scratches for the IQ2_XXS
+ * gate+up retile path.  Sized for max prefill (n_tokens=2048, n_expert_used=6,
+ * 12288 routings; in_dim=4096, mid_dim=2048):
+ *   expert_weight_f16:  16 MB (one expert tile, reused across experts)
+ *   perm_act_f16:       96 MB (gathered F16 activations, gate+up shared)
+ *   perm_gate_f32:      96 MB (cuBLAS GemmEx output for gate)
+ *   perm_up_f32:        96 MB (cuBLAS GemmEx output for up)
+ *   layout_count/offset/indices: ≤ 50 KB total
+ * Total ≤ 304 MB, well within GB10 unified-memory budget.  Freed in
+ * ds4_cuda_cleanup alongside the existing scratches. */
+static void    *g_moe_expert_weight_scratch_f16;
+static uint64_t g_moe_expert_weight_scratch_bytes;
+static void    *g_moe_perm_act_scratch_f16;
+static uint64_t g_moe_perm_act_scratch_bytes;
+static void    *g_moe_perm_gate_scratch_f32;
+static uint64_t g_moe_perm_gate_scratch_bytes;
+static void    *g_moe_perm_up_scratch_f32;
+static uint64_t g_moe_perm_up_scratch_bytes;
+static void    *g_moe_layout_count_scratch;
+static uint64_t g_moe_layout_count_scratch_bytes;
+static void    *g_moe_layout_offset_scratch;
+static uint64_t g_moe_layout_offset_scratch_bytes;
+static void    *g_moe_layout_indices_scratch;
+static uint64_t g_moe_layout_indices_scratch_bytes;
 static int g_f16_tensor_core_disabled;
 static int g_f16_tensor_core_warned;
 static int g_q8_cublas_warned;
@@ -199,6 +223,27 @@ static int ds4_cuda_ensure_q8_weight_scratch_f16(uint64_t bytes) {
     if (g_q8_weight_scratch_f16) cudaFree(g_q8_weight_scratch_f16);
     g_q8_weight_scratch_f16 = next;
     g_q8_weight_scratch_bytes = bytes;
+    return 1;
+}
+
+/* Phase 7b MoE retile Step C-4: generic lazy-resize scratch helper for the
+ * MoE retile path.  Same shape as the dedicated f16/q8 helpers above —
+ * cudaMalloc on first use, free + realloc on grow, no shrink — but takes
+ * a (slot, slot_bytes) pair so we don't need seven nearly-identical
+ * functions.  Caller passes a label for cudaMalloc failure diagnostics. */
+static int ds4_cuda_ensure_moe_scratch(void **slot,
+                                       uint64_t *slot_bytes,
+                                       uint64_t need_bytes,
+                                       const char *what) {
+    if (need_bytes == 0) need_bytes = 1;
+    if (need_bytes <= *slot_bytes) return 1;
+    void *next = NULL;
+    if (!ds4_cuda_check(cudaMalloc(&next, (size_t)need_bytes), what)) {
+        return 0;
+    }
+    if (*slot) cudaFree(*slot);
+    *slot = next;
+    *slot_bytes = need_bytes;
     return 1;
 }
 
@@ -2441,6 +2486,42 @@ void ds4_cuda_cleanup(void) {
         cudaFree(g_q8_weight_scratch_f16);
         g_q8_weight_scratch_f16 = NULL;
         g_q8_weight_scratch_bytes = 0;
+    }
+    /* Phase 7b MoE retile Step C-4: free MoE retile scratches. */
+    if (g_moe_expert_weight_scratch_f16) {
+        cudaFree(g_moe_expert_weight_scratch_f16);
+        g_moe_expert_weight_scratch_f16 = NULL;
+        g_moe_expert_weight_scratch_bytes = 0;
+    }
+    if (g_moe_perm_act_scratch_f16) {
+        cudaFree(g_moe_perm_act_scratch_f16);
+        g_moe_perm_act_scratch_f16 = NULL;
+        g_moe_perm_act_scratch_bytes = 0;
+    }
+    if (g_moe_perm_gate_scratch_f32) {
+        cudaFree(g_moe_perm_gate_scratch_f32);
+        g_moe_perm_gate_scratch_f32 = NULL;
+        g_moe_perm_gate_scratch_bytes = 0;
+    }
+    if (g_moe_perm_up_scratch_f32) {
+        cudaFree(g_moe_perm_up_scratch_f32);
+        g_moe_perm_up_scratch_f32 = NULL;
+        g_moe_perm_up_scratch_bytes = 0;
+    }
+    if (g_moe_layout_count_scratch) {
+        cudaFree(g_moe_layout_count_scratch);
+        g_moe_layout_count_scratch = NULL;
+        g_moe_layout_count_scratch_bytes = 0;
+    }
+    if (g_moe_layout_offset_scratch) {
+        cudaFree(g_moe_layout_offset_scratch);
+        g_moe_layout_offset_scratch = NULL;
+        g_moe_layout_offset_scratch_bytes = 0;
+    }
+    if (g_moe_layout_indices_scratch) {
+        cudaFree(g_moe_layout_indices_scratch);
+        g_moe_layout_indices_scratch = NULL;
+        g_moe_layout_indices_scratch_bytes = 0;
     }
     g_q8_cublas_warned = 0;
     if (g_cublas_handle) {
