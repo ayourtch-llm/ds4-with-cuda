@@ -1080,6 +1080,17 @@ static __global__ void ds4_cuda_add_f32_kernel(
     if (i < n) out[i] = a[i] + b[i];
 }
 
+/* out[i] += scale * inc[i] — used by MoE cuBLAS decode path to accumulate
+ * per-expert SwiGLU output into the shared mid buffer with routing weight. */
+static __global__ void ds4_cuda_scale_add_f32_kernel(
+        float       *out,
+        const float *inc,
+        float        scale,
+        uint32_t     n) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] += scale * inc[i];
+}
+
 /* Adapted from llama.cpp 29debb3a6a4c291d66aabbc46a0bb8c17a77e267
  * ggml/src/ggml-cuda/binbcast.cu. */
 static __global__ void ds4_cuda_repeat_hc_f32_kernel(
@@ -1802,6 +1813,83 @@ static __global__ void ds4_cuda_dense_q8_0_matvec_kernel(
 
     if (lane == 0) out[(uint64_t)tok * out_dim + row] = acc;
 }
+
+/* Q8_0 paired matvec kernel: two independent weight matrices, one shared input.
+ * Used for attention projections where attn_q_a and attn_kv both read attn_norm
+ * but produce different outputs (qr and kv_raw respectively).
+ *
+ * Each block handles ROWS_PER_BLOCK output rows of the A-matrix.
+ * blockIdx.x indexes output rows of A, blockIdx.y indexes tokens.
+ * The B-matrix output rows are indexed by blockIdx.x + out_dim_a offset.
+ *
+ * The paired warp helper quantizes x once and dots against both weight rows,
+ * saving activation quantization work and halving x[] memory reads. */
+template<uint32_t ROWS_PER_BLOCK>
+static __global__ void ds4_cuda_dense_q8_0_pair_matvec_kernel(
+        const ds4_cuda_block_q8_0 *weights_a,
+        const ds4_cuda_block_q8_0 *weights_b,
+        const float               *x,
+        float                     *out_a,
+        float                     *out_b,
+        uint32_t                   in_dim,
+        uint32_t                   out_dim_a,
+        uint32_t                   out_dim_b,
+        uint32_t                   n_tok) {
+    const uint32_t row_a = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
+    const uint32_t tok   = blockIdx.y;
+    if (row_a >= out_dim_a || tok >= n_tok) return;
+    const uint32_t lane = threadIdx.x;
+
+    const ds4_cuda_block_q8_0 *wa_row = weights_a + (uint64_t)row_a * ((in_dim + 31u) / 32u);
+    const ds4_cuda_block_q8_0 *wb_row = weights_b + (uint64_t)row_a * ((in_dim + 31u) / 32u);
+    const float *xrow = x + (uint64_t)tok * in_dim;
+
+    float acc_a = 0.0f, acc_b = 0.0f;
+    ds4_cuda_warp_quantize_and_dot_q8_0_pair_f32(xrow, wa_row, wb_row, in_dim, lane, &acc_a, &acc_b);
+
+    if (lane == 0) {
+        out_a[(uint64_t)tok * out_dim_a + row_a] = acc_a;
+        out_b[(uint64_t)tok * out_dim_b + row_a] = acc_b;
+    }
+}
+
+/* Specialized paired kernel for decode: out_dim_a != out_dim_b.
+ * When the two matrices have different output dimensions (e.g., 1024 vs 1024),
+ * we need a grid that covers both.  This variant uses a two-phase approach
+ * where the grid covers max(out_dim_a, out_dim_b) rows. */
+template<uint32_t ROWS_PER_BLOCK>
+static __global__ void ds4_cuda_dense_q8_0_pair_matvec_kernel_asym(
+        const ds4_cuda_block_q8_0 *weights_a,
+        const ds4_cuda_block_q8_0 *weights_b,
+        const float               *x,
+        float                     *out_a,
+        float                     *out_b,
+        uint32_t                   in_dim,
+        uint32_t                   out_dim_a,
+        uint32_t                   out_dim_b,
+        uint32_t                   n_tok) {
+    const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
+    const uint32_t tok = blockIdx.y;
+    const uint32_t lane = threadIdx.x;
+    const uint32_t blocks = (in_dim + 31u) / 32u;
+
+    /* Phase A: compute rows that exist in both matrices. */
+    if (row < out_dim_a && tok < n_tok) {
+        const ds4_cuda_block_q8_0 *wa_row = weights_a + (uint64_t)row * blocks;
+        float acc_a = ds4_cuda_warp_quantize_and_dot_q8_0_f32(
+            x + (uint64_t)tok * in_dim, wa_row, in_dim, lane);
+        if (lane == 0) out_a[(uint64_t)tok * out_dim_a + row] = acc_a;
+    }
+
+    /* Phase B: compute rows for matrix B. */
+    if (row < out_dim_b && tok < n_tok) {
+        const ds4_cuda_block_q8_0 *wb_row = weights_b + (uint64_t)row * blocks;
+        float acc_b = ds4_cuda_warp_quantize_and_dot_q8_0_f32(
+            x + (uint64_t)tok * in_dim, wb_row, in_dim, lane);
+        if (lane == 0) out_b[(uint64_t)tok * out_dim_b + row] = acc_b;
+    }
+}
+
 
 static __device__ float ds4_cuda_hc_expand_split_value(
         float        block_v,
@@ -4059,6 +4147,83 @@ int ds4_cuda_matmul_q8_0_tensor(
         (uint32_t)n_tok);
     ok = ds4_cuda_check(cudaGetLastError(), "launch matmul q8_0 fused");
     return ok;
+}
+
+/* Paired Q8_0 matmul: two weight matrices share one input.
+ * Quantizes the activation once and dots against both weight sets.
+ * Used for attention projections where attn_q_a (4096→1024) and
+ * attn_kv (4096→1024) are independent but read the same attn_norm.
+ * Saves one kernel launch and halves the x[] memory reads. */
+int ds4_cuda_matmul_q8_0_pair_tensor(
+        ds4_cuda_tensor       *out_a,
+        ds4_cuda_tensor       *out_b,
+        const void            *model_map,
+        uint64_t               model_size,
+        uint64_t               weight_a_offset,
+        uint64_t               weight_b_offset,
+        uint64_t               in_dim,
+        uint64_t               out_dim_a,
+        uint64_t               out_dim_b,
+        const ds4_cuda_tensor *x,
+        uint64_t               n_tok) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (!out_a || !out_b || !model_map || !x ||
+        in_dim == 0 || out_dim_a == 0 || out_dim_b == 0 || n_tok == 0) return 0;
+    if ((in_dim & 31u) != 0 || in_dim > UINT32_MAX ||
+        out_dim_a > UINT32_MAX || out_dim_b > UINT32_MAX || n_tok > UINT32_MAX) return 0;
+
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    const uint64_t weight_bytes = (out_dim_a > out_dim_b ? out_dim_a : out_dim_b) * blocks * sizeof(ds4_cuda_block_q8_0);
+    if (weight_a_offset > model_size || weight_bytes > model_size - weight_a_offset ||
+        weight_b_offset > model_size || weight_bytes > model_size - weight_b_offset) return 0;
+
+    const uint64_t x_elems     = in_dim * n_tok;
+    const uint64_t out_a_elems = out_dim_a * n_tok;
+    const uint64_t out_b_elems = out_dim_b * n_tok;
+    if (x_elems > UINT64_MAX / sizeof(float) ||
+        out_a_elems > UINT64_MAX / sizeof(float) ||
+        out_b_elems > UINT64_MAX / sizeof(float)) return 0;
+
+    void *x_ptr = NULL, *out_a_ptr = NULL, *out_b_ptr = NULL;
+    if (!ds4_cuda_tensor_range(x, x_elems * sizeof(float), "matmul q8_0 pair input", &x_ptr) ||
+        !ds4_cuda_tensor_range(out_a, out_a_elems * sizeof(float), "matmul q8_0 pair out_a", &out_a_ptr) ||
+        !ds4_cuda_tensor_range(out_b, out_b_elems * sizeof(float), "matmul q8_0 pair out_b", &out_b_ptr)) {
+        return 0;
+    }
+
+    const ds4_cuda_block_q8_0 *wa = (const ds4_cuda_block_q8_0 *)
+        ds4_cuda_model_range_ptr(model_map, model_size, weight_a_offset,
+                                  out_dim_a * blocks * sizeof(ds4_cuda_block_q8_0), "matmul q8_0 pair weights_a");
+    const ds4_cuda_block_q8_0 *wb = (const ds4_cuda_block_q8_0 *)
+        ds4_cuda_model_range_ptr(model_map, model_size, weight_b_offset,
+                                  out_dim_b * blocks * sizeof(ds4_cuda_block_q8_0), "matmul q8_0 pair weights_b");
+    if (!wa || !wb) return 0;
+
+    constexpr uint32_t ROWS_PER_BLOCK = 4u;
+    const uint32_t max_out = (uint32_t)(out_dim_a > out_dim_b ? out_dim_a : out_dim_b);
+    const uint32_t row_blocks = (max_out + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK;
+
+    if (out_dim_a == out_dim_b) {
+        ds4_cuda_dense_q8_0_pair_matvec_kernel<ROWS_PER_BLOCK><<<
+            dim3(row_blocks, (uint32_t)n_tok, 1),
+            dim3(32u, ROWS_PER_BLOCK, 1),
+            0, g_stream>>>(
+            wa, wb, (const float *)x_ptr,
+            (float *)out_a_ptr, (float *)out_b_ptr,
+            (uint32_t)in_dim, (uint32_t)out_dim_a, (uint32_t)out_dim_b,
+            (uint32_t)n_tok);
+    } else {
+        ds4_cuda_dense_q8_0_pair_matvec_kernel_asym<ROWS_PER_BLOCK><<<
+            dim3(row_blocks, (uint32_t)n_tok, 1),
+            dim3(32u, ROWS_PER_BLOCK, 1),
+            0, g_stream>>>(
+            wa, wb, (const float *)x_ptr,
+            (float *)out_a_ptr, (float *)out_b_ptr,
+            (uint32_t)in_dim, (uint32_t)out_dim_a, (uint32_t)out_dim_b,
+            (uint32_t)n_tok);
+    }
+    return ds4_cuda_check(cudaGetLastError(), "launch matmul q8_0 pair");
 }
 
 int ds4_cuda_shared_gate_up_swiglu_q8_0_tensor(

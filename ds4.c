@@ -14937,21 +14937,27 @@ static bool cuda_graph_encode_one_layer(
                     L->hc_attn_scale->abs_offset, L->hc_attn_base->abs_offset,
                     L->attn_norm->abs_offset, DS4_N_EMBD, DS4_N_HC,
                     DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS);
-    if (ok) ok = ds4_cuda_matmul_q8_0_tensor(g->qr, model->map, model->size,
-                                              L->attn_q_a->abs_offset,
-                                              DS4_N_EMBD, DS4_N_LORA_O, g->attn_norm, 1u);
+   /* Paired Q8_0 matvec for attn_q_a + attn_kv projections.
+     * Both read g->attn_norm; quantizing the activation once and dotting
+     * against both weight sets saves one kernel launch and halves the
+     * attn_norm[] memory reads.  The asymmetric kernel handles the
+     * different output dimensions (DS4_N_LORA_O=1024 vs kv_dim=2048). */
+    if (ok) ok = ds4_cuda_matmul_q8_0_pair_tensor(g->qr, g->kv_raw,
+                                                   model->map, model->size,
+                                                   L->attn_q_a->abs_offset,
+                                                   L->attn_kv->abs_offset,
+                                                   DS4_N_EMBD, DS4_N_LORA_O,
+                                                   (uint64_t)kv_dim,
+                                                   g->attn_norm, 1u);
     if (ok) ok = ds4_cuda_rms_norm_weight_tensor(g->qr_norm, g->qr,
-                                                 model->map, model->size,
-                                                 L->attn_q_a_norm->abs_offset,
-                                                 DS4_N_LORA_O, DS4_RMS_EPS);
+                                                  model->map, model->size,
+                                                  L->attn_q_a_norm->abs_offset,
+                                                  DS4_N_LORA_O, DS4_RMS_EPS);
     if (ok) ok = ds4_cuda_matmul_q8_0_tensor(g->q, model->map, model->size,
-                                              L->attn_q_b->abs_offset,
-                                              DS4_N_LORA_O, q_dim, g->qr_norm, 1u);
+                                               L->attn_q_b->abs_offset,
+                                               DS4_N_LORA_O, q_dim, g->qr_norm, 1u);
     if (ok) ok = ds4_cuda_head_rms_norm_tensor(g->q, 1u, DS4_N_HEAD,
-                                                DS4_N_HEAD_DIM, DS4_RMS_EPS);
-    if (ok) ok = ds4_cuda_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
-                                              L->attn_kv->abs_offset,
-                                              DS4_N_EMBD, kv_dim, g->attn_norm, 1u);
+                                                 DS4_N_HEAD_DIM, DS4_RMS_EPS);
     if (ok) ok = ds4_cuda_rms_norm_weight_tensor(g->kv, g->kv_raw,
                                                  model->map, model->size,
                                                  L->attn_kv_a_norm->abs_offset,

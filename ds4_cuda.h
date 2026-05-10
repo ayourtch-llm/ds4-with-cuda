@@ -335,6 +335,22 @@ int ds4_cuda_matmul_q8_0_tensor(
         const ds4_cuda_tensor *x,
         uint64_t               n_tok);
 
+/* Paired Q8_0 matmul: two weight matrices share one input.
+ * Quantizes x once per block and dots against both weight rows.
+ * out_dim_a and out_dim_b may differ (asymmetric variant handles this). */
+int ds4_cuda_matmul_q8_0_pair_tensor(
+        ds4_cuda_tensor       *out_a,
+        ds4_cuda_tensor       *out_b,
+        const void            *model_map,
+        uint64_t               model_size,
+        uint64_t               weight_a_offset,
+        uint64_t               weight_b_offset,
+        uint64_t               in_dim,
+        uint64_t               out_dim_a,
+        uint64_t               out_dim_b,
+        const ds4_cuda_tensor *x,
+        uint64_t               n_tok);
+
 int ds4_cuda_shared_gate_up_swiglu_q8_0_tensor(
         ds4_cuda_tensor       *gate,
         ds4_cuda_tensor       *up,
