@@ -215,6 +215,7 @@ void ds4_test_quantize_row_q8_K(const float *x, void *y, int64_t k);
 void ds4_test_dense_q2_k_matvec(float *out, const void *weights, const void *xq, uint32_t in_dim, uint32_t out_dim);
 void ds4_test_dense_iq2_xxs_matvec(float *out, const void *weights, const void *xq, uint32_t in_dim, uint32_t out_dim);
 void ds4_test_dense_iq2_xxs_pair_matvec(float *out0, float *out1, const void *weights0, const void *weights1, const void *xq, uint32_t in_dim, uint32_t out_dim);
+void ds4_test_dequant_iq2_xxs_to_f32(float *out, const void *weights, uint32_t in_dim, uint32_t out_dim);
 void ds4_test_router_select_raw(int32_t *selected,
                                 float *weights,
                                 float *probs,

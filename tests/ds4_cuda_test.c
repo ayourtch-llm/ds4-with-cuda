@@ -98,6 +98,11 @@ int ds4_cuda_test_dense_iq2_xxs_pair_matvec_tensor(
         const ds4_cuda_tensor *xq,
         uint32_t               in_dim,
         uint32_t               out_dim);
+int ds4_cuda_test_dequant_iq2_xxs_to_f32_tensor(
+        ds4_cuda_tensor       *out,
+        const ds4_cuda_tensor *weights,
+        uint32_t               in_dim,
+        uint32_t               out_dim);
 
 typedef struct {
     uint8_t  scales[16];
@@ -1321,6 +1326,36 @@ static int dense_iq2_xxs_pair_cuda(const float *in, ds4_cuda_tensor *out_dev,
     return ok;
 }
 
+/* Phase 7b MoE retile Step A: standalone dequant parity test.  No
+ * activation is involved — both sides regenerate the same IQ2_XXS bytes
+ * from the cfg seed, then the CPU oracle dequants to F32 and the CUDA
+ * launcher dequants to F16 → converts to F32, both into out. */
+static int dequant_iq2_xxs_to_f32_cpu(const float *in, float *out, void *cfg) {
+    (void)in;
+    struct dense_cfg *c = cfg;
+    dense_fill_iq2_xxs_one(c);
+    if (!c->initialized) return 0;
+    ds4_test_dequant_iq2_xxs_to_f32(out, c->weights0, c->in_dim, c->out_dim);
+    return 1;
+}
+
+static int dequant_iq2_xxs_to_f32_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                       size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in; (void)in_elems; (void)out_elems;
+    struct dense_cfg *c = cfg;
+    dense_fill_iq2_xxs_one(c);
+    if (!c->initialized) return 0;
+    ds4_cuda_tensor *w = ds4_cuda_tensor_alloc(c->weight0_bytes);
+    if (!w) return 0;
+    int ok = ds4_cuda_tensor_write(w, 0, c->weights0, c->weight0_bytes);
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_test_dequant_iq2_xxs_to_f32_tensor(out_dev, w,
+                                                             c->in_dim, c->out_dim);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(w);
+    return ok;
+}
+
 static struct dense_cfg dense_f16_cfg = { .in_dim = 4096, .out_dim = 64 };
 static struct dense_cfg prod_f32_matmul_cfg = { .in_dim = 512, .out_dim = 64 };
 static struct dense_cfg prod_f16_pair_cfg = { .in_dim = 512, .out_dim = 64 };
@@ -1329,6 +1364,9 @@ static struct dense_cfg prod_shared_q8_0_swiglu_cfg = { .in_dim = 512, .out_dim 
 static struct dense_cfg dense_q2_k_cfg = { .in_dim = 4096, .out_dim = 64 };
 static struct dense_cfg dense_iq2_xxs_cfg = { .in_dim = 4096, .out_dim = 64 };
 static struct dense_cfg dense_iq2_xxs_pair_cfg = { .in_dim = 4096, .out_dim = 64 };
+/* Step A parity dimensions: 4096-element rows × 64 rows = 262 144 F32
+ * elements out, 64 × 16 = 1024 IQ2_XXS blocks ≈ 67.6 KiB weight bytes. */
+static struct dense_cfg dequant_iq2_xxs_cfg = { .in_dim = 4096, .out_dim = 64 };
 
 DS4_CUDA_PARITY_TEST(dense_f16_matvec,
     .seed = 0xD3F16,
@@ -1401,6 +1439,20 @@ DS4_CUDA_PARITY_TEST(dense_iq2_xxs_pair_matvec,
     .cpu_fn = dense_iq2_xxs_pair_cpu,
     .cuda_fn = dense_iq2_xxs_pair_cuda,
     .cfg = (void *)&dense_iq2_xxs_pair_cfg);
+
+/* Phase 7b MoE retile Step A: dequant kernel parity vs CPU F32 oracle.
+ * Tolerance accommodates F16 round-trip on the GPU side: at typical IQ2_XXS
+ * dequant magnitudes (~1e-3 to ~0.1), F16's 10-bit mantissa loses ~13 bits
+ * vs F32, so a single rounding gap is ~2^13 ≈ 8192 F32 ULPs.  Allow 16384
+ * to give a 2× cushion against deepest-tail values. */
+DS4_CUDA_PARITY_TEST(dequant_iq2_xxs_to_f32,
+    .seed = 0xD3D202,
+    .in_elems = 4096,
+    .out_elems = 4096 * 64,
+    .ulp_tolerance = 16384,
+    .cpu_fn = dequant_iq2_xxs_to_f32_cpu,
+    .cuda_fn = dequant_iq2_xxs_to_f32_cuda,
+    .cfg = (void *)&dequant_iq2_xxs_cfg);
 
 /* ---------------------------------------------------------------------------
  * flash_attn — Phase 1 m3.  Raw sliding-window attention with sinks.
@@ -5904,6 +5956,7 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_dense_q2_k_matvec,
     &ds4_cuda_parity_dense_iq2_xxs_matvec,
     &ds4_cuda_parity_dense_iq2_xxs_pair_matvec,
+    &ds4_cuda_parity_dequant_iq2_xxs_to_f32,
     &ds4_cuda_parity_flash_attn,
     &ds4_cuda_parity_router_select_batch,
     &ds4_cuda_parity_routed_moe_batch,

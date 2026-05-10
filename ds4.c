@@ -2793,6 +2793,55 @@ void ds4_test_dense_iq2_xxs_matvec(
     }
 }
 
+/* Phase 7b MoE retile Step A: per-element IQ2_XXS → F32 dequant oracle.
+ *
+ * Reference for the CUDA dequant kernel parity test.  Implements the same
+ * per-element formula that's implicit in ds4_vec_dot_iq2_xxs_q8_K: each
+ * element is `0.125 * f16_to_f32(d) * ls * (signs & kmask ? -grid[k] : grid[k])`
+ * where the (ib32, l, k) decomposition of the in-block element index unpacks
+ * the same metadata the dot helper consumes inline.  Output is row-major
+ * (out_dim × in_dim) F32. */
+void ds4_test_dequant_iq2_xxs_to_f32(
+        float      *out,
+        const void *weights,
+        uint32_t    in_dim,
+        uint32_t    out_dim) {
+    const uint64_t blocks_per_row = in_dim / QK_K;
+    const block_iq2_xxs *w = (const block_iq2_xxs *)weights;
+    for (uint32_t row = 0; row < out_dim; row++) {
+        const block_iq2_xxs *row_blocks = w + (uint64_t)row * blocks_per_row;
+        float *row_out = out + (uint64_t)row * in_dim;
+        for (uint64_t b = 0; b < blocks_per_row; b++) {
+            const block_iq2_xxs *blk = row_blocks + b;
+            const float d = f16_to_f32(blk->d);
+            float *blk_out = row_out + b * (uint64_t)QK_K;
+            for (int ib32 = 0; ib32 < QK_K / 32; ib32++) {
+                const uint32_t aux0 =
+                    (uint32_t)blk->qs[ib32 * 4 + 0] |
+                    ((uint32_t)blk->qs[ib32 * 4 + 1] << 16);
+                const uint32_t aux1 =
+                    (uint32_t)blk->qs[ib32 * 4 + 2] |
+                    ((uint32_t)blk->qs[ib32 * 4 + 3] << 16);
+                const uint8_t *aux8 = (const uint8_t *)&aux0;
+                const uint32_t ls = 2u * (aux1 >> 28) + 1u;
+                for (int l = 0; l < 4; l++) {
+                    const uint8_t  grid_idx = aux8[l];
+                    const uint32_t sign_idx = (aux1 >> (7 * l)) & 0x7fu;
+                    const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + grid_idx);
+                    const uint8_t  signs = ksigns_iq2xs[sign_idx];
+                    const float scale = 0.125f * d * (float)ls;
+                    for (int k = 0; k < 8; k++) {
+                        const int32_t v = (signs & kmask_iq2xs[k])
+                                              ? -(int32_t)grid[k]
+                                              : (int32_t)grid[k];
+                        blk_out[ib32 * 32 + l * 8 + k] = scale * (float)v;
+                    }
+                }
+            }
+        }
+    }
+}
+
 void ds4_test_dense_iq2_xxs_pair_matvec(
         float      *out0,
         float      *out1,

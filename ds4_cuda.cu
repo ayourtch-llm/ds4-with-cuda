@@ -229,6 +229,71 @@ __global__ static void ds4_cuda_kernel_dequant_q8_0_to_half(
     }
 }
 
+/* Phase 7b MoE retile Step A: IQ2_XXS → F16 dequant kernel.
+ *
+ * Implements the per-element dequant formula implicit in
+ * ds4_cuda_warp_vec_dot_iq2_xxs_q8_K (line ~679): each element value is
+ *
+ *     w[elem] = 0.125 * f16_to_f32(block.d) * ls * (signs & kmask ? -grid[k] : grid[k])
+ *
+ * where (ib32, l, k) decomposes the element index within a block of 256:
+ *   ib32 = elem / 32          (sub-block index, 0..7)
+ *   l    = (elem % 32) / 8    (8-elem segment within sub-block, 0..3)
+ *   k    = elem % 8           (lane within segment, 0..7)
+ * and per-segment metadata is unpacked from the 4 uint16s in qs[ib32*4..ib32*4+3]:
+ *   aux0 = qs[0] | qs[1]<<16  (4 grid_idx bytes)
+ *   aux1 = qs[2] | qs[3]<<16  (4 sign_idx 7-bit fields + 4-bit ls in top nibble)
+ *
+ * One warp (32 lanes) per IQ2_XXS block; each lane covers one (ib32, l) =
+ * 8 contiguous output elements.  Output is row-major (out_dim × in_dim) F16.
+ * Used by the MoE retile path and by the Step A parity test. */
+__global__ static void ds4_cuda_kernel_dequant_iq2_xxs_to_half(
+        __half                       *out_f16,
+        const ds4_cuda_block_iq2_xxs *weights,
+        uint32_t                      in_dim,
+        uint32_t                      out_dim) {
+    const uint32_t block_id = blockIdx.x;
+    const uint32_t row      = blockIdx.y;
+    const uint32_t blocks_per_row = in_dim / 256u;
+    if (block_id >= blocks_per_row || row >= out_dim) return;
+
+    const uint32_t lane = threadIdx.x;
+    const uint32_t ib32 = lane >> 2;       /* lane / 4 ∈ [0,8) */
+    const uint32_t l    = lane & 3u;       /* lane % 4 ∈ [0,4) */
+
+    const ds4_cuda_block_iq2_xxs *block =
+        weights + (uint64_t)row * blocks_per_row + block_id;
+
+    const float d = __half2float(__ushort_as_half(block->d));
+
+    const uint16_t *q2 = block->qs + ib32 * 4u;
+    const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+    const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+    const uint8_t *aux8 = (const uint8_t *)&aux0;
+
+    const uint32_t ls       = 2u * (aux1 >> 28) + 1u;
+    const uint8_t  grid_idx = aux8[l];
+    const uint32_t sign_idx = (aux1 >> (7u * l)) & 127u;
+    const uint8_t *grid     = (const uint8_t *)(iq2xxs_grid + grid_idx);
+    const uint8_t  signs    = ksigns_iq2xs[sign_idx];
+
+    const float scale = 0.125f * d * (float)ls;
+
+    __half *out_ptr = out_f16
+                    + (uint64_t)row * in_dim
+                    + (uint64_t)block_id * 256u
+                    + ib32 * 32u
+                    + l * 8u;
+
+    #pragma unroll
+    for (uint32_t k = 0; k < 8u; k++) {
+        const int32_t v = (signs & kmask_iq2xs[k])
+                              ? -(int32_t)grid[k]
+                              : (int32_t)grid[k];
+        out_ptr[k] = __float2half(scale * (float)v);
+    }
+}
+
 /* F32→F16 / F16→F32 conversion kernels for the cuBLAS staging path.
  * Mirrors mitkox 1696-1710. */
 __global__ static void ds4_cuda_kernel_f32_to_half(__half *out, const float *in, uint64_t n) {
@@ -2767,6 +2832,62 @@ int ds4_cuda_test_dense_iq2_xxs_pair_matvec_tensor(
         in_dim,
         out_dim);
     return ds4_cuda_check(cudaGetLastError(), "launch dense iq2_xxs pair matvec");
+}
+
+/* Phase 7b MoE retile Step A: standalone test launcher for the IQ2_XXS →
+ * F16 dequant kernel.  Allocates a transient F16 device scratch, runs the
+ * dequant kernel into it, then converts F16 → F32 into the parity-harness
+ * output tensor.  Lifetime: scratch is freed before return.  This is a
+ * test-only entry; production retile (Step C) reuses the dequant kernel
+ * directly with persistent scratch. */
+int ds4_cuda_test_dequant_iq2_xxs_to_f32_tensor(
+        ds4_cuda_tensor       *out,
+        const ds4_cuda_tensor *weights,
+        uint32_t               in_dim,
+        uint32_t               out_dim) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (in_dim == 0 || out_dim == 0 || (in_dim % 256u) != 0) return 0;
+
+    const uint64_t blocks_per_row = in_dim / 256u;
+    const uint64_t weight_bytes =
+        (uint64_t)out_dim * blocks_per_row * sizeof(ds4_cuda_block_iq2_xxs);
+    const uint64_t n_elems   = (uint64_t)out_dim * in_dim;
+    const uint64_t out_bytes = n_elems * sizeof(float);
+    void *w_ptr = NULL, *out_ptr = NULL;
+    if (!ds4_cuda_tensor_range(weights, weight_bytes, "dequant iq2_xxs weights", &w_ptr) ||
+        !ds4_cuda_tensor_range(out, out_bytes, "dequant iq2_xxs output", &out_ptr)) {
+        return 0;
+    }
+
+    void *scratch_f16 = NULL;
+    const uint64_t scratch_bytes = n_elems * sizeof(__half);
+    if (!ds4_cuda_check(cudaMalloc(&scratch_f16, (size_t)scratch_bytes),
+                        "dequant iq2_xxs scratch alloc")) {
+        return 0;
+    }
+
+    ds4_cuda_kernel_dequant_iq2_xxs_to_half<<<
+            dim3((uint32_t)blocks_per_row, out_dim, 1),
+            dim3(32u, 1, 1),
+            0, g_stream>>>(
+        (__half *)scratch_f16,
+        (const ds4_cuda_block_iq2_xxs *)w_ptr,
+        in_dim, out_dim);
+    int ok = ds4_cuda_check(cudaGetLastError(), "launch dequant iq2_xxs to half");
+
+    if (ok) {
+        const uint32_t threads = 256;
+        const uint32_t nblocks = (uint32_t)((n_elems + threads - 1) / threads);
+        ds4_cuda_kernel_half_to_f32<<<nblocks, threads, 0, g_stream>>>(
+            (float *)out_ptr, (const __half *)scratch_f16, n_elems);
+        ok = ds4_cuda_check(cudaGetLastError(), "launch half_to_f32 (iq2_xxs dequant test)");
+    }
+
+    /* cudaFree is synchronous against pending stream work, so the kernels
+     * above complete before the scratch is released. */
+    cudaFree(scratch_f16);
+    return ok;
 }
 
 #define DS4_CUDA_STUB(fn, args) \
