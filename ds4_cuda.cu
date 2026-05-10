@@ -416,6 +416,130 @@ __global__ static void ds4_cuda_kernel_dequant_q2_K_to_half(
     }
 }
 
+/* Phase 8 Stage 1.5b — vectorized-store variants of the IQ2_XXS and Q2_K
+ * dequant kernels.  Math is bit-equivalent to the baseline kernels above;
+ * only the store pattern changes: 8 separate 2-byte stores per lane are
+ * coalesced into one 16-byte int4 store via a stack-local packed buffer.
+ *
+ * Diagnosis from re-profile (post-FA-2): IQ2_XXS dequant achieves ~25% of
+ * GB10's 273 GB/s peak.  Hardware can't coalesce 32 strided 2-byte stores
+ * into a single sector, producing 16-32 sector transactions per warp
+ * iteration × 8 iterations = 128-256 transactions/warp.  Vectorizing to
+ * one int4 per lane yields a single 512-byte coalesced sector per warp.
+ *
+ * Production-path env-gated by DS4_CUDA_MOE_COMPACT=1 (default off until
+ * perf+parity validated).  Per `feedback_runtime_only_bugs`. */
+__global__ static void ds4_cuda_kernel_dequant_iq2_xxs_to_half_fast(
+        __half                       *out_f16,
+        const ds4_cuda_block_iq2_xxs *weights,
+        uint32_t                      in_dim,
+        uint32_t                      out_dim) {
+    const uint32_t block_id = blockIdx.x;
+    const uint32_t row      = blockIdx.y;
+    const uint32_t blocks_per_row = in_dim / 256u;
+    if (block_id >= blocks_per_row || row >= out_dim) return;
+
+    const uint32_t lane = threadIdx.x;
+    const uint32_t ib32 = lane >> 2;
+    const uint32_t l    = lane & 3u;
+
+    const ds4_cuda_block_iq2_xxs *block =
+        weights + (uint64_t)row * blocks_per_row + block_id;
+
+    const float d = __half2float(__ushort_as_half(block->d));
+
+    const uint16_t *q2 = block->qs + ib32 * 4u;
+    const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+    const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+    const uint8_t *aux8 = (const uint8_t *)&aux0;
+
+    const uint32_t ls       = 2u * (aux1 >> 28) + 1u;
+    const uint8_t  grid_idx = aux8[l];
+    const uint32_t sign_idx = (aux1 >> (7u * l)) & 127u;
+    const uint8_t *grid     = (const uint8_t *)(iq2xxs_grid + grid_idx);
+    const uint8_t  signs    = ksigns_iq2xs[sign_idx];
+
+    const float scale = 0.125f * d * (float)ls;
+
+    /* Pack 8 halves into a local int4 (registers), then issue ONE 16-byte
+     * coalesced store — 32 lanes × 16 bytes = 512 contiguous bytes/warp. */
+    union { __half h[8]; int4 v; } pkt;
+    #pragma unroll
+    for (uint32_t k = 0; k < 8u; k++) {
+        const int32_t v = (signs & kmask_iq2xs[k])
+                              ? -(int32_t)grid[k]
+                              : (int32_t)grid[k];
+        pkt.h[k] = __float2half(scale * (float)v);
+    }
+    int4 *out_ptr = reinterpret_cast<int4 *>(
+        out_f16 + (uint64_t)row * in_dim
+                + (uint64_t)block_id * 256u
+                + ib32 * 32u
+                + l * 8u);
+    *out_ptr = pkt.v;
+}
+
+__global__ static void ds4_cuda_kernel_dequant_q2_K_to_half_fast(
+        __half                       *out_f16,
+        const ds4_cuda_block_q2_K    *weights,
+        uint32_t                      in_dim,
+        uint32_t                      out_dim) {
+    const uint32_t block_id = blockIdx.x;
+    const uint32_t row      = blockIdx.y;
+    const uint32_t blocks_per_row = in_dim / 256u;
+    if (block_id >= blocks_per_row || row >= out_dim) return;
+
+    const uint32_t lane = threadIdx.x;
+    const ds4_cuda_block_q2_K *block =
+        weights + (uint64_t)row * blocks_per_row + block_id;
+
+    const float d    = __half2float(__ushort_as_half(block->d));
+    const float dmin = __half2float(__ushort_as_half(block->dmin));
+
+    const uint32_t elem_base = lane * 8u;
+    const uint32_t k         = elem_base >> 7;
+    const uint32_t j         = (elem_base >> 5) & 3u;
+    const uint32_t half      = (elem_base >> 4) & 1u;
+    const uint32_t is        = k * 8u + j * 2u + half;
+    const uint32_t shift     = j * 2u;
+    const uint32_t l_base    = elem_base & 15u;
+    const uint32_t byte_base = k * 32u + half * 16u;
+
+    const uint32_t scale_d   = (uint32_t)block->scales[is] & 0x0fu;
+    const uint32_t scale_min = (uint32_t)block->scales[is] >> 4u;
+    const float scale_d_f    = d    * (float)scale_d;
+    const float scale_min_f  = dmin * (float)scale_min;
+
+    union { __half h[8]; int4 v; } pkt;
+    #pragma unroll
+    for (uint32_t i = 0; i < 8u; i++) {
+        const uint32_t l = l_base + i;
+        const uint8_t q2_byte = block->qs[byte_base + l];
+        const uint32_t q2_val = (q2_byte >> shift) & 3u;
+        const float w = scale_d_f * (float)q2_val - scale_min_f;
+        pkt.h[i] = __float2half(w);
+    }
+    int4 *out_ptr = reinterpret_cast<int4 *>(
+        out_f16 + (uint64_t)row * in_dim
+                + (uint64_t)block_id * 256u
+                + elem_base);
+    *out_ptr = pkt.v;
+}
+
+/* Phase 8 Stage 1.5b — env-gate for vectorized MoE dequant variants.
+ * DS4_CUDA_MOE_COMPACT=1 routes the retile driver through the _fast
+ * dequant kernels.  Default off until perf+parity validated. */
+static int ds4_cuda_moe_compact_enabled(void) {
+    static int initialized;
+    static int enabled;
+    if (!initialized) {
+        const char *s = getenv("DS4_CUDA_MOE_COMPACT");
+        enabled = (s && s[0] && s[0] != '0') ? 1 : 0;
+        initialized = 1;
+    }
+    return enabled;
+}
+
 /* Phase 7b MoE retile Step C-1: build the per-expert routing layout from the
  * router's selected[] tensor.
  *
@@ -3382,6 +3506,102 @@ int ds4_cuda_test_dequant_q2_K_to_f32_tensor(
     return ok;
 }
 
+/* Phase 8 Stage 1.5b — test launchers for the vectorized-store fast
+ * dequant kernels.  Same shape as the baseline launchers above, just
+ * dispatch to the _fast kernel.  Used by the parity-test fixtures
+ * dequant_iq2_xxs_to_f32_fast and dequant_q2_K_to_f32_fast. */
+int ds4_cuda_test_dequant_iq2_xxs_to_f32_fast_tensor(
+        ds4_cuda_tensor       *out,
+        const ds4_cuda_tensor *weights,
+        uint32_t               in_dim,
+        uint32_t               out_dim) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (in_dim == 0 || out_dim == 0 || (in_dim % 256u) != 0) return 0;
+
+    const uint64_t blocks_per_row = in_dim / 256u;
+    const uint64_t weight_bytes =
+        (uint64_t)out_dim * blocks_per_row * sizeof(ds4_cuda_block_iq2_xxs);
+    const uint64_t n_elems   = (uint64_t)out_dim * in_dim;
+    const uint64_t out_bytes = n_elems * sizeof(float);
+    void *w_ptr = NULL, *out_ptr = NULL;
+    if (!ds4_cuda_tensor_range(weights, weight_bytes, "dequant iq2_xxs_fast weights", &w_ptr) ||
+        !ds4_cuda_tensor_range(out, out_bytes, "dequant iq2_xxs_fast output", &out_ptr)) {
+        return 0;
+    }
+
+    void *scratch_f16 = NULL;
+    const uint64_t scratch_bytes = n_elems * sizeof(__half);
+    if (!ds4_cuda_check(cudaMalloc(&scratch_f16, (size_t)scratch_bytes),
+                        "dequant iq2_xxs_fast scratch alloc")) return 0;
+
+    ds4_cuda_kernel_dequant_iq2_xxs_to_half_fast<<<
+            dim3((uint32_t)blocks_per_row, out_dim, 1),
+            dim3(32u, 1, 1),
+            0, g_stream>>>(
+        (__half *)scratch_f16,
+        (const ds4_cuda_block_iq2_xxs *)w_ptr,
+        in_dim, out_dim);
+    int ok = ds4_cuda_check(cudaGetLastError(), "launch dequant iq2_xxs_fast to half");
+
+    if (ok) {
+        const uint32_t threads = 256;
+        const uint32_t nblocks = (uint32_t)((n_elems + threads - 1) / threads);
+        ds4_cuda_kernel_half_to_f32<<<nblocks, threads, 0, g_stream>>>(
+            (float *)out_ptr, (const __half *)scratch_f16, n_elems);
+        ok = ds4_cuda_check(cudaGetLastError(), "launch half_to_f32 (iq2_xxs_fast dequant test)");
+    }
+
+    cudaFree(scratch_f16);
+    return ok;
+}
+
+int ds4_cuda_test_dequant_q2_K_to_f32_fast_tensor(
+        ds4_cuda_tensor       *out,
+        const ds4_cuda_tensor *weights,
+        uint32_t               in_dim,
+        uint32_t               out_dim) {
+    if (!g_initialized && !ds4_cuda_init()) return 0;
+    if (!g_batch_open) return 0;
+    if (in_dim == 0 || out_dim == 0 || (in_dim % 256u) != 0) return 0;
+
+    const uint64_t blocks_per_row = in_dim / 256u;
+    const uint64_t weight_bytes =
+        (uint64_t)out_dim * blocks_per_row * sizeof(ds4_cuda_block_q2_K);
+    const uint64_t n_elems   = (uint64_t)out_dim * in_dim;
+    const uint64_t out_bytes = n_elems * sizeof(float);
+    void *w_ptr = NULL, *out_ptr = NULL;
+    if (!ds4_cuda_tensor_range(weights, weight_bytes, "dequant q2_K_fast weights", &w_ptr) ||
+        !ds4_cuda_tensor_range(out, out_bytes, "dequant q2_K_fast output", &out_ptr)) {
+        return 0;
+    }
+
+    void *scratch_f16 = NULL;
+    const uint64_t scratch_bytes = n_elems * sizeof(__half);
+    if (!ds4_cuda_check(cudaMalloc(&scratch_f16, (size_t)scratch_bytes),
+                        "dequant q2_K_fast scratch alloc")) return 0;
+
+    ds4_cuda_kernel_dequant_q2_K_to_half_fast<<<
+            dim3((uint32_t)blocks_per_row, out_dim, 1),
+            dim3(32u, 1, 1),
+            0, g_stream>>>(
+        (__half *)scratch_f16,
+        (const ds4_cuda_block_q2_K *)w_ptr,
+        in_dim, out_dim);
+    int ok = ds4_cuda_check(cudaGetLastError(), "launch dequant q2_K_fast to half");
+
+    if (ok) {
+        const uint32_t threads = 256;
+        const uint32_t nblocks = (uint32_t)((n_elems + threads - 1) / threads);
+        ds4_cuda_kernel_half_to_f32<<<nblocks, threads, 0, g_stream>>>(
+            (float *)out_ptr, (const __half *)scratch_f16, n_elems);
+        ok = ds4_cuda_check(cudaGetLastError(), "launch half_to_f32 (q2_K_fast dequant test)");
+    }
+
+    cudaFree(scratch_f16);
+    return ok;
+}
+
 /* Phase 7b MoE retile Step C-1: standalone test launcher for the routing
  * layout kernel.  Mirrors the dequant launchers above: takes managed-memory
  * input/output tensors, launches a single block, and returns.  Production
@@ -4765,13 +4985,24 @@ static int ds4_cuda_routed_moe_iq2_xxs_retile(
 
             /* Gate: dequant W → expert_weight_f16, then cuBLAS C[mid_dim, e_count]
              * = W^T_col × X_col where W is row-major [mid_dim × in_dim] and X
-             * is row-major [e_count × in_dim].  Mirrors Stage 3+ pattern. */
-            ds4_cuda_kernel_dequant_iq2_xxs_to_half<<<
-                    dim3(blocks_per_row, expert_mid_dim, 1),
-                    dim3(32u, 1, 1),
-                    0, g_stream>>>(
-                (__half *)g_moe_expert_weight_scratch_f16,
-                e_gate, expert_in_dim, expert_mid_dim);
+             * is row-major [e_count × in_dim].  Mirrors Stage 3+ pattern.
+             * S1.5b: env-gated _fast variant uses int4 vectorized stores. */
+            const int compact = ds4_cuda_moe_compact_enabled();
+            if (compact) {
+                ds4_cuda_kernel_dequant_iq2_xxs_to_half_fast<<<
+                        dim3(blocks_per_row, expert_mid_dim, 1),
+                        dim3(32u, 1, 1),
+                        0, g_stream>>>(
+                    (__half *)g_moe_expert_weight_scratch_f16,
+                    e_gate, expert_in_dim, expert_mid_dim);
+            } else {
+                ds4_cuda_kernel_dequant_iq2_xxs_to_half<<<
+                        dim3(blocks_per_row, expert_mid_dim, 1),
+                        dim3(32u, 1, 1),
+                        0, g_stream>>>(
+                    (__half *)g_moe_expert_weight_scratch_f16,
+                    e_gate, expert_in_dim, expert_mid_dim);
+            }
             if (!ds4_cuda_check(cudaGetLastError(), "retile gate dequant")) return 0;
             cublasStatus_t status = cublasGemmEx(
                 g_cublas_handle,
@@ -4787,12 +5018,21 @@ static int ds4_cuda_routed_moe_iq2_xxs_retile(
             if (!ds4_cuda_check_cublas(status, "retile gate cublasGemmEx")) return 0;
 
             /* Up: same pattern, different weight slab. */
-            ds4_cuda_kernel_dequant_iq2_xxs_to_half<<<
-                    dim3(blocks_per_row, expert_mid_dim, 1),
-                    dim3(32u, 1, 1),
-                    0, g_stream>>>(
-                (__half *)g_moe_expert_weight_scratch_f16,
-                e_up, expert_in_dim, expert_mid_dim);
+            if (compact) {
+                ds4_cuda_kernel_dequant_iq2_xxs_to_half_fast<<<
+                        dim3(blocks_per_row, expert_mid_dim, 1),
+                        dim3(32u, 1, 1),
+                        0, g_stream>>>(
+                    (__half *)g_moe_expert_weight_scratch_f16,
+                    e_up, expert_in_dim, expert_mid_dim);
+            } else {
+                ds4_cuda_kernel_dequant_iq2_xxs_to_half<<<
+                        dim3(blocks_per_row, expert_mid_dim, 1),
+                        dim3(32u, 1, 1),
+                        0, g_stream>>>(
+                    (__half *)g_moe_expert_weight_scratch_f16,
+                    e_up, expert_in_dim, expert_mid_dim);
+            }
             if (!ds4_cuda_check(cudaGetLastError(), "retile up dequant")) return 0;
             status = cublasGemmEx(
                 g_cublas_handle,
@@ -4886,12 +5126,21 @@ static int ds4_cuda_routed_moe_iq2_xxs_retile(
             float *down_block = (float *)g_moe_perm_down_scratch_f32
                                 + (uint64_t)e_start * out_dim;
 
-            ds4_cuda_kernel_dequant_q2_K_to_half<<<
-                    dim3(blocks_per_row_d, out_dim, 1),
-                    dim3(32u, 1, 1),
-                    0, g_stream>>>(
-                (__half *)g_moe_expert_weight_scratch_f16,
-                e_down, expert_mid_dim, out_dim);
+            if (ds4_cuda_moe_compact_enabled()) {
+                ds4_cuda_kernel_dequant_q2_K_to_half_fast<<<
+                        dim3(blocks_per_row_d, out_dim, 1),
+                        dim3(32u, 1, 1),
+                        0, g_stream>>>(
+                    (__half *)g_moe_expert_weight_scratch_f16,
+                    e_down, expert_mid_dim, out_dim);
+            } else {
+                ds4_cuda_kernel_dequant_q2_K_to_half<<<
+                        dim3(blocks_per_row_d, out_dim, 1),
+                        dim3(32u, 1, 1),
+                        0, g_stream>>>(
+                    (__half *)g_moe_expert_weight_scratch_f16,
+                    e_down, expert_mid_dim, out_dim);
+            }
             if (!ds4_cuda_check(cudaGetLastError(), "retile down dequant")) return 0;
             cublasStatus_t status = cublasGemmEx(
                 g_cublas_handle,

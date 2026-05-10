@@ -103,7 +103,17 @@ int ds4_cuda_test_dequant_iq2_xxs_to_f32_tensor(
         const ds4_cuda_tensor *weights,
         uint32_t               in_dim,
         uint32_t               out_dim);
+int ds4_cuda_test_dequant_iq2_xxs_to_f32_fast_tensor(
+        ds4_cuda_tensor       *out,
+        const ds4_cuda_tensor *weights,
+        uint32_t               in_dim,
+        uint32_t               out_dim);
 int ds4_cuda_test_dequant_q2_K_to_f32_tensor(
+        ds4_cuda_tensor       *out,
+        const ds4_cuda_tensor *weights,
+        uint32_t               in_dim,
+        uint32_t               out_dim);
+int ds4_cuda_test_dequant_q2_K_to_f32_fast_tensor(
         ds4_cuda_tensor       *out,
         const ds4_cuda_tensor *weights,
         uint32_t               in_dim,
@@ -1448,6 +1458,41 @@ static int dequant_q2_K_to_f32_cuda(const float *in, ds4_cuda_tensor *out_dev,
     return ok;
 }
 
+/* Phase 8 Stage 1.5b — fast (vectorized-store) variants. */
+static int dequant_iq2_xxs_to_f32_fast_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                            size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in; (void)in_elems; (void)out_elems;
+    struct dense_cfg *c = cfg;
+    dense_fill_iq2_xxs_one(c);
+    if (!c->initialized) return 0;
+    ds4_cuda_tensor *w = ds4_cuda_tensor_alloc(c->weight0_bytes);
+    if (!w) return 0;
+    int ok = ds4_cuda_tensor_write(w, 0, c->weights0, c->weight0_bytes);
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_test_dequant_iq2_xxs_to_f32_fast_tensor(out_dev, w,
+                                                                  c->in_dim, c->out_dim);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(w);
+    return ok;
+}
+
+static int dequant_q2_K_to_f32_fast_cuda(const float *in, ds4_cuda_tensor *out_dev,
+                                         size_t in_elems, size_t out_elems, void *cfg) {
+    (void)in; (void)in_elems; (void)out_elems;
+    struct dense_cfg *c = cfg;
+    dense_fill_q2_k(c);
+    if (!c->initialized) return 0;
+    ds4_cuda_tensor *w = ds4_cuda_tensor_alloc(c->weight0_bytes);
+    if (!w) return 0;
+    int ok = ds4_cuda_tensor_write(w, 0, c->weights0, c->weight0_bytes);
+    if (ok) ok = ds4_cuda_begin_commands();
+    if (ok) ok = ds4_cuda_test_dequant_q2_K_to_f32_fast_tensor(out_dev, w,
+                                                                c->in_dim, c->out_dim);
+    if (ok) ok = ds4_cuda_end_commands();
+    ds4_cuda_tensor_free(w);
+    return ok;
+}
+
 DS4_CUDA_PARITY_TEST(dense_f16_matvec,
     .seed = 0xD3F16,
     .in_elems = 4096,
@@ -1534,6 +1579,15 @@ DS4_CUDA_PARITY_TEST(dequant_iq2_xxs_to_f32,
     .cuda_fn = dequant_iq2_xxs_to_f32_cuda,
     .cfg = (void *)&dequant_iq2_xxs_cfg);
 
+DS4_CUDA_PARITY_TEST(dequant_iq2_xxs_to_f32_fast,
+    .seed = 0xD3D203,
+    .in_elems = 4096,
+    .out_elems = 4096 * 64,
+    .ulp_tolerance = 16384,
+    .cpu_fn = dequant_iq2_xxs_to_f32_cpu,
+    .cuda_fn = dequant_iq2_xxs_to_f32_fast_cuda,
+    .cfg = (void *)&dequant_iq2_xxs_cfg);
+
 DS4_CUDA_PARITY_TEST(dequant_q2_K_to_f32,
     .seed = 0xD3D2E2,
     .in_elems = 4096,
@@ -1541,6 +1595,15 @@ DS4_CUDA_PARITY_TEST(dequant_q2_K_to_f32,
     .ulp_tolerance = 16384,
     .cpu_fn = dequant_q2_K_to_f32_cpu,
     .cuda_fn = dequant_q2_K_to_f32_cuda,
+    .cfg = (void *)&dequant_q2_k_cfg);
+
+DS4_CUDA_PARITY_TEST(dequant_q2_K_to_f32_fast,
+    .seed = 0xD3D2E3,
+    .in_elems = 4096,
+    .out_elems = 4096 * 64,
+    .ulp_tolerance = 16384,
+    .cpu_fn = dequant_q2_K_to_f32_cpu,
+    .cuda_fn = dequant_q2_K_to_f32_fast_cuda,
     .cfg = (void *)&dequant_q2_k_cfg);
 
 /* Phase 7b MoE retile Step C-1: routing-layout kernel parity test.
@@ -6732,7 +6795,9 @@ static const ds4_cuda_parity_test *const all_tests[] = {
     &ds4_cuda_parity_dense_iq2_xxs_matvec,
     &ds4_cuda_parity_dense_iq2_xxs_pair_matvec,
     &ds4_cuda_parity_dequant_iq2_xxs_to_f32,
+    &ds4_cuda_parity_dequant_iq2_xxs_to_f32_fast,
     &ds4_cuda_parity_dequant_q2_K_to_f32,
+    &ds4_cuda_parity_dequant_q2_K_to_f32_fast,
     &ds4_cuda_parity_moe_layout,
     &ds4_cuda_parity_moe_gather_act_to_f32,
     &ds4_cuda_parity_moe_unpermute_swiglu_route,
